@@ -283,9 +283,9 @@ def _navigate_using_cuteftp_dialog(
     remote_listview: int | None,
     target_path: str,
 ) -> bool:
-    """CuteFTP 9 documents Ctrl+L as its Change Remote Folder command."""
+    """CuteFTP 9 documents Ctrl+D as its Change Remote Folder command."""
     _focus_cuteftp_control(main_hwnd, remote_listview or main_hwnd)
-    _press_ctrl_key(ord("L"))
+    _press_ctrl_key(ord("D"))
 
     dialog_hwnd = _find_cuteftp_dialog(main_hwnd)
     if not dialog_hwnd:
@@ -343,7 +343,7 @@ def _navigate_cuteftp_gui_to_path(
         except Exception:
             logger.exception("Direct CuteFTP Remote address navigation failed.")
 
-    # Fallback to CuteFTP's own Change Remote Folder dialog (Ctrl+L).
+    # Fallback to CuteFTP's own Change Remote Folder dialog (Ctrl+D).
     if _navigate_using_cuteftp_dialog(main_hwnd, remote_listview, target):
         return target
 
