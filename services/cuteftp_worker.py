@@ -1,5 +1,7 @@
 import ctypes
+import logging
 import struct
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -10,7 +12,10 @@ import win32gui
 import win32process
 from core.config_loader import cfg
 
+logger = logging.getLogger(__name__)
+
 user32 = ctypes.windll.user32
+_CUTEFTP_GUI_LOCK = threading.RLock()
 
 
 def _copy_files_to_windows_clipboard(file_paths: list[str]):
@@ -62,180 +67,431 @@ def _find_cuteftp_gui_window() -> int | None:
     return found_hwnds[0] if found_hwnds else None
 
 
+def _normalise_remote_path(path: str) -> str:
+    path = (path or "").replace("\\", "/").strip()
+    if not path:
+        return ""
+    if path == "/":
+        return "/"
+    return "/" + path.lstrip("/").rstrip("/")
+
+
+def _paths_equal(left: str, right: str) -> bool:
+    return _normalise_remote_path(left).casefold() == _normalise_remote_path(right).casefold()
+
+
 def _find_remote_controls(main_hwnd: int) -> tuple[int | None, int | None]:
     """
-    پیدا کردن کنترل‌های پنل سمت راست (Remote) در CuteFTP 9.3 بدون وابستگی به وضعیت ریموت دسکتاپ:
-    ۱. نوار آدرس Remote: کنترلی از نوع Edit که متن آن با '/' شروع می‌شود (مثلاً /English/Movies)
-    ۲. لیست فایل‌های Remote: کنترل SysListView32 در سمت راست بالا
+    Find the Remote list and the address Edit control above it.
+    Candidate controls are ranked by their current path text and geometry
+    relative to the right-hand (Remote) file list.
     """
+    main_left, main_top, main_right, main_bottom = win32gui.GetWindowRect(main_hwnd)
+    main_mid_x = (main_left + main_right) // 2
     listviews = []
-    slash_edits = []
-    other_edits = []
+    edits = []
 
     def _enum_child(hwnd, _):
-        cls_name = win32gui.GetClassName(hwnd)
         try:
-            c_rect = win32gui.GetClientRect(hwnd)
-            w = c_rect[2] - c_rect[0]
-            h = c_rect[3] - c_rect[1]
-            w_rect = win32gui.GetWindowRect(hwnd)
+            cls_name = win32gui.GetClassName(hwnd)
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            width, height = right - left, bottom - top
+            if width <= 0 or height <= 0:
+                return
+
+            if cls_name in ("SysListView32", "TListView") and width > 120 and height > 100:
+                if (left + right) // 2 > main_mid_x:
+                    listviews.append((left, top, right, bottom, hwnd))
+
+            if cls_name in ("Edit", "ComboBox", "ComboBoxEx32") and width > 100 and 12 <= height <= 55:
+                if left >= main_mid_x - 10:
+                    text = _get_edit_text(hwnd).strip()
+                    edits.append((left, top, right, bottom, cls_name, text, hwnd))
         except Exception:
             return
 
-        if cls_name == "SysListView32" and w > 120 and h > 100:
-            listviews.append((w_rect[0], w_rect[1], w, h, hwnd))
-        elif cls_name == "Edit" and w > 100 and 12 <= h <= 45:
-            txt = _get_edit_text(hwnd).strip()
-            if txt.startswith("/"):
-                slash_edits.append((w_rect[0], hwnd))
-            elif not (len(txt) >= 2 and txt[1] == ":"):  # حذف نوار آدرس ویندوز (C:\...)
-                other_edits.append((w_rect[0], hwnd))
-
     win32gui.EnumChildWindows(main_hwnd, _enum_child, None)
 
-    remote_edit = None
-    if slash_edits:
-        # نوار آدرسی که با '/' شروع می‌شود، قطعا نوار آدرس هاست Remote است
-        slash_edits.sort(key=lambda x: x[0], reverse=True)
-        remote_edit = slash_edits[0][1]
-    elif other_edits:
-        other_edits.sort(key=lambda x: x[0], reverse=True)
-        remote_edit = other_edits[0][1]
-
     remote_listview = None
+    remote_rect = None
     if listviews:
-        # اگر بیش از ۲ لیست وجود دارد، پایینی‌ترین لیست مربوط به Queue Window است؛ آن را کنار بگذار
-        if len(listviews) >= 3:
-            listviews.sort(key=lambda x: x[1])
-            top_listviews = listviews[:-1]
-        else:
-            top_listviews = listviews
+        # The upper/right list is the Remote pane; lower list views are usually the queue.
+        listviews.sort(key=lambda item: (item[1], -item[0]))
+        remote_rect = listviews[0][:4]
+        remote_listview = listviews[0][4]
 
-        # در بین دو پنل چپ و راست، پنل سمت راست بیشترین X را دارد
-        top_listviews.sort(key=lambda x: x[0], reverse=True)
-        remote_listview = top_listviews[0][4]
+    remote_edit = None
+    if edits:
+        def _score(item):
+            left, top, right, bottom, cls_name, text, hwnd = item
+            score = 0
+            if text.startswith("/"):
+                score += 1000
+            if cls_name == "Edit":
+                score += 30
+            if text:
+                score += 20
+            if left >= main_mid_x:
+                score += 50
+            if remote_rect:
+                list_left, list_top, list_right, _ = remote_rect
+                overlap = max(0, min(right, list_right) - max(left, list_left))
+                if overlap:
+                    score += 250
+                if bottom <= list_top and list_top - bottom <= 100:
+                    score += 300 - (list_top - bottom)
+            return score
+
+        edits.sort(key=_score, reverse=True)
+        best = edits[0]
+        if _score(best) >= 100:
+            remote_edit = best[6]
 
     return remote_listview, remote_edit
 
 
-def _navigate_cuteftp_gui_to_path(main_hwnd: int, edit_hwnd: int | None, target_remote_dir: str) -> str:
-    """
-    تغییر پوشه مقصد در CuteFTP 9.3 بدون نیاز به SetCursorPos (سازگار با RDP بسته یا Minimize شده)
-    """
-    if not edit_hwnd or not target_remote_dir or target_remote_dir == "__CURRENT__":
-        return _get_edit_text(edit_hwnd).strip() if edit_hwnd else ""
-
-    normalized_target = "/" + target_remote_dir.replace("\\", "/").strip().lstrip("/")
-    if len(normalized_target) > 1:
-        normalized_target = normalized_target.rstrip("/")
-
-    current_path = _get_edit_text(edit_hwnd).strip()
-    if len(current_path) > 1:
-        current_path = current_path.rstrip("/")
-
-    if current_path.lower() == normalized_target.lower():
-        return normalized_target
-
-    target_tid, _ = win32process.GetWindowThreadProcessId(main_hwnd)
-    cur_tid = win32api.GetCurrentThreadId()
-    attached = False
-    try:
-        if cur_tid != target_tid:
-            attached = bool(user32.AttachThreadInput(cur_tid, target_tid, True))
-
-        # ۱. دادن فوکوس سیستمی به نوار آدرس Remote
-        user32.SetFocus(edit_hwnd)
-        lparam_click = win32api.MAKELONG(15, 8)
-        user32.SendMessageW(edit_hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lparam_click)
-        user32.SendMessageW(edit_hwnd, win32con.WM_LBUTTONUP, 0, lparam_click)
-        time.sleep(0.1)
-
-        # ۲. نوشتن مسیر جدید در نوار آدرس و بردن مکان‌نما به انتهای خط
-        _set_edit_text(edit_hwnd, normalized_target)
-        text_len = len(normalized_target)
-        user32.SendMessageW(edit_hwnd, win32con.EM_SETSEL, text_len, text_len)
-
-        # ۳. اطلاع‌رسانی تغییر متن به کنترل والد (ComboBox)
-        combo_hwnd = win32gui.GetParent(edit_hwnd)
-        edit_id = win32gui.GetDlgCtrlID(edit_hwnd)
-        if combo_hwnd:
-            # ارسال EN_CHANGE و CBN_EDITCHANGE
-            user32.SendMessageW(combo_hwnd, win32con.WM_COMMAND, (0x0300 << 16) | (edit_id & 0xFFFF), edit_hwnd)
-            combo_parent = win32gui.GetParent(combo_hwnd)
-            combo_id = win32gui.GetDlgCtrlID(combo_hwnd)
-            if combo_parent:
-                user32.SendMessageW(combo_parent, win32con.WM_COMMAND, (5 << 16) | (combo_id & 0xFFFF), combo_hwnd)
-
-        time.sleep(0.1)
-
-        # ۴. ارسال کلید Enter مستقیماً به نوار آدرس برای رفتن به پوشه جدید
-        user32.PostMessageW(edit_hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0x001C0001)
-        user32.PostMessageW(edit_hwnd, win32con.WM_CHAR, 0x0D, 0x001C0001)
-        user32.PostMessageW(edit_hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0xC01C0001)
-    finally:
-        if attached:
-            user32.AttachThreadInput(cur_tid, target_tid, False)
-
-    # ۵. صبر برای دریافت لیست فایل‌های پوشه جدید از هاست دانلود
-    time.sleep(2.2)
-
-    updated_path = _get_edit_text(edit_hwnd).strip()
-    return updated_path or normalized_target
+def _press_key(vk: int):
+    win32api.keybd_event(vk, 0, 0, 0)
+    time.sleep(0.04)
+    win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+    time.sleep(0.08)
 
 
-def upload_via_open_cuteftp_gui(local_target: Path, target_remote_dir: str = "__CURRENT__") -> tuple[bool, str]:
-    """
-    آپلود پوشه یا فایل از طریق پنجره بازِ CuteFTP بدون نیاز به ماوس فیزیکی (SetCursorPos)
-    """
-    main_hwnd = _find_cuteftp_gui_window()
-    if not main_hwnd:
-        return False, ""
+def _press_ctrl_key(vk: int):
+    win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+    time.sleep(0.04)
+    win32api.keybd_event(vk, 0, 0, 0)
+    time.sleep(0.04)
+    win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+    win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+    time.sleep(0.12)
 
-    try:
-        if win32gui.IsIconic(main_hwnd):
-            win32gui.ShowWindow(main_hwnd, win32con.SW_RESTORE)
-            time.sleep(0.2)
-    except Exception:
-        pass
 
-    remote_pane_hwnd, remote_edit_hwnd = _find_remote_controls(main_hwnd)
-
-    # ۱. تغییر پوشه در نوار آدرس Remote
-    actual_remote_path = _navigate_cuteftp_gui_to_path(main_hwnd, remote_edit_hwnd, target_remote_dir)
-
-    # ۲. کپی کردن فایل یا پوشه محلی در کلیپ‌بورد ویندوز
-    _copy_files_to_windows_clipboard([str(local_target.resolve())])
-    time.sleep(0.15)
-
-    # ۳. فعال‌سازی پنل سمت راست (Remote Pane) و ارسال دستور Paste (ID_EDIT_PASTE = 0xE125)
-    target_tid, _ = win32process.GetWindowThreadProcessId(main_hwnd)
-    cur_tid = win32api.GetCurrentThreadId()
-    attached = False
-    try:
-        if cur_tid != target_tid:
-            attached = bool(user32.AttachThreadInput(cur_tid, target_tid, True))
-
-        if remote_pane_hwnd:
-            user32.SetFocus(remote_pane_hwnd)
+def _copy_text_to_clipboard(text: str):
+    last_error = None
+    for _ in range(10):
+        try:
+            win32clipboard.OpenClipboard()
             try:
-                c_rect = win32gui.GetClientRect(remote_pane_hwnd)
-                click_x = max(10, (c_rect[2] - c_rect[0]) - 20)
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
+            finally:
+                win32clipboard.CloseClipboard()
+            return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.1)
+    raise RuntimeError(f"امکان قراردادن مسیر در کلیپ‌بورد وجود ندارد: {last_error}")
+
+
+def _focus_cuteftp_control(main_hwnd: int, control_hwnd: int):
+    """
+    Activate CuteFTP despite Windows foreground-lock restrictions.
+
+    Windows may refuse SetForegroundWindow when the bot is running in the
+    background. Temporarily attach the bot's input queue to both the current
+    foreground thread and CuteFTP's GUI thread, send the documented Alt
+    activation nudge, then activate and focus the requested child control.
+    """
+    if not win32gui.IsWindow(main_hwnd):
+        raise RuntimeError("پنجره اصلی CuteFTP دیگر معتبر نیست.")
+    if not win32gui.IsWindow(control_hwnd):
+        raise RuntimeError("کنترل مقصد در پنجره CuteFTP معتبر نیست.")
+
+    if win32gui.IsIconic(main_hwnd):
+        win32gui.ShowWindow(main_hwnd, win32con.SW_RESTORE)
+        time.sleep(0.25)
+    else:
+        win32gui.ShowWindow(main_hwnd, win32con.SW_SHOW)
+
+    target_tid, target_pid = win32process.GetWindowThreadProcessId(main_hwnd)
+    control_tid, control_pid = win32process.GetWindowThreadProcessId(control_hwnd)
+    current_tid = win32api.GetCurrentThreadId()
+
+    attached_pairs = []
+
+    def _attach(thread_a: int, thread_b: int):
+        if not thread_a or not thread_b or thread_a == thread_b:
+            return
+        if (thread_a, thread_b) in attached_pairs or (thread_b, thread_a) in attached_pairs:
+            return
+        if user32.AttachThreadInput(thread_a, thread_b, True):
+            attached_pairs.append((thread_a, thread_b))
+
+    try:
+        # Joining the foreground input queue is important: merely calling
+        # SetForegroundWindow from a background worker is often ignored by Windows.
+        foreground_hwnd = win32gui.GetForegroundWindow()
+        foreground_tid = 0
+        if foreground_hwnd and win32gui.IsWindow(foreground_hwnd):
+            foreground_tid, _ = win32process.GetWindowThreadProcessId(foreground_hwnd)
+
+        _attach(current_tid, foreground_tid)
+        _attach(current_tid, target_tid)
+        _attach(current_tid, control_tid)
+
+        # Restore and raise the main CuteFTP window.
+        try:
+            win32gui.BringWindowToTop(main_hwnd)
+        except Exception:
+            pass
+
+        # A short Alt key press can release the foreground activation lock on
+        # Windows versions that otherwise ignore SetForegroundWindow.
+        try:
+            win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+            time.sleep(0.04)
+            win32api.keybd_event(
+                win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0
+            )
+            time.sleep(0.06)
+        except Exception:
+            pass
+
+        try:
+            win32gui.SetForegroundWindow(main_hwnd)
+        except Exception:
+            pass
+        try:
+            win32gui.SetActiveWindow(main_hwnd)
+        except Exception:
+            pass
+        try:
+            user32.SetFocus(control_hwnd)
+        except Exception:
+            pass
+
+        # GetForegroundWindow returns a top-level window. It may be a CuteFTP
+        # owned window, not the exact main HWND, so compare process IDs.
+        deadline = time.monotonic() + 1.5
+        foreground_pid = None
+        foreground_title = ""
+        while time.monotonic() < deadline:
+            active_hwnd = win32gui.GetForegroundWindow()
+            if active_hwnd and win32gui.IsWindow(active_hwnd):
+                try:
+                    _, foreground_pid = win32process.GetWindowThreadProcessId(active_hwnd)
+                    foreground_title = win32gui.GetWindowText(active_hwnd)
+                except Exception:
+                    foreground_pid = None
+            if foreground_pid == target_pid:
+                break
+            time.sleep(0.05)
+
+        if foreground_pid != target_pid:
+            # Distinguish a failed activation from different Windows sessions.
+            try:
+                active_hwnd = win32gui.GetForegroundWindow()
+                active_tid, active_pid = win32process.GetWindowThreadProcessId(active_hwnd)
+                active_title = win32gui.GetWindowText(active_hwnd)
             except Exception:
-                click_x = 300
-            # ارسال کلیک مجازی به حاشیه سمت راست لیست Remote تا پنل Remote در MFC فعال شود
-            lparam = win32api.MAKELONG(click_x, 25)
-            user32.SendMessageW(remote_pane_hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lparam)
-            user32.SendMessageW(remote_pane_hwnd, win32con.WM_LBUTTONUP, 0, lparam)
-            time.sleep(0.15)
+                active_tid, active_pid, active_title = 0, 0, "<unknown>"
 
-        # اجرای دستور Edit -> Paste در CuteFTP
-        user32.PostMessageW(main_hwnd, win32con.WM_COMMAND, 0xE125, 0)
+            raise RuntimeError(
+                "ویندوز اجازه فعال‌کردن پنجره CuteFTP را نداد. "
+                f"ربات PID={win32api.GetCurrentProcessId()}، "
+                f"CuteFTP PID={target_pid}، "
+                f"پنجره فعال PID={active_pid}/TID={active_tid} "
+                f"عنوان={active_title!r}. "
+                "بررسی کنید هر دو برنامه با یک کاربر و سطح دسترسی یکسان "
+                "در یک نشست دسکتاپ اجرا شوند؛ CuteFTP را از حالت Run as "
+                "administrator خارج کنید یا ربات را نیز با همان سطح اجرا کنید."
+            )
+
+        # Focus the child edit/list control after CuteFTP owns the foreground.
+        user32.SetFocus(control_hwnd)
+
     finally:
-        if attached:
-            user32.AttachThreadInput(cur_tid, target_tid, False)
+        for thread_a, thread_b in reversed(attached_pairs):
+            try:
+                user32.AttachThreadInput(thread_a, thread_b, False)
+            except Exception:
+                pass
 
-    time.sleep(0.3)
-    return True, actual_remote_path
+def _paste_text_into_control(main_hwnd: int, control_hwnd: int, text: str) -> bool:
+    _copy_text_to_clipboard(text)
+    _focus_cuteftp_control(main_hwnd, control_hwnd)
+    _press_ctrl_key(ord("A"))
+    _press_ctrl_key(ord("V"))
+    time.sleep(0.15)
+    return _get_edit_text(control_hwnd).strip() == text
+
+
+def _find_cuteftp_dialog(main_hwnd: int, timeout: float = 2.5) -> int | None:
+    _, process_id = win32process.GetWindowThreadProcessId(main_hwnd)
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        dialogs = []
+
+        def _enum_window(hwnd, _):
+            if hwnd == main_hwnd or not win32gui.IsWindowVisible(hwnd):
+                return
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if pid != process_id:
+                    return
+                owner = win32gui.GetWindow(hwnd, win32con.GW_OWNER)
+                if owner == main_hwnd or win32gui.GetClassName(hwnd) == "#32770":
+                    dialogs.append(hwnd)
+            except Exception:
+                return
+
+        win32gui.EnumWindows(_enum_window, None)
+        if dialogs:
+            return dialogs[0]
+        time.sleep(0.08)
+
+    return None
+
+
+def _find_dialog_edit(dialog_hwnd: int) -> int | None:
+    candidates = []
+
+    def _enum_child(hwnd, _):
+        try:
+            cls_name = win32gui.GetClassName(hwnd)
+            if cls_name not in ("Edit", "ComboBox", "ComboBoxEx32"):
+                return
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            width, height = right - left, bottom - top
+            if width >= 100 and 12 <= height <= 60:
+                candidates.append((width, hwnd))
+        except Exception:
+            return
+
+    win32gui.EnumChildWindows(dialog_hwnd, _enum_child, None)
+    candidates.sort(reverse=True)
+    return candidates[0][1] if candidates else None
+
+
+def _navigate_using_cuteftp_dialog(
+    main_hwnd: int,
+    remote_listview: int | None,
+    target_path: str,
+) -> bool:
+    """CuteFTP 9 documents Ctrl+D as its Change Remote Folder command."""
+    _focus_cuteftp_control(main_hwnd, remote_listview or main_hwnd)
+    _press_ctrl_key(ord("D"))
+
+    dialog_hwnd = _find_cuteftp_dialog(main_hwnd)
+    if not dialog_hwnd:
+        return False
+
+    dialog_edit = _find_dialog_edit(dialog_hwnd)
+    if not dialog_edit:
+        return False
+
+    if not _paste_text_into_control(dialog_hwnd, dialog_edit, target_path):
+        return False
+
+    # IDOK is the standard OK command for a Windows dialog.
+    user32.SendMessageW(dialog_hwnd, win32con.WM_COMMAND, 1, 0)
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if not win32gui.IsWindow(dialog_hwnd) or not win32gui.IsWindowVisible(dialog_hwnd):
+            time.sleep(1.5)
+            _, address_edit = _find_remote_controls(main_hwnd)
+            current = _get_edit_text(address_edit).strip() if address_edit else ""
+            return bool(current and _paths_equal(current, target_path))
+        time.sleep(0.1)
+
+    return False
+
+
+def _navigate_cuteftp_gui_to_path(
+    main_hwnd: int,
+    edit_hwnd: int | None,
+    remote_listview: int | None,
+    target_remote_dir: str,
+) -> str:
+    if not target_remote_dir or target_remote_dir == "__CURRENT__":
+        current = _get_edit_text(edit_hwnd).strip() if edit_hwnd else ""
+        return _normalise_remote_path(current)
+
+    target = _normalise_remote_path(target_remote_dir)
+    if not target:
+        raise RuntimeError("مسیر مقصد خالی است.")
+
+    current = _get_edit_text(edit_hwnd).strip() if edit_hwnd else ""
+    if current and _paths_equal(current, target):
+        return target
+
+    # First use the actual Remote address Edit. Real Ctrl+A / Ctrl+V / Enter
+    # generates the control notifications that WM_SETTEXT + PostMessage missed.
+    if edit_hwnd:
+        try:
+            if _paste_text_into_control(main_hwnd, edit_hwnd, target):
+                _press_key(win32con.VK_RETURN)
+                time.sleep(2.0)
+                if _paths_equal(_get_edit_text(edit_hwnd).strip(), target):
+                    return target
+        except Exception:
+            logger.exception("Direct CuteFTP Remote address navigation failed.")
+
+    # Fallback to CuteFTP's own Change Remote Folder dialog (Ctrl+D).
+    if _navigate_using_cuteftp_dialog(main_hwnd, remote_listview, target):
+        return target
+
+    raise RuntimeError(
+        f"مسیر مقصد [{target}] در CuteFTP اعمال و تأیید نشد؛ "
+        "برای جلوگیری از آپلود در پوشه قبلی، هیچ فایلی ارسال نشد."
+    )
+
+
+def upload_via_open_cuteftp_gui(
+    local_target: Path,
+    target_remote_dir: str = "__CURRENT__",
+) -> tuple[bool, str]:
+    """Upload through the user's already-authenticated, open CuteFTP session."""
+    local_target = Path(local_target).resolve()
+    if not local_target.exists():
+        raise FileNotFoundError(f"فایل یا پوشه محلی پیدا نشد: {local_target}")
+
+    with _CUTEFTP_GUI_LOCK:
+        main_hwnd = _find_cuteftp_gui_window()
+        if not main_hwnd:
+            raise RuntimeError(
+                "پنجره CuteFTP پیدا نشد. برنامه باید در همان نشست تعاملی ویندوز باز باشد."
+            )
+
+        remote_pane_hwnd, remote_edit_hwnd = _find_remote_controls(main_hwnd)
+        if not remote_pane_hwnd:
+            raise RuntimeError(
+                "پنل Remote در CuteFTP پیدا نشد؛ آپلود برای جلوگیری از مقصد اشتباه لغو شد."
+            )
+
+        actual_remote_path = _navigate_cuteftp_gui_to_path(
+            main_hwnd,
+            remote_edit_hwnd,
+            remote_pane_hwnd,
+            target_remote_dir,
+        )
+        if not actual_remote_path:
+            raise RuntimeError(
+                "مسیر فعلی Remote قابل تشخیص نیست؛ آپلود در مقصد نامشخص انجام نشد."
+            )
+
+        # Reacquire after navigation in case CuteFTP rebuilt its child controls.
+        remote_pane_hwnd, remote_edit_hwnd = _find_remote_controls(main_hwnd)
+        if not remote_pane_hwnd:
+            raise RuntimeError("پس از تغییر مسیر، پنل Remote پیدا نشد؛ آپلود لغو شد.")
+
+        if target_remote_dir and target_remote_dir != "__CURRENT__":
+            visible_path = _get_edit_text(remote_edit_hwnd).strip() if remote_edit_hwnd else ""
+            if not visible_path or not _paths_equal(visible_path, actual_remote_path):
+                raise RuntimeError(
+                    "مسیر قابل مشاهده در نوار Remote با مقصد انتخابی مطابقت ندارد؛ آپلود لغو شد."
+                )
+
+        # CF_HDROP + Ctrl+V is the native CuteFTP clipboard-upload workflow.
+        _copy_files_to_windows_clipboard([str(local_target)])
+        _focus_cuteftp_control(main_hwnd, remote_pane_hwnd)
+        _press_ctrl_key(ord("V"))
+        time.sleep(0.5)
+
+        return True, actual_remote_path
 
 
 def get_current_cuteftp_remote_dir() -> str:
@@ -248,7 +504,7 @@ def get_current_cuteftp_remote_dir() -> str:
         if remote_edit_hwnd:
             txt = _get_edit_text(remote_edit_hwnd).strip()
             if txt:
-                return txt
+                return _normalise_remote_path(txt)
     except Exception:
         pass
     return cfg.get("cuteftp", "remote_base_dir", "/English/Movies")
