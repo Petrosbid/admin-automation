@@ -185,41 +185,128 @@ def _copy_text_to_clipboard(text: str):
 
 
 def _focus_cuteftp_control(main_hwnd: int, control_hwnd: int):
+    """
+    Activate CuteFTP despite Windows foreground-lock restrictions.
+
+    Windows may refuse SetForegroundWindow when the bot is running in the
+    background. Temporarily attach the bot's input queue to both the current
+    foreground thread and CuteFTP's GUI thread, send the documented Alt
+    activation nudge, then activate and focus the requested child control.
+    """
+    if not win32gui.IsWindow(main_hwnd):
+        raise RuntimeError("پنجره اصلی CuteFTP دیگر معتبر نیست.")
+    if not win32gui.IsWindow(control_hwnd):
+        raise RuntimeError("کنترل مقصد در پنجره CuteFTP معتبر نیست.")
+
     if win32gui.IsIconic(main_hwnd):
         win32gui.ShowWindow(main_hwnd, win32con.SW_RESTORE)
         time.sleep(0.25)
+    else:
+        win32gui.ShowWindow(main_hwnd, win32con.SW_SHOW)
+
+    target_tid, target_pid = win32process.GetWindowThreadProcessId(main_hwnd)
+    control_tid, control_pid = win32process.GetWindowThreadProcessId(control_hwnd)
+    current_tid = win32api.GetCurrentThreadId()
+
+    attached_pairs = []
+
+    def _attach(thread_a: int, thread_b: int):
+        if not thread_a or not thread_b or thread_a == thread_b:
+            return
+        if (thread_a, thread_b) in attached_pairs or (thread_b, thread_a) in attached_pairs:
+            return
+        if user32.AttachThreadInput(thread_a, thread_b, True):
+            attached_pairs.append((thread_a, thread_b))
 
     try:
-        win32gui.BringWindowToTop(main_hwnd)
-        win32gui.SetForegroundWindow(main_hwnd)
-    except Exception:
-        pass
-    time.sleep(0.15)
+        # Joining the foreground input queue is important: merely calling
+        # SetForegroundWindow from a background worker is often ignored by Windows.
+        foreground_hwnd = win32gui.GetForegroundWindow()
+        foreground_tid = 0
+        if foreground_hwnd and win32gui.IsWindow(foreground_hwnd):
+            foreground_tid, _ = win32process.GetWindowThreadProcessId(foreground_hwnd)
 
-    foreground = win32gui.GetForegroundWindow()
-    if foreground != main_hwnd:
+        _attach(current_tid, foreground_tid)
+        _attach(current_tid, target_tid)
+        _attach(current_tid, control_tid)
+
+        # Restore and raise the main CuteFTP window.
         try:
-            _, fg_pid = win32process.GetWindowThreadProcessId(foreground)
-            _, main_pid = win32process.GetWindowThreadProcessId(main_hwnd)
+            win32gui.BringWindowToTop(main_hwnd)
         except Exception:
-            fg_pid, main_pid = -1, -2
-        if fg_pid != main_pid:
+            pass
+
+        # A short Alt key press can release the foreground activation lock on
+        # Windows versions that otherwise ignore SetForegroundWindow.
+        try:
+            win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+            time.sleep(0.04)
+            win32api.keybd_event(
+                win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0
+            )
+            time.sleep(0.06)
+        except Exception:
+            pass
+
+        try:
+            win32gui.SetForegroundWindow(main_hwnd)
+        except Exception:
+            pass
+        try:
+            win32gui.SetActiveWindow(main_hwnd)
+        except Exception:
+            pass
+        try:
+            user32.SetFocus(control_hwnd)
+        except Exception:
+            pass
+
+        # GetForegroundWindow returns a top-level window. It may be a CuteFTP
+        # owned window, not the exact main HWND, so compare process IDs.
+        deadline = time.monotonic() + 1.5
+        foreground_pid = None
+        foreground_title = ""
+        while time.monotonic() < deadline:
+            active_hwnd = win32gui.GetForegroundWindow()
+            if active_hwnd and win32gui.IsWindow(active_hwnd):
+                try:
+                    _, foreground_pid = win32process.GetWindowThreadProcessId(active_hwnd)
+                    foreground_title = win32gui.GetWindowText(active_hwnd)
+                except Exception:
+                    foreground_pid = None
+            if foreground_pid == target_pid:
+                break
+            time.sleep(0.05)
+
+        if foreground_pid != target_pid:
+            # Distinguish a failed activation from different Windows sessions.
+            try:
+                active_hwnd = win32gui.GetForegroundWindow()
+                active_tid, active_pid = win32process.GetWindowThreadProcessId(active_hwnd)
+                active_title = win32gui.GetWindowText(active_hwnd)
+            except Exception:
+                active_tid, active_pid, active_title = 0, 0, "<unknown>"
+
             raise RuntimeError(
-                "CuteFTP نمی‌تواند پنجره فعال شود. CuteFTP و ربات باید در یک "
-                "نشست تعاملی ویندوز اجرا شوند و صفحه قفل نباشد."
+                "ویندوز اجازه فعال‌کردن پنجره CuteFTP را نداد. "
+                f"ربات PID={win32api.GetCurrentProcessId()}، "
+                f"CuteFTP PID={target_pid}، "
+                f"پنجره فعال PID={active_pid}/TID={active_tid} "
+                f"عنوان={active_title!r}. "
+                "بررسی کنید هر دو برنامه با یک کاربر و سطح دسترسی یکسان "
+                "در یک نشست دسکتاپ اجرا شوند؛ CuteFTP را از حالت Run as "
+                "administrator خارج کنید یا ربات را نیز با همان سطح اجرا کنید."
             )
 
-    target_tid, _ = win32process.GetWindowThreadProcessId(control_hwnd)
-    current_tid = win32api.GetCurrentThreadId()
-    attached = False
-    try:
-        if current_tid != target_tid:
-            attached = bool(user32.AttachThreadInput(current_tid, target_tid, True))
+        # Focus the child edit/list control after CuteFTP owns the foreground.
         user32.SetFocus(control_hwnd)
-    finally:
-        if attached:
-            user32.AttachThreadInput(current_tid, target_tid, False)
 
+    finally:
+        for thread_a, thread_b in reversed(attached_pairs):
+            try:
+                user32.AttachThreadInput(thread_a, thread_b, False)
+            except Exception:
+                pass
 
 def _paste_text_into_control(main_hwnd: int, control_hwnd: int, text: str) -> bool:
     _copy_text_to_clipboard(text)
