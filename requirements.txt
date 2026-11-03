@@ -1,0 +1,11 @@
+aiogram
+aiohttp
+aiohttp-socks
+pyyaml
+pywin32
+beautifulsoup4
+lxml
+cloudscraper
+gdown
+chardet
+ffsubsync

@@ -1,0 +1,55 @@
+telegram:
+  bot_token: "9194234248:AAGGkeiVf7E8v0BAL_Ft1R-VUvS6oh2ESME"
+  admin_ids:
+    - 815777731
+proxy:
+  enabled: true
+  # مثال: socks5://127.0.0.1:10808 یا http://user:pass@ip:port
+  url: "https://t.me/proxy?server=me.foltmeingop.co.uk&port=8880&secret=eeNEgYdJvXrFGRMCIMJdCQ"
+
+paths:
+  workspace_dir: "C:\\MediaBot\\workspace"
+  presets_dir: "C:\\MediaBot\\presets"
+  aria2c_bin: "C:\\Tools\\aria2\\aria2c.exe"
+  mkvmerge_bin: "C:\\Program Files\\MKVToolNix\\mkvmerge.exe"
+  mkvextract_bin: "C:\\Program Files\\MKVToolNix\\mkvextract.exe"
+  handbrake_bin: "C:\\Program Files\\HandBrakeCLI\\HandBrakeCLI.exe"
+  megadl_bin: "C:\\Tools\\megatools\\megatools.exe"
+  ffsubsync_bin: "ffsubsync"
+  ffmpeg_dir: "C:\\Tools\\ffmpeg\\bin"
+
+  qbittorrent:
+    webui_url: "http://127.0.0.1:8080"
+    username: "admin"
+    password: "adminpassword"
+
+
+branding:
+  site_tag: "EmpireBestTv"
+  global_title_and_track_name: ".::EmpireBestTv.Com::."
+  sub_fa_language: "per"
+  sub_en_language: "eng"
+  fa_default_flag: true
+  fa_forced_flag: true
+
+subtitle_sync:
+  # اگر true باشد، حتی بدون پرسش هم همیشه زیرنویس فارسی قبل از مرج/هاردساب سینک می‌شود
+  always_auto_sync: false
+  default_offset_ms: 0
+
+subtitle_style:
+  font_name: "Vazirmatn"
+  font_size: 22
+  hex_color: "#fbff00"
+  bold: true
+  outline_width: 2.0
+  shadow_depth: 1.0
+
+cuteftp:
+  host: "185.130.50.130"
+  port: 21
+  protocol: "FTP"          # FTP, FTPS, SFTP
+  username: "hamid@dl15.cdnzed.sbs"
+  password: "ftppassword"
+  remote_base_dir: "/public_html/media"
+  base_download_url: "https://dl.example.com/media"
