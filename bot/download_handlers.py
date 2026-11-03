@@ -1,720 +1,322 @@
-import re
 import uuid
-
 from pathlib import Path
-
-from aiogram import Router, F
-from aiogram.types import (
-    Message,
-    CallbackQuery
-)
+from aiogram import Router, F, Bot
+from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
 from core.config_loader import cfg
 from core.queue_manager import queue_engine
-
-from services.downloader_service import DownloaderService
 from services.scraper_service import ScraperService
-
-from bot.handlers import BotStates
-
+from services.downloader_service import DownloaderService
+from services.mkv_service import MKVService
 from bot.keyboards import (
-    main_menu_kb,
-    download_target_folders_kb,
-    search_results_kb
+    main_menu_kb, search_categories_kb, search_sites_kb,
+    search_results_kb, download_target_folders_kb
 )
 
-
-router = Router(name="download_management")
+router = Router()
 
 
 class DownloadStates(StatesGroup):
-
-    waiting_link = State()
-
-    waiting_folder_name = State()
-
-
-def _safe_folder_name(name: str) -> str:
-
-    name = re.sub(
-        r'[<>:"/\\|?*]',
-        "",
-        name
-    )
-
-    name = name.strip().replace(" ", "_")
-
-    return name[:100] or "New_Download"
+    waiting_search_query = State()
+    waiting_direct_link = State()
+    choosing_download_folder = State()
+    waiting_direct_folder_name = State()
+    waiting_link_for_sub_extract = State()
 
 
-def _format_search_results(results: list[dict]) -> str:
-
-    lines = [
-        "🔍 <b>نتایج جست‌وجو</b>",
-        "",
-        "نام کامل هر نتیجه:",
-        ""
-    ]
-
-    for idx, item in enumerate(results[:25], 1):
-
-        title = str(
-            item.get("title", "بدون عنوان")
-        )
-
-        icon = (
-            "🧲"
-            if item.get("type") == "magnet"
-            else "📄"
-        )
-
-        lines.append(
-            f"{idx}. {icon} <b>{title}</b>"
-        )
-
-    lines.extend([
-        "",
-        "برای انتخاب، روی دکمه مربوط به نتیجه کلیک کنید."
-    ])
-
-    return "\n".join(lines)
+def is_admin(user_id: int) -> bool:
+    return user_id in cfg.get("telegram", "admin_ids", [])
 
 
-async def _show_download_targets(
-    target: str,
-    suggested_name: str,
-    state: FSMContext,
-    message: Message,
-    edit: bool = False
-):
-
+async def _show_download_targets(target_msg_or_call: Message | CallbackQuery, state: FSMContext):
+    """نمایش لیست پوشه‌های موجود در Workspace یا گزینه ساخت پوشه جدید برای دانلود"""
     folders = DownloaderService.list_workspace_folders()
-
-    await state.update_data(
-        pending_download_target=target,
-        suggested_folder_name=suggested_name,
-        available_download_folders=[
-            str(folder)
-            for folder in folders
-        ]
-    )
+    await state.update_data(dl_available_folders=[str(f.resolve()) for f in folders])
+    await state.set_state(DownloadStates.choosing_download_folder)
 
     text = (
-        "📥 <b>انتخاب مقصد دانلود</b>\n\n"
-        f"🎬 عنوان: <b>{suggested_name}</b>\n\n"
-        "یکی از پوشه‌های موجود را انتخاب کنید "
-        "یا یک پوشه جدید بسازید."
+        "📂 **انتخاب پوشه مقصد دانلود:**\n\n"
+        "یکی از پوشه‌های موجود زیر را انتخاب کنید و یا دکمه **«➕ ساخت پوشه جدید»** را بزنید:"
     )
+    kb = download_target_folders_kb(folders)
 
-    keyboard = download_target_folders_kb(
-        folders
-    )
-
-    if edit:
-
-        await message.edit_text(
-            text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-
+    if isinstance(target_msg_or_call, CallbackQuery):
+        await target_msg_or_call.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
     else:
-
-        await message.answer(
-            text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
+        await target_msg_or_call.answer(text, reply_markup=kb, parse_mode="Markdown")
 
 
-async def _enqueue_download(
-    message: Message,
-    state: FSMContext,
-    parent_dir: Path,
-    suggested_name: str
-):
+# ==================== ۱. جستجو و دانلود از ۹ سایت ====================
+@router.callback_query(F.data == "menu:search")
+async def cb_search_menu(call: CallbackQuery):
+    await call.message.edit_text("🔍 دسته‌بندی سایت مورد نظر را انتخاب کنید:", reply_markup=search_categories_kb())
 
+
+@router.callback_query(F.data.startswith("scat:"))
+async def cb_search_cat(call: CallbackQuery):
+    cat = call.data.split(":")[1]
+    await call.message.edit_text("🌐 سایت مورد نظر برای جستجو را انتخاب کنید:", reply_markup=search_sites_kb(cat))
+
+
+@router.callback_query(F.data.startswith("ssite:"))
+async def cb_select_site(call: CallbackQuery, state: FSMContext):
+    site_key = call.data.split(":")[1]
+    await state.update_data(selected_site=site_key)
+    await state.set_state(DownloadStates.waiting_search_query)
+    await call.message.edit_text(f"✏️ نام فیلم، سریال یا انیمه را برای جستجو در `{site_key}` ارسال کنید:", parse_mode="Markdown")
+
+
+@router.message(DownloadStates.waiting_search_query)
+async def handle_search_query(message: Message, state: FSMContext):
     data = await state.get_data()
-
-    target = data.get(
-        "pending_download_target"
-    )
-
-    if not target:
-
-        return await message.answer(
-            "❌ لینک دانلود پیدا نشد."
-        )
-
-    safe_name = _safe_folder_name(
-        suggested_name
-    )
-
-    dest_dir = parent_dir / safe_name
-
-    dest_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    task = await queue_engine.add_task(
-        "download",
-        f"دانلود: {safe_name}",
-        DownloaderService.download,
-        target,
-        dest_dir
-    )
-
-    await state.clear()
-
-    await message.answer(
-        f"✅ <b>دانلود به صف اضافه شد.</b>\n\n"
-        f"🎬 عنوان: <b>{safe_name}</b>\n"
-        f"🆔 شناسه: <code>{task.task_id}</code>\n"
-        f"📂 مسیر: <code>{dest_dir}</code>\n\n"
-        "می‌توانید دانلودهای دیگری نیز اضافه کنید.",
-        reply_markup=main_menu_kb(),
-        parse_mode="HTML"
-    )
-
-
-async def _enqueue_download_from_callback(
-    call: CallbackQuery,
-    state: FSMContext,
-    parent_dir: Path,
-    suggested_name: str
-):
-
-    data = await state.get_data()
-
-    target = data.get(
-        "pending_download_target"
-    )
-
-    if not target:
-
-        return await call.answer(
-            "لینک دانلود پیدا نشد.",
-            show_alert=True
-        )
-
-    safe_name = _safe_folder_name(
-        suggested_name
-    )
-
-    dest_dir = parent_dir / safe_name
-
-    dest_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    task = await queue_engine.add_task(
-        "download",
-        f"دانلود: {safe_name}",
-        DownloaderService.download,
-        target,
-        dest_dir
-    )
-
-    await state.clear()
-
-    await call.message.edit_text(
-        f"✅ <b>دانلود به صف اضافه شد.</b>\n\n"
-        f"🎬 عنوان: <b>{safe_name}</b>\n"
-        f"🆔 شناسه: <code>{task.task_id}</code>\n"
-        f"📂 مسیر: <code>{dest_dir}</code>\n\n"
-        "می‌توانید دانلودهای دیگری نیز اضافه کنید.",
-        reply_markup=main_menu_kb(),
-        parse_mode="HTML"
-    )
-
-
-# ==================================================
-# DIRECT DOWNLOAD
-# ==================================================
-
-@router.callback_query(F.data == "menu:direct_dl")
-async def start_direct_download(
-    call: CallbackQuery,
-    state: FSMContext
-):
-
-    await state.clear()
-
-    await state.set_state(
-        DownloadStates.waiting_link
-    )
-
-    await call.message.edit_text(
-        "📥 <b>دانلود مستقیم</b>\n\n"
-        "لینک مورد نظر را ارسال کنید:\n\n"
-        "• HTTP / HTTPS\n"
-        "• Magnet\n"
-        "• Torrent\n"
-        "• Mega.nz\n"
-        "• Google Drive\n\n"
-        "همچنین می‌توانید فایل .torrent را ارسال کنید.",
-        parse_mode="HTML"
-    )
-
-    await call.answer()
-
-
-@router.message(
-    DownloadStates.waiting_link,
-    F.text
-)
-async def receive_download_link(
-    message: Message,
-    state: FSMContext
-):
-
-    target = (
-        message.text or ""
-    ).strip()
-
-    if not target.startswith(
-        ("http://", "https://", "magnet:?")
-    ):
-
-        return await message.answer(
-            "⚠️ لینک معتبر ارسال کنید."
-        )
-
-    await state.update_data(
-        pending_download_target=target
-    )
-
-    await _show_download_targets(
-        target=target,
-        suggested_name="New_Download",
-        state=state,
-        message=message
-    )
-
-
-@router.message(
-    DownloadStates.waiting_link,
-    F.document
-)
-async def receive_download_torrent(
-    message: Message,
-    state: FSMContext
-):
-
-    filename = (
-        message.document.file_name or ""
-    )
-
-    if not filename.lower().endswith(".torrent"):
-
-        return await message.answer(
-            "⚠️ لطفاً فایل .torrent ارسال کنید."
-        )
-
-    workspace = Path(
-        cfg.get("paths", "workspace_dir")
-    ).resolve()
-
-    incoming_dir = workspace / "_incoming_torrents"
-
-    incoming_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    safe_filename = Path(filename).name
-
-    torrent_path = incoming_dir / (
-        f"{uuid.uuid4().hex[:8]}_{safe_filename}"
-    )
-
-    await message.bot.download(
-        message.document,
-        destination=torrent_path
-    )
-
-    target = str(torrent_path)
-
-    await _show_download_targets(
-        target=target,
-        suggested_name=Path(filename).stem,
-        state=state,
-        message=message
-    )
-
-
-# ==================================================
-# DIRECT LINKS SENT OUTSIDE THE DOWNLOAD MENU
-# ==================================================
-
-@router.message(
-    F.text.regexp(r"^(magnet:\?xt=|https?://)")
-)
-async def catch_direct_link(
-    message: Message,
-    state: FSMContext
-):
-
-    if message.from_user.id not in cfg.get(
-        "telegram",
-        "admin_ids",
-        []
-    ):
-        return
-
-    target = message.text.strip()
-
-    await state.clear()
-
-    await _show_download_targets(
-        target=target,
-        suggested_name="New_Download",
-        state=state,
-        message=message
-    )
-
-
-@router.message(
-    F.document.file_name.regexp(r"(?i)\.torrent$")
-)
-async def catch_torrent_file(
-    message: Message,
-    state: FSMContext
-):
-
-    if message.from_user.id not in cfg.get(
-        "telegram",
-        "admin_ids",
-        []
-    ):
-        return
-
-    workspace = Path(
-        cfg.get("paths", "workspace_dir")
-    ).resolve()
-
-    incoming_dir = workspace / "_incoming_torrents"
-
-    incoming_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    filename = Path(
-        message.document.file_name
-    ).name
-
-    torrent_path = incoming_dir / (
-        f"{uuid.uuid4().hex[:8]}_{filename}"
-    )
-
-    await message.bot.download(
-        message.document,
-        destination=torrent_path
-    )
-
-    await state.clear()
-
-    await _show_download_targets(
-        target=str(torrent_path),
-        suggested_name=Path(filename).stem,
-        state=state,
-        message=message
-    )
-
-
-# ==================================================
-# EXISTING FOLDER SELECTION
-# ==================================================
-
-@router.callback_query(F.data.startswith("dlfolder:"))
-async def choose_existing_download_folder(
-    call: CallbackQuery,
-    state: FSMContext
-):
+    site_key = data["selected_site"]
+    wait_msg = await message.answer("⏳ در حال جستجو...")
 
     try:
-
-        idx = int(
-            call.data.split(":")[1]
-        )
-
-        data = await state.get_data()
-
-        folders = data.get(
-            "available_download_folders",
-            []
-        )
-
-        if idx < 0 or idx >= len(folders):
-
-            return await call.answer(
-                "پوشه انتخاب شده معتبر نیست.",
-                show_alert=True
-            )
-
-        selected_folder = Path(
-            folders[idx]
-        ).resolve()
-
-        workspace = Path(
-            cfg.get("paths", "workspace_dir")
-        ).resolve()
-
-        if not selected_folder.is_relative_to(workspace):
-
-            return await call.answer(
-                "مسیر انتخاب شده خارج از Workspace است.",
-                show_alert=True
-            )
-
-        if not selected_folder.is_dir():
-
-            return await call.answer(
-                "پوشه دیگر وجود ندارد.",
-                show_alert=True
-            )
-
-        suggested_name = data.get(
-            "suggested_folder_name",
-            "New_Download"
-        )
-
-        await _enqueue_download_from_callback(
-            call,
-            state,
-            selected_folder,
-            suggested_name
-        )
-
-        await call.answer(
-            "دانلود به صف اضافه شد."
-        )
-
-    except Exception as exc:
-
-        await call.answer(
-            f"خطا: {str(exc)[:150]}",
-            show_alert=True
-        )
-
-
-# ==================================================
-# CREATE NEW FOLDER
-# ==================================================
-
-@router.callback_query(F.data == "dlnew")
-async def create_download_folder_start(
-    call: CallbackQuery,
-    state: FSMContext
-):
-
-    await state.set_state(
-        DownloadStates.waiting_folder_name
-    )
-
-    data = await state.get_data()
-
-    suggested_name = data.get(
-        "suggested_folder_name",
-        ""
-    )
-
-    await call.message.edit_text(
-        "📁 <b>ساخت پوشه جدید</b>\n\n"
-        f"نام پیشنهادی:\n<code>{suggested_name}</code>\n\n"
-        "نام پوشه مقصد را ارسال کنید:",
-        parse_mode="HTML"
-    )
-
-    await call.answer()
-
-
-@router.message(
-    DownloadStates.waiting_folder_name,
-    F.text
-)
-async def receive_new_download_folder_name(
-    message: Message,
-    state: FSMContext
-):
-
-    folder_name = _safe_folder_name(
-        message.text
-    )
-
-    workspace = Path(
-        cfg.get("paths", "workspace_dir")
-    ).resolve()
-
-    folders = DownloaderService.create_movie_folders(
-        folder_name
-    )
-
-    await _enqueue_download(
-        message,
-        state,
-        workspace,
-        folder_name
-    )
-
-
-# ==================================================
-# SEARCH
-# ==================================================
-
-@router.message(
-    BotStates.waiting_search_query,
-    F.text
-)
-async def search_with_full_titles(
-    message: Message,
-    state: FSMContext
-):
-
-    data = await state.get_data()
-
-    site_key = data.get(
-        "selected_site"
-    )
-
-    if not site_key:
-
-        return await message.answer(
-            "❌ سایت جست‌وجو مشخص نشده است."
-        )
-
-    wait_message = await message.answer(
-        "🔍 در حال جست‌وجو..."
-    )
-
-    try:
-
-        results = await ScraperService.search(
-            site_key,
-            message.text.strip()
-        )
-
+        results = await ScraperService.search(site_key, message.text.strip())
         if not results:
+            return await wait_msg.edit_text("❌ نتیجه‌ای یافت نشد.", reply_markup=main_menu_kb())
 
-            return await wait_message.edit_text(
-                "❌ نتیجه‌ای یافت نشد.",
-                reply_markup=main_menu_kb()
-            )
-
-        results = results[:25]
-
-        await state.update_data(
-            search_results=results
-        )
-
-        await wait_message.edit_text(
-            _format_search_results(results),
+        await state.update_data(search_results=results)
+        await wait_msg.edit_text(
+            f"✅ نتایج یافت شده برای `{message.text}`:\nروی گزینه دلخواه کلیک کنید تا دانلود شود:",
             reply_markup=search_results_kb(results),
-            parse_mode="HTML"
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ خطا در جستجو:\n`{e}`", reply_markup=main_menu_kb(), parse_mode="Markdown")
+
+
+@router.callback_query(F.data.startswith("sres:"))
+async def cb_click_search_result(call: CallbackQuery, state: FSMContext):
+    idx = int(call.data.split(":")[1])
+    data = await state.get_data()
+    results = data.get("search_results", [])
+    if idx >= len(results):
+        return await call.answer("⚠️ نتیجه منقضی شده است، دوباره جستجو کنید.", show_alert=True)
+
+    chosen = results[idx]
+
+    if chosen.get("type") == "page":
+        await call.message.edit_text("⏳ در حال استخراج لینک‌های Mega و Google Drive از داخل صفحه...")
+        sub_links = await ScraperService.extract_links_from_page(chosen["target"])
+        if not sub_links:
+            return await call.message.edit_text("❌ لینک مستقیمی در صفحه پیدا نشد.", reply_markup=main_menu_kb())
+        for sl in sub_links:
+            sl["type"] = "direct"
+        await state.update_data(search_results=sub_links)
+        return await call.message.edit_text(
+            "🔗 لینک‌های استخراج شده از صفحه (برای شروع دانلود کلیک کنید):",
+            reply_markup=search_results_kb(sub_links)
         )
 
-    except Exception as exc:
+    await state.update_data(pending_direct_target=chosen["target"])
+    await _show_download_targets(call, state)
 
-        await wait_message.edit_text(
-            f"❌ خطا در جست‌وجو:\n<code>{str(exc)[:1000]}</code>",
+
+# ==================== ۲. دانلود لینک مستقیم / تورنت / مگا / گوگل درایو ====================
+@router.callback_query(F.data == "menu:direct_dl")
+async def cb_direct_dl(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(DownloadStates.waiting_direct_link)
+    await call.message.edit_text(
+        "📥 **دانلود فیلم یا سریال**\n\n"
+        "🔗 لطفاً **لینک مستقیم، لینک Magnet، لینک Mega.nz یا Google Drive** را ارسال کنید (و یا **فایل `.torrent`** بفرستید):",
+        parse_mode="Markdown"
+    )
+
+
+@router.message(DownloadStates.waiting_direct_link)
+async def handle_direct_link_input(message: Message, state: FSMContext):
+    if message.document and message.document.file_name and message.document.file_name.lower().endswith(".torrent"):
+        temp_dir = Path(cfg.get("paths", "workspace_dir")) / "_incoming_torrents"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        t_path = temp_dir / message.document.file_name
+        await message.bot.download(message.document, destination=t_path)
+        target = str(t_path.resolve())
+    elif message.text:
+        target = message.text.strip()
+    else:
+        return await message.answer("⚠️ لطفاً یک لینک معتبر یا یک فایل `.torrent` ارسال کنید:")
+
+    await state.update_data(pending_direct_target=target)
+    await _show_download_targets(message, state)
+
+
+@router.callback_query(DownloadStates.choosing_download_folder, F.data.startswith("dlfolder:"))
+async def cb_select_existing_dl_folder(call: CallbackQuery, state: FSMContext):
+    idx = int(call.data.split(":")[1])
+    data = await state.get_data()
+    folders = data.get("dl_available_folders", [])
+    if idx >= len(folders):
+        return await call.answer("⚠️ پوشه یافت نشد.", show_alert=True)
+
+    chosen_dir = Path(folders[idx])
+    for sub_name in ("softsub", "hardsub", "sub"):
+        (chosen_dir / sub_name).mkdir(parents=True, exist_ok=True)
+
+    target = data["pending_direct_target"]
+    task = await queue_engine.add_task(
+        "download",
+        f"دانلود در {chosen_dir.name}",
+        DownloaderService.download,
+        target,
+        chosen_dir
+    )
+    await state.clear()
+    await call.message.edit_text(
+        f"✅ دانلود با موفقیت در صف قرار گرفت!\n"
+        f"📂 پوشه مقصد: `{chosen_dir.name}`\n"
+        f"🆔 کد تسک: `{task.task_id}`",
+        reply_markup=main_menu_kb(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(DownloadStates.choosing_download_folder, F.data == "dlnew")
+async def cb_create_new_dl_folder(call: CallbackQuery, state: FSMContext):
+    await state.set_state(DownloadStates.waiting_direct_folder_name)
+    await call.message.edit_text(
+        "📁 لطفاً **نام پوشه جدید** (نام فیلم یا سریال) را وارد کنید:",
+        parse_mode="Markdown"
+    )
+
+
+@router.message(DownloadStates.waiting_direct_folder_name)
+async def handle_direct_folder_name(message: Message, state: FSMContext):
+    if not message.text:
+        return await message.answer("⚠️ لطفاً نام پوشه را به صورت متن ارسال کنید:")
+
+    folder_name = message.text.strip()
+    data = await state.get_data()
+    pending_target = data.get("pending_direct_target")
+
+    folders = DownloaderService.create_movie_folders(folder_name)
+    if pending_target:
+        task = await queue_engine.add_task(
+            "download",
+            f"دانلود در {folders['base'].name}",
+            DownloaderService.download,
+            pending_target,
+            folders["base"]
+        )
+        await state.clear()
+        return await message.answer(
+            f"✅ دانلود با موفقیت در صف قرار گرفت!\n"
+            f"📂 پوشه ساخته شده: `{folders['base'].name}` (شامل `softsub`, `hardsub`, `sub`)\n"
+            f"🆔 کد تسک: `{task.task_id}`",
             reply_markup=main_menu_kb(),
-            parse_mode="HTML"
+            parse_mode="Markdown"
         )
 
+    await state.update_data(dl_folder_name=folder_name)
+    await state.set_state(DownloadStates.waiting_direct_link)
+    await message.answer(
+        f"📂 پوشه `{folders['base'].name}` ساخته شد.\nحالا لینک یا فایل `.torrent` را ارسال کنید:",
+        parse_mode="Markdown"
+    )
 
-@router.callback_query(
-    F.data.startswith("sres:")
-)
-async def choose_search_result(
-    call: CallbackQuery,
-    state: FSMContext
-):
 
-    try:
+# ==================== ۳. ارسال لینک دانلود فیلم و استخراج خودکار زیرنویس آن ====================
+async def _download_and_extract_subs_job(
+    bot: Bot,
+    chat_id: int,
+    target_link: str,
+    temp_dir: Path,
+    progress_callback=None
+) -> list[str]:
+    await DownloaderService.download(target_link, temp_dir, progress_callback=progress_callback)
+    videos = DownloaderService.find_video_files(temp_dir)
+    if not videos:
+        raise FileNotFoundError("هیچ فایل ویدئویی پس از دانلود یافت نشد.")
 
-        idx = int(
-            call.data.split(":")[1]
+    video_file = videos[0]
+    if progress_callback:
+        progress_callback(f"در حال استخراج زیرنویس‌ها از {video_file.name}...")
+
+    subs_dir = temp_dir / "extracted_subs"
+    extracted = await MKVService.extract_all_subtitles(video_file, subs_dir, progress_callback=progress_callback)
+
+    if not extracted:
+        await bot.send_message(chat_id, f"⚠️ فیلم `{video_file.name}` دانلود شد اما هیچ ترک زیرنویسی داخل آن وجود نداشت.", parse_mode="Markdown")
+        return []
+
+    for sub_p in extracted:
+        await bot.send_document(
+            chat_id,
+            FSInputFile(sub_p),
+            caption=f"📤 زیرنویس استخراج شده از:\n`{video_file.name}`\n📄 فایل: `{sub_p.name}`",
+            parse_mode="Markdown"
         )
+    return [str(p) for p in extracted]
 
-        data = await state.get_data()
 
-        results = data.get(
-            "search_results",
-            []
-        )
+@router.callback_query(F.data == "menu:link_extract_sub")
+async def cb_link_extract_sub(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(DownloadStates.waiting_link_for_sub_extract)
+    await call.message.edit_text(
+        "📤 **دانلود فیلم و استخراج خودکار زیرنویس**\n\n"
+        "لینک مستقیم فیلم، لینک Magnet/تورنت، یا لینک Mega/GDrive را ارسال کنید (یا فایل `.torrent` بفرستید).\n"
+        "ربات فیلم را دانلود کرده و تمام زیرنویس‌های داخل آن را استخراج و در همین چت برایتان ارسال می‌کند:",
+        parse_mode="Markdown"
+    )
 
-        if idx < 0 or idx >= len(results):
 
-            return await call.answer(
-                "نتیجه انتخاب شده معتبر نیست.",
-                show_alert=True
-            )
+@router.message(DownloadStates.waiting_link_for_sub_extract)
+async def handle_link_for_sub_extract(message: Message, state: FSMContext):
+    job_uid = str(uuid.uuid4())[:6]
+    temp_dir = Path(cfg.get("paths", "workspace_dir")) / f"SubExtract_{job_uid}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
-        chosen = results[idx]
+    if message.document and message.document.file_name and message.document.file_name.lower().endswith(".torrent"):
+        t_path = temp_dir / message.document.file_name
+        await message.bot.download(message.document, destination=t_path)
+        target = str(t_path.resolve())
+    elif message.text:
+        target = message.text.strip()
+    else:
+        return await message.answer("⚠️ لطفاً لینک یا فایل `.torrent` ارسال کنید:")
 
-        if chosen.get("type") == "page":
+    task = await queue_engine.add_task(
+        "download",
+        f"دانلود + استخراج زیرنویس ({job_uid})",
+        _download_and_extract_subs_job,
+        message.bot,
+        message.chat.id,
+        target,
+        temp_dir
+    )
+    await state.clear()
+    await message.answer(
+        f"✅ در صف قرار گرفت! (کد تسک: `{task.task_id}`)\n"
+        "به محض اتمام دانلود، فایل‌های زیرنویس استخراج شده در همین صفحه برایتان ارسال می‌شوند.",
+        reply_markup=main_menu_kb(),
+        parse_mode="Markdown"
+    )
 
-            await call.message.edit_text(
-                "⏳ در حال استخراج لینک‌های دانلود..."
-            )
 
-            sub_links = await ScraperService.extract_links_from_page(
-                chosen["target"]
-            )
+# ==================== دریافت مستقیم فایل .torrent یا لینک در حالت بدون استیت ====================
+@router.message(StateFilter(None), F.document)
+async def receive_download_torrent(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if message.document.file_name and message.document.file_name.lower().endswith(".torrent"):
+        temp_dir = Path(cfg.get("paths", "workspace_dir")) / "_incoming_torrents"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        t_path = temp_dir / message.document.file_name
+        await message.bot.download(message.document, destination=t_path)
 
-            if not sub_links:
+        await state.update_data(pending_direct_target=str(t_path.resolve()))
+        await _show_download_targets(message, state)
 
-                return await call.message.edit_text(
-                    "❌ لینک مستقیمی پیدا نشد.",
-                    reply_markup=main_menu_kb()
-                )
 
-            for link in sub_links:
-                link["type"] = "direct"
-
-            await state.update_data(
-                search_results=sub_links
-            )
-
-            await call.message.edit_text(
-                _format_search_results(sub_links),
-                reply_markup=search_results_kb(sub_links),
-                parse_mode="HTML"
-            )
-
-            return
-
-        target = chosen.get("target")
-
-        if not target:
-
-            return await call.answer(
-                "لینک دانلود پیدا نشد.",
-                show_alert=True
-            )
-
-        await _show_download_targets(
-            target=target,
-            suggested_name=chosen.get(
-                "title",
-                "New_Download"
-            ),
-            state=state,
-            message=call.message,
-            edit=True
-        )
-
-        await call.answer()
-
-    except Exception as exc:
-
-        await call.answer(
-            f"خطا: {str(exc)[:150]}",
-            show_alert=True
-        )
+@router.message(StateFilter(None), F.text.regexp(r"^(magnet:\?xt=|https?://)"))
+async def catch_direct_links_in_chat(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.update_data(pending_direct_target=message.text.strip())
+    await _show_download_targets(message, state)

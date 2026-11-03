@@ -17,7 +17,6 @@ class DownloaderService:
 
     @staticmethod
     def _resolve_binary(config_key: str, exe_name: str, common_paths: list[str] = None) -> str:
-        """پیدا کردن هوشمند فایل اجرایی از کانفیگ، متغیر PATH ویندوز یا مسیرهای استاندارد"""
         configured = cfg.get("paths", config_key)
         if configured and Path(configured).is_file():
             return str(Path(configured))
@@ -33,9 +32,22 @@ class DownloaderService:
         return configured or exe_name
 
     @staticmethod
+    def list_workspace_folders() -> list[Path]:
+        """لیست کردن تمامی پوشه‌های فیلم/سریال موجود در Workspace"""
+        workspace = Path(cfg.get("paths", "workspace_dir", "./workspace")).resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        return sorted(
+            [
+                p for p in workspace.iterdir()
+                if p.is_dir() and not p.name.startswith("_") and p.name != "browser_profile"
+            ],
+            key=lambda x: x.name.lower()
+        )
+
+    @staticmethod
     def create_movie_folders(movie_title: str) -> dict[str, Path]:
         """ساخت پوشه فیلم به همراه زیرپوشه‌های softsub, hardsub, sub"""
-        workspace = Path(cfg.get("paths", "workspace_dir"))
+        workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
         safe_name = re.sub(r'[<>:"/\\|?*]', "", movie_title).strip().replace(" ", "_")
         if not safe_name:
             safe_name = "Media_Download"
@@ -43,9 +55,9 @@ class DownloaderService:
 
         folders = {
             "base": base_dir,
-            "softsub": base_dir / "softsub",
-            "hardsub": base_dir / "hardsub",
-            "sub": base_dir / "sub",
+            "SoftSub": base_dir / "SoftSub",
+            "HardSub": base_dir / "HardSub",
+            "srt": base_dir / "srt",
         }
         for p in folders.values():
             p.mkdir(parents=True, exist_ok=True)
@@ -67,7 +79,6 @@ class DownloaderService:
 
     @staticmethod
     def is_torrent_target(target: str) -> bool:
-        """تشخیص اینکه ورودی لینک مگنت یا فایل/لینک تورنت است یا خیر"""
         t_low = target.lower().strip()
         if t_low.startswith("magnet:?"):
             return True
@@ -88,25 +99,16 @@ class DownloaderService:
         dest_dir: Path,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
-        """
-        دانلود هوشمند:
-        - تورنت و مگنت -> ۱. WebUI API مستقیم qBittorrent -> ۲. qbt.exe -> ۳. فال‌بک به aria2c
-        - گوگل درایو -> gdown
-        - مگا -> megatools
-        - لینک مستقیم -> aria2c (با فال‌بک به دانلودر استریم مستقیم aiohttp)
-        """
         dest_dir.mkdir(parents=True, exist_ok=True)
         target = url_or_magnet.strip()
         url_lower = target.lower()
 
         if cls.is_torrent_target(target):
-            # تلاش اول: ارتباط مستقیم با WebUI برنامه qBittorrent
             try:
                 return await cls._download_qbt_webui_api(target, dest_dir, progress_callback)
             except Exception as webui_err:
                 logging.warning(f"qBittorrent WebUI API fallback ({webui_err}), trying qbt.exe / aria2c...")
 
-            # تلاش دوم: استفاده از qbt.exe در صورت وجود
             qbt_bin = cls._resolve_binary("qbt_bin", "qbt.exe", [r"C:\Tools\qbt\qbt.exe"])
             if Path(qbt_bin).is_file():
                 try:
@@ -114,7 +116,6 @@ class DownloaderService:
                 except Exception as qbt_err:
                     logging.warning(f"qbt.exe failed ({qbt_err}), falling back to aria2c...")
 
-            # تلاش سوم: دانلود تورنت با aria2c
             return await cls._download_aria2(target, dest_dir, progress_callback)
 
         elif "drive.google.com" in url_lower:
@@ -135,7 +136,6 @@ class DownloaderService:
         dest_dir: Path,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
-        """دانلود تورنت مستقیماً از طریق HTTP API داخلی qBittorrent بدون نیاز به qbt.exe"""
         qbt_cfg = cfg.get("qbittorrent") or {}
         base_url = str(qbt_cfg.get("webui_url", "http://127.0.0.1:8080")).rstrip("/")
         username = qbt_cfg.get("username", "admin")
@@ -144,7 +144,6 @@ class DownloaderService:
 
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            # ۱. لاگین به WebUI
             login_resp = await session.post(
                 f"{base_url}/api/v2/auth/login",
                 data={"username": username, "password": password}
@@ -152,7 +151,6 @@ class DownloaderService:
             if login_resp.status != 200:
                 raise RuntimeError(f"qBittorrent WebUI HTTP {login_resp.status}")
 
-            # ۲. ارسال فایل .torrent یا لینک مگنت
             data = aiohttp.FormData()
             data.add_field("savepath", dest_resolved)
 
@@ -177,7 +175,7 @@ class DownloaderService:
                 raise RuntimeError(f"qBittorrent add failed: {await add_resp.text()}")
 
             if progress_callback:
-                progress_callback("تورنت به qBittorrent اضافه شد. در حال دریافت متادیتا...")
+                progress_callback("0% | تورنت به qBittorrent اضافه شد...")
 
             completed_states = {"uploading", "stalledup", "pausedup", "queuedup", "checkingup", "forcedup"}
             matched_hash = None
@@ -237,7 +235,6 @@ class DownloaderService:
         dest_dir: Path,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
-        """دانلود تورنت با استفاده از qbittorrent-cli (qbt.exe)"""
         qbt_cfg = cfg.get("qbittorrent") or {}
         auth_args = []
         if qbt_cfg.get("webui_url"):
@@ -382,7 +379,6 @@ class DownloaderService:
         dest_dir: Path,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
-        """دانلودر مستقیم داخلی پایتون (فال‌بک در صورت نصب نبودن aria2c روی سیستم تست)"""
         filename = url.split("?")[0].rstrip("/").split("/")[-1] or "downloaded_video.mkv"
         if "." not in filename:
             filename += ".mkv"

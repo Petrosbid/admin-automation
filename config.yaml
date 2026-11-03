@@ -63,5 +63,5 @@ cuteftp:
   protocol: "FTP"
   username: "ftpuser"
   password: "ftppassword"
-  remote_base_dir: "/public_html/media"
-  base_download_url: "https://dl.example.com/media"
+  remote_base_dir: "English"
+  base_download_url: "https://dl15.cdnzed.sbs/English"

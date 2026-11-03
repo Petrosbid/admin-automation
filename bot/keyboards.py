@@ -8,6 +8,20 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services.scraper_service import ScraperService
 from services.handbrake_service import HandBrakeService
+from services.cuteftp_service import CuteFTPService
+
+
+def smart_middle_truncate(text: str, max_len: int = 40) -> str:
+    """
+    برش هوشمند نام‌های طولانی از وسط، به طوری که هم ابتدای نام فیلم و هم انتهای آن
+    (کیفیت 1080p/720p، شماره قسمت، SoftSub/HardSub و پسوند فایل) کاملاً مشخص باشد.
+    """
+    text = str(text).strip()
+    if len(text) <= max_len:
+        return text
+    head_len = (max_len - 1) // 2 + 2
+    tail_len = max_len - head_len - 1
+    return f"{text[:head_len]}…{text[-tail_len:]}"
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -68,7 +82,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="📊 وضعیت صف و حذف پراسس‌ها",
+            text="📊 وضعیت صف و مدیریت پراسس‌ها",
             callback_data="menu:queues"
         ),
         InlineKeyboardButton(
@@ -79,10 +93,6 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
     return builder.as_markup()
 
-
-# ==================================================
-# MONITORING
-# ==================================================
 
 def monitor_menu_kb(is_enabled: bool) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -139,10 +149,6 @@ def monitor_menu_kb(is_enabled: bool) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# ==================================================
-# FOLDER MANAGEMENT
-# ==================================================
-
 def folder_structure_choice_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
@@ -184,7 +190,7 @@ def target_folders_kb(
 
         builder.row(
             InlineKeyboardButton(
-                text=f"📁 {rel_name[:45]}",
+                text=f"📁 [{idx+1}] {smart_middle_truncate(rel_name, 38)}",
                 callback_data=f"tsubdir:{idx}"
             )
         )
@@ -207,7 +213,7 @@ def download_target_folders_kb(
     for idx, folder in enumerate(folders[:25]):
         builder.row(
             InlineKeyboardButton(
-                text=f"📂 {folder.name[:45]}",
+                text=f"📂 [{idx+1}] {smart_middle_truncate(folder.name, 38)}",
                 callback_data=f"dlfolder:{idx}"
             )
         )
@@ -229,32 +235,45 @@ def download_target_folders_kb(
     return builder.as_markup()
 
 
-def subtitle_upload_options_kb() -> InlineKeyboardMarkup:
+def cuteftp_destination_kb(active_gui_path: str = "/") -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+
     builder.row(
         InlineKeyboardButton(
-            text="🎨 ذخیره همراه با استایل بولد و زرد (#fbff00)",
-            callback_data="subsave:styled"
+            text=f"📍 آپلود در مسیر فعلی باز در CuteFTP ({smart_middle_truncate(active_gui_path, 22)})",
+            callback_data="cftp_dest:current"
+        )
+    )
+
+    destinations = CuteFTPService.get_saved_destinations()
+    for idx, item in enumerate(destinations[:15]):
+        builder.row(
+            InlineKeyboardButton(
+                text=item["label"][:50],
+                callback_data=f"cftp_dest:preset:{idx}"
+            )
+        )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="✏️ تایپ دستی مسیر مقصد در هاست (مثلاً Series/Severance/S02)",
+            callback_data="cftp_dest:custom"
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="📄 ذخیره به صورت خام (بدون تغییر استایل)",
-            callback_data="subsave:raw"
+            text="➕ افزودن مسیر جدید به لیست دکمه‌های ثابت",
+            callback_data="cftp_dest:add_fav"
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="🔙 انصراف",
-            callback_data="menu:home"
+            text="🔙 بازگشت به فایل‌منیجر",
+            callback_data="menu:file_mgr"
         )
     )
     return builder.as_markup()
 
-
-# ==================================================
-# SEARCH
-# ==================================================
 
 def search_categories_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -324,7 +343,7 @@ def search_results_kb(
 
         builder.row(
             InlineKeyboardButton(
-                text=f"{icon} {title[:48]}",
+                text=f"{icon} [{idx+1}] {smart_middle_truncate(title, 38)}",
                 callback_data=f"sres:{idx}"
             )
         )
@@ -338,10 +357,6 @@ def search_results_kb(
 
     return builder.as_markup()
 
-
-# ==================================================
-# FILE MANAGER
-# ==================================================
 
 def file_browser_kb(
     items: list[Path],
@@ -361,7 +376,7 @@ def file_browser_kb(
 
         builder.row(
             InlineKeyboardButton(
-                text=f"{icon} {path.name[:45]}",
+                text=f"{icon} [{idx+1}] {smart_middle_truncate(path.name, 38)}",
                 callback_data=f"fitem:{idx}"
             )
         )
@@ -387,7 +402,7 @@ def file_browser_kb(
 
     builder.row(
         InlineKeyboardButton(
-            text="☁️ آپلود کل پوشه با CuteFTP",
+            text="☁️ آپلود کل این پوشه با CuteFTP (انتخاب مقصد)",
             callback_data="fact:upload_current_dir"
         )
     )
@@ -402,10 +417,6 @@ def file_browser_kb(
     return builder.as_markup()
 
 
-# ==================================================
-# VIDEO SELECTION (FOLDER BY FOLDER & MULTI-SELECT)
-# ==================================================
-
 def multi_video_select_kb(
     videos: list[Path],
     selected_indices: set[int]
@@ -418,7 +429,7 @@ def multi_video_select_kb(
 
         builder.row(
             InlineKeyboardButton(
-                text=f"{mark} {rel_label[:43]}",
+                text=f"{mark} [{idx+1}] {smart_middle_truncate(rel_label, 36)}",
                 callback_data=f"mvsel:{idx}"
             )
         )
@@ -452,7 +463,7 @@ def subtitle_folder_browser_kb(
     for idx, folder in enumerate(folders[:20]):
         builder.row(
             InlineKeyboardButton(
-                text=f"📁 پوشه: {folder.name[:44]}",
+                text=f"📁 [{idx+1}] {smart_middle_truncate(folder.name, 38)}",
                 callback_data=f"subnav:dir:{idx}"
             )
         )
@@ -462,7 +473,7 @@ def subtitle_folder_browser_kb(
         mark = "✅" if is_sel else "⬜"
         builder.row(
             InlineKeyboardButton(
-                text=f"{mark} 🎬 {vid.name[:45]}",
+                text=f"{mark} 🎬 [F{idx+1}] {smart_middle_truncate(vid.name, 35)}",
                 callback_data=f"subnav:vid:{idx}"
             )
         )
@@ -486,7 +497,7 @@ def subtitle_folder_browser_kb(
     count = len(selected_paths)
     builder.row(
         InlineKeyboardButton(
-            text=f"📎 ادامه به ارسال زیرنویس ({count} فایل انتخاب شده) ➡️",
+            text=f"📎 ادامه به مرحله زیرنویس ({count} فایل انتخاب شده) ➡️",
             callback_data="mvact:proceed"
         )
     )
@@ -499,20 +510,15 @@ def subtitle_folder_browser_kb(
     return builder.as_markup()
 
 
-# ==================================================
-# QUEUE MANAGEMENT (DELETE FINISHED / CANCEL ACTIVE)
-# ==================================================
-
 def queue_management_kb(tasks: list[Any]) -> InlineKeyboardMarkup:
-    """کیبورد مدیریت صف همراه با دکمه حذف تکی و پاکسازی کلی پراسس‌های تمام‌شده"""
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text="🔄 بروزرسانی درصد پیشرفت",
+            text="🔄 بروزرسانی لحظه‌ای",
             callback_data="menu:queues"
         ),
         InlineKeyboardButton(
-            text="🧹 حذف تمام پراسس‌های تمام‌شده",
+            text="🧹 پاکسازی تمام‌شده‌ها",
             callback_data="qact:clear_finished"
         ),
     )
@@ -527,14 +533,14 @@ def queue_management_kb(tasks: list[Any]) -> InlineKeyboardMarkup:
         if is_done:
             builder.row(
                 InlineKeyboardButton(
-                    text=f"🗑 حذف پراسس تمام‌شده #{t.task_id} ({t.title[:25]})",
+                    text=f"🗑 حذف #{t.task_id} | {smart_middle_truncate(t.title, 28)}",
                     callback_data=f"qdel:{t.task_id}"
                 )
             )
         else:
             builder.row(
                 InlineKeyboardButton(
-                    text=f"🛑 لغو و حذف #{t.task_id} ({t.title[:25]})",
+                    text=f"🛑 توقف و حذف #{t.task_id} | {smart_middle_truncate(t.title, 24)}",
                     callback_data=f"qcancel:{t.task_id}"
                 )
             )
@@ -548,34 +554,31 @@ def queue_management_kb(tasks: list[Any]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# ==================================================
-# SUBTITLE SOURCE SELECTION
-# ==================================================
-
 def subtitle_source_kb(
-    language: str
+    language: str,
+    local_subs_count: int = 0
 ) -> InlineKeyboardMarkup:
     language_name = "فارسی" if language == "fa" else "انگلیسی"
-
     builder = InlineKeyboardBuilder()
 
+    count_badge = f" ({local_subs_count} فایل یافت شد)" if local_subs_count > 0 else ""
     builder.row(
         InlineKeyboardButton(
-            text=f"🔍 بله، زیرنویس {language_name} در پوشه است",
+            text=f"📂 انتخاب زیرنویس {language_name} از پوشه sub / فیلم{count_badge}",
             callback_data=f"subscan:{language}"
         )
     )
 
     builder.row(
         InlineKeyboardButton(
-            text=f"📤 خیر، آپلود زیرنویس {language_name}",
+            text=f"📤 آپلود فایل زیرنویس {language_name} جدید",
             callback_data=f"subupload:{language}"
         )
     )
 
     builder.row(
         InlineKeyboardButton(
-            text="⏭ این زبان را رد کن",
+            text=f"⏭ بدون زیرنویس {language_name} (رد کردن)",
             callback_data=f"skip:{language}_sub"
         )
     )
@@ -597,33 +600,30 @@ def subtitle_file_found_kb(
     builder = InlineKeyboardBuilder()
 
     for idx, path in enumerate(files[:20]):
+        folder_hint = f"[{path.parent.name}] " if path.parent.name.lower() == "sub" else ""
         builder.row(
             InlineKeyboardButton(
-                text=f"📄 {path.name[:45]}",
+                text=f"📄 [{idx+1}] {folder_hint}{smart_middle_truncate(path.name, 34)}",
                 callback_data=f"subfile:{language}:{idx}"
             )
         )
 
     builder.row(
         InlineKeyboardButton(
-            text="📤 آپلود فایل دیگر",
+            text="📤 آپلود یک فایل زیرنویس دیگر از تلگرام",
             callback_data=f"subupload:{language}"
         )
     )
 
     builder.row(
         InlineKeyboardButton(
-            text="⏭ رد شدن",
+            text="⏭ رد شدن از این زبان",
             callback_data=f"skip:{language}_sub"
         )
     )
 
     return builder.as_markup()
 
-
-# ==================================================
-# SUBTITLE SYNC
-# ==================================================
 
 def sync_options_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -659,30 +659,26 @@ def sync_options_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# ==================================================
-# OPERATION MODE
-# ==================================================
-
 def subtitle_mode_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     builder.row(
         InlineKeyboardButton(
-            text="📎 فقط SoftSub",
+            text="📎 فقط SoftSub (در پوشه softsub)",
             callback_data="submode:softsub"
         )
     )
 
     builder.row(
         InlineKeyboardButton(
-            text="🔥 فقط HardSub",
+            text="🔥 فقط HardSub (در پوشه hardsub)",
             callback_data="submode:hardsub"
         )
     )
 
     builder.row(
         InlineKeyboardButton(
-            text="🚀 هر دو عملیات",
+            text="🚀 هر دو عملیات (پکیج کامل)",
             callback_data="submode:both"
         )
     )
@@ -719,10 +715,6 @@ def skip_or_cancel_kb(
     return builder.as_markup()
 
 
-# ==================================================
-# VIDEO ACTIONS
-# ==================================================
-
 def video_actions_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
@@ -737,10 +729,7 @@ def video_actions_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(
             text="📎 SoftSub",
             callback_data="vact:softsub"
-        )
-    )
-
-    builder.row(
+        ),
         InlineKeyboardButton(
             text="🔥 HardSub",
             callback_data="vact:hardsub"
@@ -749,14 +738,14 @@ def video_actions_kb() -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="🚀 اتوماسیون کامل",
+            text="🚀 اتوماسیون کامل (SoftSub + HardSub)",
             callback_data="vact:full_auto"
         )
     )
 
     builder.row(
         InlineKeyboardButton(
-            text="☁️ آپلود با CuteFTP",
+            text="☁️ آپلود این فایل با CuteFTP (انتخاب مقصد)",
             callback_data="vact:upload_file"
         )
     )
@@ -770,10 +759,6 @@ def video_actions_kb() -> InlineKeyboardMarkup:
 
     return builder.as_markup()
 
-
-# ==================================================
-# HANDBRAKE PRESETS
-# ==================================================
 
 def presets_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()

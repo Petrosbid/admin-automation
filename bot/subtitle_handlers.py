@@ -13,8 +13,9 @@ from services.subtitle_service import SubtitleService
 from services.mkv_service import MKVService
 from services.handbrake_service import HandBrakeService
 from bot.keyboards import (
-    main_menu_kb, subtitle_folder_browser_kb, sync_options_kb,
-    subtitle_mode_kb, skip_or_cancel_kb, presets_kb
+    main_menu_kb, subtitle_folder_browser_kb, subtitle_source_kb,
+    subtitle_file_found_kb, sync_options_kb, subtitle_mode_kb,
+    skip_or_cancel_kb, presets_kb
 )
 
 router = Router()
@@ -34,17 +35,16 @@ class SubtitleStates(StatesGroup):
 def _resolve_media_dirs(video_path: Path, custom_base_stem: str) -> dict[str, Path]:
     """
     تشخیص هوشمند پوشه مادر فیلم تا خروجی هاردساب همیشه در پوشه hardsub
-    و خروجی سافت‌ساب همیشه در پوشه softsub قرار بگیرد (حتی اگر فیلم ورودی داخل پوشه softsub باشد!).
+    و خروجی سافت‌ساب همیشه در پوشه softsub قرار بگیرد.
     """
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     vid_parent = video_path.resolve().parent
 
-    # اگر فایل ویدئو خودش داخل یکی از زیرپوشه‌های softsub / hardsub / sub است، یک سطح بالا برو
     if vid_parent.name.lower() in ("softsub", "hardsub", "sub", "raw_temp"):
         movie_base_dir = vid_parent.parent
     elif vid_parent == workspace:
         safe_name = re.sub(r'[<>:"/\\|?*]', "", custom_base_stem).strip().replace(" ", "_")
-        movie_base_dir = workspace / safe_name
+        movie_base_dir = workspace / (safe_name or "Media_Output")
     else:
         movie_base_dir = vid_parent
 
@@ -59,8 +59,33 @@ def _resolve_media_dirs(video_path: Path, custom_base_stem: str) -> dict[str, Pa
     return folders
 
 
+def _find_local_subtitles_for_video(video_path: Path) -> list[Path]:
+    """
+    جستجوی تمامی فایل‌های زیرنویس (.srt و .ass) موجود در پوشه sub و پوشه خود فیلم
+    """
+    dirs = _resolve_media_dirs(video_path, video_path.stem)
+    search_dirs = [dirs["sub"], dirs["base"], video_path.parent]
+    found: list[Path] = []
+    seen: set[str] = set()
+
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        for f in sorted(d.iterdir(), key=lambda x: x.name.lower()):
+            if (
+                f.is_file()
+                and f.suffix.lower() in (".srt", ".ass", ".ssa")
+                and not f.name.startswith("_temp_")
+                and not f.name.startswith("_soft_clean_")
+            ):
+                resolved_str = str(f.resolve())
+                if resolved_str not in seen:
+                    seen.add(resolved_str)
+                    found.append(f.resolve())
+    return found
+
+
 def _format_current_filenames_prompt(data: dict) -> str:
-    """نمایش نام فعلی فایل اصلی به صورت Monospace جهت کپی با یک لمس"""
     target_videos = [Path(p) for p in data.get("target_videos", [])]
     if len(target_videos) == 1:
         v_file = target_videos[0]
@@ -80,14 +105,53 @@ def _format_current_filenames_prompt(data: dict) -> str:
     )
 
 
-# ==================== مرورگر پوشه‌به‌پوشه برای انتخاب فیلم‌ها جهت زیرنویس ====================
+async def _prompt_fa_subtitle_step(msg_or_call: Message | CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    first_video = Path(data["target_videos"][0])
+    local_subs = _find_local_subtitles_for_video(first_video)
+    await state.update_data(local_sub_candidates=[str(p) for p in local_subs])
+    await state.set_state(SubtitleStates.waiting_fa_subtitle)
+
+    text = (
+        f"🎬 فیلم هدف: `{first_video.name}`\n"
+        f"📂 تعداد زیرنویس‌های موجود در پوشه فیلم / `sub`: **`{len(local_subs)}` فایل**\n\n"
+        "🇮🇷 **مرحله ۱: زیرنویس فارسی**\n"
+        "می‌توانید زیرنویس فارسی را از داخل پوشه انتخاب کنید، یا فایل جدیدی آپلود نمایید (یا اگر زیرنویس فارسی ندارید رد کنید):"
+    )
+    kb = subtitle_source_kb("fa", len(local_subs))
+    if isinstance(msg_or_call, CallbackQuery):
+        await msg_or_call.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    else:
+        await msg_or_call.answer(text, reply_markup=kb, parse_mode="Markdown")
+
+
+async def _prompt_en_subtitle_step(msg_or_call: Message | CallbackQuery, state: FSMContext, prefix_note: str = ""):
+    data = await state.get_data()
+    first_video = Path(data["target_videos"][0])
+    local_subs = _find_local_subtitles_for_video(first_video)
+    await state.update_data(local_sub_candidates=[str(p) for p in local_subs])
+    await state.set_state(SubtitleStates.waiting_en_subtitle)
+
+    text = (
+        f"{prefix_note}"
+        "🇬🇧 **مرحله ۲: زیرنویس انگلیسی**\n"
+        "می‌توانید زیرنویس انگلیسی را از داخل پوشه `sub` انتخاب کنید، فایل جدید بفرستید و یا رد کنید:"
+    )
+    kb = subtitle_source_kb("en", len(local_subs))
+    if isinstance(msg_or_call, CallbackQuery):
+        await msg_or_call.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    else:
+        await msg_or_call.answer(text, reply_markup=kb, parse_mode="Markdown")
+
+
+# ==================== مرورگر پوشه‌به‌پوشه برای انتخاب فیلم‌ها ====================
 async def _render_sub_folder_browser(call: CallbackQuery, state: FSMContext, browse_dir: Path):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     browse_dir = browse_dir.resolve()
     browse_dir.mkdir(parents=True, exist_ok=True)
 
     folders = sorted(
-        [p for p in browse_dir.iterdir() if p.is_dir() and not p.name.startswith("_")],
+        [p for p in browse_dir.iterdir() if p.is_dir() and not p.name.startswith("_") and p.name != "browser_profile"],
         key=lambda x: x.name.lower()
     )
     videos = DownloaderService.find_video_files(browse_dir, recursive=False)
@@ -104,7 +168,7 @@ async def _render_sub_folder_browser(call: CallbackQuery, state: FSMContext, bro
 
     is_root = (browse_dir == workspace)
     await call.message.edit_text(
-        f"🎬 **انتخاب پوشه‌به‌پوشه فیلم‌ها برای زیرنویس**\n"
+        f"🎬 **انتخاب پوشه‌به‌پوشه فیلم‌ها برای زیرنویس / انکود**\n"
         f"📂 مسیر فعلی:\n`{browse_dir}`\n"
         f"✅ فایل‌های انتخاب شده تا الان: `{len(selected_paths)}` فایل\n\n"
         "روی پوشه مورد نظر کلیک کنید تا باز شود، سپس فایل‌های داخل آن را تیک (`✅`) بزنید:",
@@ -185,25 +249,86 @@ async def cb_proceed_to_subs(call: CallbackQuery, state: FSMContext):
         return await call.answer("⚠️ حداقل یک فایل ویدئویی را از داخل پوشه‌ها تیک بزنید!", show_alert=True)
 
     await state.update_data(target_videos=sel, fa_sub_path=None, en_sub_path=None)
-    await state.set_state(SubtitleStates.waiting_fa_subtitle)
+    await _prompt_fa_subtitle_step(call, state)
+
+
+# ==================== اسکن، انتخاب از پوشه یا آپلود زیرنویس فارسی و انگلیسی ====================
+@router.callback_query(F.data.startswith("subscan:"))
+async def cb_scan_directory_for_subs(call: CallbackQuery, state: FSMContext):
+    lang = call.data.split(":")[1]  # fa | en
+    data = await state.get_data()
+    first_video = Path(data["target_videos"][0])
+    local_subs = _find_local_subtitles_for_video(first_video)
+    await state.update_data(local_sub_candidates=[str(p) for p in local_subs])
+
+    lang_label = "فارسی" if lang == "fa" else "انگلیسی"
+    if not local_subs:
+        return await call.answer(
+            f"❌ هیچ فایل زیرنویسی (.srt / .ass) در پوشه sub یا کنار فیلم پیدا نشد! لطفاً گزینه آپلود را بزنید.",
+            show_alert=True
+        )
+
     await call.message.edit_text(
-        f"✅ تعداد `{len(sel)}` فایل فیلم انتخاب شد.\n\n"
-        "🇮🇷 **مرحله ۱ زیرنویس:** لطفاً **فایل زیرنویس فارسی (`.srt` یا `.ass`)** را ارسال کنید\n"
-        "*(در سافت‌ساب بدون تغییر رنگ و در هاردساب با رنگ زرد `#fbff00` و بولد اعمال می‌شود)*:",
-        reply_markup=skip_or_cancel_kb("skip:fa_sub"),
+        f"📂 **فایل‌های زیرنویس موجود در پوشه فیلم و `sub/`:**\n"
+        f"کدام فایل به عنوان **زیرنویس {lang_label}** استفاده شود؟",
+        reply_markup=subtitle_file_found_kb(lang, local_subs),
         parse_mode="Markdown"
     )
 
 
-# ==================== دریافت زیرنویس فارسی و انگلیسی، سینک و نام‌گذاری ====================
+@router.callback_query(F.data.startswith("subfile:"))
+async def cb_select_existing_sub_file(call: CallbackQuery, state: FSMContext):
+    _, lang, idx_str = call.data.split(":")
+    idx = int(idx_str)
+    data = await state.get_data()
+    candidates = data.get("local_sub_candidates", [])
+    if idx >= len(candidates):
+        return await call.answer("⚠️ فایل یافت نشد.", show_alert=True)
+
+    chosen_sub = Path(candidates[idx])
+    if chosen_sub.suffix.lower() == ".srt":
+        SubtitleService.normalize_srt_utf8(chosen_sub)
+
+    if lang == "fa":
+        await state.update_data(fa_sub_path=str(chosen_sub))
+        await _prompt_en_subtitle_step(
+            call, state,
+            prefix_note=f"✅ زیرنویس فارسی انتخاب شد:\n`{chosen_sub.name}`\n\n"
+        )
+    else:
+        await state.update_data(en_sub_path=str(chosen_sub))
+        await state.set_state(SubtitleStates.waiting_sync_choice)
+        await call.message.edit_text(
+            f"✅ زیرنویس انگلیسی انتخاب شد:\n`{chosen_sub.name}`\n\n"
+            "🔄 **مرحله سینک (هماهنگ‌سازی) زیرنویس قبل از پردازش:**\n"
+            "چگونه می‌خواهید تایمینگ زیرنویس با فیلم سینک شود؟",
+            reply_markup=sync_options_kb(),
+            parse_mode="Markdown"
+        )
+
+
+@router.callback_query(F.data.startswith("subupload:"))
+async def cb_ask_upload_sub(call: CallbackQuery, state: FSMContext):
+    lang = call.data.split(":")[1]
+    if lang == "fa":
+        await state.set_state(SubtitleStates.waiting_fa_subtitle)
+        await call.message.edit_text(
+            "📤 لطفاً **فایل زیرنویس فارسی (`.srt` یا `.ass`)** را در چت ارسال کنید:",
+            reply_markup=skip_or_cancel_kb("skip:fa_sub"),
+            parse_mode="Markdown"
+        )
+    else:
+        await state.set_state(SubtitleStates.waiting_en_subtitle)
+        await call.message.edit_text(
+            "📤 لطفاً **فایل زیرنویس انگلیسی (`.srt` یا `.ass`)** را در چت ارسال کنید:",
+            reply_markup=skip_or_cancel_kb("skip:en_sub"),
+            parse_mode="Markdown"
+        )
+
+
 @router.callback_query(SubtitleStates.waiting_fa_subtitle, F.data == "skip:fa_sub")
 async def cb_skip_fa_sub(call: CallbackQuery, state: FSMContext):
-    await state.set_state(SubtitleStates.waiting_en_subtitle)
-    await call.message.edit_text(
-        "🇬🇧 **مرحله ۲ زیرنویس:** حالا **فایل زیرنویس انگلیسی (`.srt` یا `.ass`)** را ارسال کنید:",
-        reply_markup=skip_or_cancel_kb("skip:en_sub"),
-        parse_mode="Markdown"
-    )
+    await _prompt_en_subtitle_step(call, state, prefix_note="⏭ زیرنویس فارسی رد شد.\n\n")
 
 
 @router.message(SubtitleStates.waiting_fa_subtitle, F.document)
@@ -218,21 +343,31 @@ async def handle_fa_sub_upload(message: Message, state: FSMContext):
         SubtitleService.normalize_srt_utf8(fa_dest)
 
     await state.update_data(fa_sub_path=str(fa_dest))
-    await state.set_state(SubtitleStates.waiting_en_subtitle)
-    await message.answer(
-        "✅ زیرنویس **فارسی** دریافت و در پوشه `sub` ذخیره شد.\n\n"
-        "🇬🇧 **مرحله ۲ زیرنویس:** اگر **زیرنویس انگلیسی** هم دارید فایل آن را بفرستید.\n"
-        "در صورت زدن «رد شدن»، اولین زیرنویس انگلیسیِ داخل خود فیلم حفظ و سایر زیرنویس‌ها حذف می‌شوند:",
-        reply_markup=skip_or_cancel_kb("skip:en_sub"),
-        parse_mode="Markdown"
+    await _prompt_en_subtitle_step(
+        message, state,
+        prefix_note=f"✅ زیرنویس فارسی آپلود و در پوشه `sub` ذخیره شد:\n`{fa_dest.name}`\n\n"
     )
 
 
 @router.callback_query(SubtitleStates.waiting_en_subtitle, F.data == "skip:en_sub")
 async def cb_skip_en_sub(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    if not data.get("fa_sub_path") and not data.get("en_sub_path"):
-        return await call.answer("⚠️ حداقل یکی از زیرنویس‌های فارسی یا انگلیسی باید ارسال شود!", show_alert=True)
+    has_fa = bool(data.get("fa_sub_path"))
+    has_en = bool(data.get("en_sub_path"))
+    preselected_mode = data.get("operation_mode")
+
+    # اگر هیچ زیرنویسی (نه فارسی و نه انگلیسی) انتخاب نشده باشد:
+    if not has_fa and not has_en:
+        if preselected_mode == "softsub":
+            return await call.answer("⚠️ برای عملیات سافت‌ساب حداقل یک زیرنویس باید انتخاب شود!", show_alert=True)
+        # برای هاردساب (انکود بدون زیرنویس): نیازی به مرحله سینک نیست، مستقیم به تغییر نام فایل برو
+        await state.update_data(sync_mode="none", sync_offset_ms=0, operation_mode="hardsub")
+        await state.set_state(SubtitleStates.waiting_custom_output_name)
+        return await call.message.edit_text(
+            "ℹ️ **انکود با HandBrake بدون زیرنویس** (زیرنویس‌های داخلی فیلم نیز حذف می‌شوند تا هیچ زیرنویسی هاردساب نشود).\n\n"
+            f"{_format_current_filenames_prompt(data)}",
+            parse_mode="Markdown"
+        )
 
     await state.set_state(SubtitleStates.waiting_sync_choice)
     await call.message.edit_text(
@@ -315,7 +450,7 @@ async def handle_custom_output_name(message: Message, state: FSMContext):
         if preselected_mode in ("hardsub", "both"):
             await state.set_state(SubtitleStates.waiting_preset_choice)
             return await message.answer(
-                "🔥 لطفاً **پریست HandBrake** را از لیست زیر برای هاردساب انتخاب کنید:",
+                "🔥 لطفاً **پریست HandBrake** را از لیست زیر انتخاب کنید:",
                 reply_markup=presets_kb(),
                 parse_mode="Markdown"
             )
@@ -325,7 +460,7 @@ async def handle_custom_output_name(message: Message, state: FSMContext):
     await state.set_state(SubtitleStates.waiting_operation_mode)
     brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
     await message.answer(
-        f"⚙️ تمام Track Name ها و File Title روی `{brand}` تنظیم شدند و زیرنویس فارسی روی **Default + Forced** قرار گرفت.\n"
+        f"⚙️ تمام Track Name ها و File Title روی `{brand}` تنظیم شدند.\n"
         "حالا نوع عملیات را انتخاب کنید:",
         reply_markup=subtitle_mode_kb(),
         parse_mode="Markdown"
@@ -374,12 +509,11 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
             f"{Path(custom_name).stem}_{idx+1}" if len(target_videos) > 1 else Path(custom_name).stem
         )
 
-        # تشخیص پوشه مادر و ساخت تضمینی پوشه‌های مجزای softsub و hardsub
         dirs = _resolve_media_dirs(vid, base_stem)
         soft_dir = dirs["softsub"]
         hard_dir = dirs["hardsub"]
 
-        if mode in ("softsub", "both"):
+        if mode in ("softsub", "both") and (fa_sub or en_sub):
             soft_out = soft_dir / f"{base_stem}.SoftSub.{site_tag}.mkv"
             t_soft = await queue_engine.add_task(
                 "mkvtoolnix",
@@ -398,7 +532,7 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
 
         if mode in ("hardsub", "both") and chosen_preset:
             hard_out = hard_dir / f"{base_stem}.HardSub.{site_tag}.mp4"
-            primary_sub = fa_sub or en_sub
+            primary_sub = fa_sub or en_sub  # اگر هر دو None باشند، بدون زیرنویس انکود می‌شود
             secondary_sub = en_sub if (fa_sub and en_sub) else None
             t_hard = await queue_engine.add_task(
                 "handbrake",
@@ -427,7 +561,7 @@ async def _schedule_subtitle_jobs(call: CallbackQuery, state: FSMContext, chosen
     await call.message.edit_text(
         f"✅ عملیات با تگ `{brand}` در صف قرار گرفت!\n"
         "• سافت‌ساب در پوشه `softsub` (بدون تغییر رنگ)\n"
-        "• هاردساب در پوشه `hardsub` (بولد و زرد `#fbff00`)\n\n"
+        "• هاردساب در پوشه `hardsub` (SRT بولد و زرد `#fbff00` با فونت بزرگ پیش‌فرض)\n\n"
         f"{summary_text}",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
@@ -443,7 +577,7 @@ async def _schedule_subtitle_jobs_from_msg(message: Message, state: FSMContext, 
     await message.answer(
         f"✅ عملیات با تگ `{brand}` در صف قرار گرفت!\n"
         "• سافت‌ساب در پوشه `softsub` (بدون تغییر رنگ)\n"
-        "• هاردساب در پوشه `hardsub` (بولد و زرد `#fbff00`)\n\n"
+        "• هاردساب در پوشه `hardsub` (SRT بولد و زرد `#fbff00` با فونت بزرگ پیش‌فرض)\n\n"
         f"{summary_text}",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
@@ -500,10 +634,4 @@ async def cb_single_video_sub_flow(call: CallbackQuery, state: FSMContext):
         fa_sub_path=None,
         en_sub_path=None
     )
-    await state.set_state(SubtitleStates.waiting_fa_subtitle)
-    await call.message.edit_text(
-        f"🎬 فایل انتخاب شده:\n`{Path(vid).name}`\n\n"
-        "🇮🇷 **مرحله ۱ زیرنویس:** لطفاً **فایل زیرنویس فارسی (`.srt` یا `.ass`)** را بفرستید (یا اگر ندارید روی رد شدن کلیک کنید):",
-        reply_markup=skip_or_cancel_kb("skip:fa_sub"),
-        parse_mode="Markdown"
-    )
+    await _prompt_fa_subtitle_step(call, state)
