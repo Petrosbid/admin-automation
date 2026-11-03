@@ -9,3 +9,4 @@ cloudscraper
 gdown
 chardet
 ffsubsync
+playwright

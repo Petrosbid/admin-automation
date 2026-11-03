@@ -4,12 +4,19 @@ telegram:
     - 815777731
 proxy:
   enabled: true
-  # مثال: socks5://127.0.0.1:10808 یا http://user:pass@ip:port
-  url: ""
+  # مثال: socks5://127.0.0.1:10808 یا http://127.0.0.1:10809
+  url: "socks5://127.0.0.1:10808"
+
+concurrency:
+  handbrake_workers: 2     # اجرای همزمان ۲ هاردساب با HandBrake
+  mkvtoolnix_workers: 1
+  download_workers: 1
+  upload_workers: 1
 
 monitor:
   enabled: true
-  interval_seconds: 300  # هر ۵ دقیقه (۳۰۰ ثانیه)
+  interval_seconds: 300    # هر ۵ دقیقه (۳۰۰ ثانیه)
+  use_real_browser: true   # باز کردن مرورگر واقعی برای حل کپچا و حفظ کوکی‌ها
   sites:
     pahe: "https://pahe.ink/"
     psa: "https://psa.wf/"
@@ -26,14 +33,14 @@ paths:
   ffsubsync_bin: "ffsubsync"
   ffmpeg_dir: "C:\\Tools\\ffmpeg\\bin"
 
-  qbittorrent:
-    webui_url: "http://127.0.0.1:8080"
-    username: "admin"
-    password: "adminpassword"
+qbittorrent:
+  webui_url: "http://127.0.0.1:8080"
+  username: "admin"
+  password: "adminpassword"
 
 
 branding:
-  site_tag: "EmpireBestTv"
+  site_tag: "EBTV"
   global_title_and_track_name: ".::EmpireBestTv.Com::."
   sub_fa_language: "per"
   sub_en_language: "eng"
@@ -41,23 +48,22 @@ branding:
   fa_forced_flag: true
 
 subtitle_sync:
-  # اگر true باشد، حتی بدون پرسش هم همیشه زیرنویس فارسی قبل از مرج/هاردساب سینک می‌شود
   always_auto_sync: false
   default_offset_ms: 0
 
 subtitle_style:
   font_name: "Vazirmatn"
   font_size: 22
-  hex_color: "#fbff00"
+  hex_color: "#fbff00"     # رنگ زرد (فقط برای هاردساب HandBrake)
   bold: true
   outline_width: 2.0
   shadow_depth: 1.0
 
 cuteftp:
-  host: "185.130.50.130"
+  host: "ftp.dl.example.com"
   port: 21
   protocol: "FTP"          # FTP, FTPS, SFTP
-  username: "hamid@dl15.cdnzed.sbs"
+  username: "ftpuser"
   password: "ftppassword"
   remote_base_dir: "/public_html/media"
   base_download_url: "https://dl.example.com/media"

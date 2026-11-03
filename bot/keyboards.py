@@ -30,7 +30,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📂 ۵. فایل‌منیجر سرور و آپلود با CuteFTP 9", callback_data="menu:file_mgr"),
     )
     builder.row(
-        InlineKeyboardButton(text="📊 وضعیت صف‌ها (HandBrake / MKV / qbt)", callback_data="menu:queues"),
+        InlineKeyboardButton(text="📊 وضعیت صف‌ها (۲ هاردساب همزمان / MKV)", callback_data="menu:queues"),
         InlineKeyboardButton(text="🔄 ریلود کانفیگ", callback_data="menu:reload_cfg"),
     )
     return builder.as_markup()
@@ -40,6 +40,12 @@ def monitor_menu_kb(is_enabled: bool) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     status_label = "🟢 فعال (توقف مانیتورینگ)" if is_enabled else "🔴 غیرفعال (شروع مانیتورینگ)"
     builder.row(InlineKeyboardButton(text=status_label, callback_data="mon:toggle"))
+    builder.row(
+        InlineKeyboardButton(
+            text="🔓 باز کردن صفحات روی سرور برای حل کپچا (Pahe/PSA/YTS)",
+            callback_data="mon:open_captcha"
+        )
+    )
     builder.row(InlineKeyboardButton(text="🔄 بررسی فوری هر ۳ سایت همین الان", callback_data="mon:check_now"))
     builder.row(
         InlineKeyboardButton(text="🎬 آخرین‌های Pahe", callback_data="mon:latest:pahe"),
@@ -80,19 +86,6 @@ def target_folders_kb(folders: list[Path], base_workspace: Path) -> InlineKeyboa
             InlineKeyboardButton(text=f"📁 {rel_name[:50]}", callback_data=f"tsubdir:{idx}")
         )
     builder.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
-    return builder.as_markup()
-
-
-def subtitle_upload_options_kb() -> InlineKeyboardMarkup:
-    """انتخاب نحوه ذخیره زیرنویس در پوشه هدف"""
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="🎨 ذخیره همراه با استایل بولد و زرد (#fbff00)", callback_data="subsave:styled")
-    )
-    builder.row(
-        InlineKeyboardButton(text="📄 ذخیره به صورت خام (بدون تغییر استایل)", callback_data="subsave:raw")
-    )
-    builder.row(InlineKeyboardButton(text="🔙 انصراف", callback_data="menu:home"))
     return builder.as_markup()
 
 
@@ -181,8 +174,8 @@ def sync_options_kb() -> InlineKeyboardMarkup:
 def subtitle_mode_kb() -> InlineKeyboardMarkup:
     """انتخاب نوع عملیات پس از دریافت و سینک زیرنویس"""
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="📎 فقط سافت‌ساب (صف MKVToolNix)", callback_data="submode:softsub"))
-    builder.row(InlineKeyboardButton(text="🔥 فقط هاردساب زرد و بولد (صف HandBrake)", callback_data="submode:hardsub"))
+    builder.row(InlineKeyboardButton(text="📎 فقط سافت‌ساب عادی (صف MKVToolNix)", callback_data="submode:softsub"))
+    builder.row(InlineKeyboardButton(text="🔥 فقط هاردساب زرد و بولد (صف ۲تایی HandBrake)", callback_data="submode:hardsub"))
     builder.row(InlineKeyboardButton(text="🚀 هر دو: پکیج کامل (پوشه softsub + hardsub + sub)", callback_data="submode:both"))
     builder.row(InlineKeyboardButton(text="🔙 انصراف", callback_data="menu:home"))
     return builder.as_markup()

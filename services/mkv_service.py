@@ -26,7 +26,8 @@ class MKVService:
                 "id": track["id"],
                 "type": track.get("type", "unknown"),  # video | audio | subtitles
                 "codec": track.get("codec", "Unknown"),
-                "language": props.get("language", "und"),
+                "language": str(props.get("language", "und")).lower(),
+                "language_ietf": str(props.get("language_ietf", "")).lower(),
                 "track_name": props.get("track_name", "No Name"),
             })
         return tracks_info
@@ -36,6 +37,18 @@ class MKVService:
         """فیلتر کردن فقط ترک‌های زیرنویس موجود در فایل ویدئویی"""
         all_tracks = await cls.get_all_tracks(video_path)
         return [t for t in all_tracks if t["type"] == "subtitles"]
+
+    @staticmethod
+    def _is_english_track(track: dict) -> bool:
+        """تشخیص اینکه آیا یک ترک زیرنویس داخلی به زبان انگلیسی است یا خیر"""
+        lang = track.get("language", "").lower()
+        ietf = track.get("language_ietf", "").lower()
+        t_name = str(track.get("track_name", "")).lower()
+        if lang in ("eng", "en") or ietf.startswith("en"):
+            return True
+        if "english" in t_name:
+            return True
+        return False
 
     @staticmethod
     async def extract_subtitle_track(
@@ -100,12 +113,7 @@ class MKVService:
         en_sub_reference: Path | None = None,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
-        """
-        سینک کردن زیرنویس فارسی قبل از مرج یا هاردساب:
-        ۱. اگر زیرنویس انگلیسی سینک‌شده همراهش داده شده، با آن سینک می‌کند.
-        ۲. اگر داخل خود فیلم زیرنویس متنی (SRT/ASS) وجود دارد، آن را استخراج موقت کرده و در ۲ ثانیه با آن سینک می‌کند.
-        ۳. در غیر این صورت، مستقیماً با صدای فیلم سینک می‌کند.
-        """
+        """سینک کردن زیرنویس فارسی قبل از مرج یا هاردساب بدون تغییر رنگ یا بولد کردن"""
         temp_ref_sub = None
         try:
             ref_path = en_sub_reference
@@ -116,8 +124,11 @@ class MKVService:
                     if any(k in t["codec"].lower() for k in ["subrip", "srt", "substationalpha", "ass", "utf8"])
                 ]
                 if text_subs:
-                    temp_ref_sub = sub_to_sync.with_name(f"_temp_ref_{video_path.stem}.srt")
-                    await cls.extract_subtitle_track(video_path, text_subs[0]["id"], temp_ref_sub, progress_callback)
+                    # اولویت با زیرنویس انگلیسی داخل فیلم برای مرجع سینک
+                    eng_text_subs = [t for t in text_subs if cls._is_english_track(t)]
+                    chosen_ref = eng_text_subs[0] if eng_text_subs else text_subs[0]
+                    temp_ref_sub = sub_to_sync.with_name(f"_temp_ref_{video_path.stem}_{chosen_ref['id']}.srt")
+                    await cls.extract_subtitle_track(video_path, chosen_ref["id"], temp_ref_sub, progress_callback)
                     ref_path = temp_ref_sub
 
             await SubtitleService.auto_sync_subtitle(
@@ -146,12 +157,12 @@ class MKVService:
         progress_callback: Callable[[str], None] = None
     ) -> Path:
         """
-        مرج حرفه‌ای زیرنویس فارسی و انگلیسی طبق مستندات رسمی mkvmerge:
-        - اول سینک کردن زیرنویس فارسی (در صورت انتخاب auto یا manual یا فعال بودن در کانفیگ)
+        مرج حرفه‌ای سافت‌ساب با mkvmerge:
+        - بدون زرد و بولد کردن زیرنویس (ظاهر استاندارد)
+        - اگر زیرنویس انگلیسی جدید ارسال شده باشد: حذف تمام زیرنویس‌های قبلی فیلم (--no-subtitles) و مرج فقط فارسی و انگلیسی جدید
+        - اگر زیرنویس انگلیسی ارسال نشده باشد و keep_old_subs=True باشد: نگه داشتن فقط اولین زیرنویس انگلیسی داخل فیلم (--subtitle-tracks <eng_id>) و حذف بقیه زیرنویس‌ها
+        - تنظیم زیرنویس فارسی به عنوان اولین ترک زیرنویس + Default + Forced
         - تنظیم File Title و تمامی Track Name ها به .::EmpireBestTv.Com::.
-        - تنظیم زیرنویس فارسی به عنوان Default (yes) و Forced (yes)
-        - غیرفعال کردن پرچم Default و Forced برای تمام زیرنویس‌های قدیمی داخل فیلم
-        - چیدمان ترک‌ها با --track-order به طوری که زیرنویس فارسی اولین زیرنویس فیلم باشد
         """
         mkvmerge = cfg.get("paths", "mkvmerge_bin")
         brand = custom_brand or cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
@@ -160,117 +171,135 @@ class MKVService:
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # مرحله ۰: اجرای سینک روی زیرنویس فارسی قبل از مرج
-        if fa_sub_path and fa_sub_path.exists():
-            if sync_mode == "auto" or cfg.get("subtitle_sync", "always_auto_sync", False):
-                await cls.sync_sub_against_video(video_path, fa_sub_path, en_sub_path, progress_callback)
+        # مرحله ۰: اجرای سینک روی یک کپی یا فایل زیرنویس فارسی (بدون زرد و بولد کردن!)
+        working_fa_sub = None
+        try:
+            if fa_sub_path and fa_sub_path.exists():
                 if fa_sub_path.suffix.lower() == ".srt":
-                    SubtitleService.style_srt_bold_yellow(fa_sub_path, fa_sub_path)
-            elif sync_mode == "manual" and sync_offset_ms != 0:
-                if fa_sub_path.suffix.lower() == ".srt":
-                    SubtitleService.shift_srt_time(fa_sub_path, fa_sub_path, sync_offset_ms)
-                    SubtitleService.style_srt_bold_yellow(fa_sub_path, fa_sub_path)
+                    working_fa_sub = fa_sub_path.with_name(f"_soft_clean_{fa_sub_path.name}")
+                    working_fa_sub.write_text(SubtitleService.read_subtitle_safe(fa_sub_path), encoding="utf-8-sig")
+                else:
+                    working_fa_sub = fa_sub_path
 
-        # ۱. دریافت لیست تمام ترک‌های فایل ویدئوی ورودی (File ID = 0)
-        existing_tracks = await cls.get_all_tracks(video_path)
+                if sync_mode == "auto" or cfg.get("subtitle_sync", "always_auto_sync", False):
+                    await cls.sync_sub_against_video(video_path, working_fa_sub, en_sub_path, progress_callback)
+                elif sync_mode == "manual" and sync_offset_ms != 0 and working_fa_sub.suffix.lower() == ".srt":
+                    SubtitleService.shift_srt_time(working_fa_sub, working_fa_sub, sync_offset_ms)
 
-        # ۲. ساخت دستور mkvmerge
-        cmd = [
-            mkvmerge,
-            "--gui-mode",
-            "-o", str(output_path),
-            "--title", brand,
-        ]
+            # ۱. دریافت لیست تمام ترک‌های فایل ویدئوی ورودی (File ID = 0)
+            existing_tracks = await cls.get_all_tracks(video_path)
 
-        if not keep_old_subs:
-            cmd.append("--no-subtitles")
+            # ۲. تصمیم‌گیری درباره زیرنویس‌های داخل خود فیلم:
+            # - اگر کاربر زیرنویس انگلیسی جدید فرستاده، یا keep_old_subs=False است -> هیچ زیرنویسی از فیلم اصلی نگه ندار
+            # - اگر کاربر زیرنویس انگلیسی نفرستاده و keep_old_subs=True است -> فقط اولین زیرنویس انگلیسی داخل فیلم را نگه دار
+            kept_internal_eng_track_id: int | None = None
+            has_external_en = bool(en_sub_path and en_sub_path.exists())
 
-        # ۳. تنظیم نام تمام ترک‌های موجود و خاموش کردن Default/Forced زیرنویس‌های قبلی فیلم
-        for tr in existing_tracks:
-            tid = tr["id"]
-            if tr["type"] == "subtitles":
-                if not keep_old_subs:
-                    continue
-                cmd.extend([
-                    "--track-name", f"{tid}:{brand}",
-                    "--default-track-flag", f"{tid}:no",
-                    "--forced-display-flag", f"{tid}:no",
-                ])
+            if keep_old_subs and not has_external_en:
+                for tr in existing_tracks:
+                    if tr["type"] == "subtitles" and cls._is_english_track(tr):
+                        kept_internal_eng_track_id = tr["id"]
+                        break
+
+            # ۳. ساخت دستور mkvmerge
+            cmd = [
+                mkvmerge,
+                "--gui-mode",
+                "-o", str(output_path),
+                "--title", brand,
+            ]
+
+            if kept_internal_eng_track_id is not None:
+                # فقط همین یک ترک زیرنویس انگلیسی از فایل اصلی کپی شود و بقیه زیرنویس‌ها حذف شوند
+                cmd.extend(["--subtitle-tracks", str(kept_internal_eng_track_id)])
             else:
-                cmd.extend(["--track-name", f"{tid}:{brand}"])
+                # حذف تمام زیرنویس‌های داخل فایل اصلی
+                cmd.append("--no-subtitles")
 
-        # افزودن فایل ویدئوی ورودی (File ID = 0)
-        cmd.append(str(video_path))
+            # ۴. تنظیم نام تمام ترک‌های ویدئو و صدا + ترک زیرنویس انگلیسی نگه داشته شده (در صورت وجود)
+            for tr in existing_tracks:
+                tid = tr["id"]
+                if tr["type"] == "subtitles":
+                    if tid == kept_internal_eng_track_id:
+                        cmd.extend([
+                            "--track-name", f"{tid}:{brand}",
+                            "--default-track-flag", f"{tid}:no",
+                            "--forced-display-flag", f"{tid}:no",
+                        ])
+                else:
+                    cmd.extend(["--track-name", f"{tid}:{brand}"])
 
-        # متغیرهای ردیابی File ID برای سوئیچ --track-order
-        next_file_id = 1
-        fa_file_id = None
-        en_file_id = None
+            # افزودن فایل ویدئوی ورودی (File ID = 0)
+            cmd.append(str(video_path))
 
-        # ۴. افزودن زیرنویس فارسی با Default=yes و Forced=yes
-        if fa_sub_path and fa_sub_path.exists():
-            fa_file_id = next_file_id
-            next_file_id += 1
-            cmd.extend([
-                "--language", f"0:{fa_lang}",
-                "--track-name", f"0:{brand}",
-                "--default-track-flag", "0:yes",
-                "--forced-display-flag", "0:yes",
-                "--sub-charset", "0:UTF-8",
-            ])
-            # اگر فایل ASS بود و کاربر شیفت دستی داده بود، با --sync خود mkvmerge نیز پشتیبانی شود
-            if sync_mode == "manual" and sync_offset_ms != 0 and fa_sub_path.suffix.lower() != ".srt":
-                cmd.extend(["--sync", f"0:{sync_offset_ms}"])
-            cmd.append(str(fa_sub_path))
+            next_file_id = 1
+            fa_file_id = None
+            en_file_id = None
 
-        # ۵. افزودن زیرنویس انگلیسی با Default=no و Forced=no
-        if en_sub_path and en_sub_path.exists():
-            en_file_id = next_file_id
-            next_file_id += 1
-            cmd.extend([
-                "--language", f"0:{en_lang}",
-                "--track-name", f"0:{brand}",
-                "--default-track-flag", "0:no",
-                "--forced-display-flag", "0:no",
-                "--sub-charset", "0:UTF-8",
-                str(en_sub_path)
-            ])
+            # ۵. افزودن زیرنویس فارسی با Default=yes و Forced=yes
+            if working_fa_sub and working_fa_sub.exists():
+                fa_file_id = next_file_id
+                next_file_id += 1
+                cmd.extend([
+                    "--language", f"0:{fa_lang}",
+                    "--track-name", f"0:{brand}",
+                    "--default-track-flag", "0:yes",
+                    "--forced-display-flag", "0:yes",
+                    "--sub-charset", "0:UTF-8",
+                ])
+                if sync_mode == "manual" and sync_offset_ms != 0 and working_fa_sub.suffix.lower() != ".srt":
+                    cmd.extend(["--sync", f"0:{sync_offset_ms}"])
+                cmd.append(str(working_fa_sub))
 
-        # ۶. ساخت دقیق --track-order تا زیرنویس فارسی اولین زیرنویس پلیر باشد
-        track_order = [
-            f"0:{tr['id']}" for tr in existing_tracks if tr["type"] in ("video", "audio")
-        ]
-        if fa_file_id is not None:
-            track_order.append(f"{fa_file_id}:0")
-        if en_file_id is not None:
-            track_order.append(f"{en_file_id}:0")
-        if keep_old_subs:
-            track_order.extend([
-                f"0:{tr['id']}" for tr in existing_tracks if tr["type"] == "subtitles"
-            ])
+            # ۶. افزودن زیرنویس انگلیسی ارسالی (در صورت وجود) با Default=no و Forced=no
+            if has_external_en:
+                en_file_id = next_file_id
+                next_file_id += 1
+                cmd.extend([
+                    "--language", f"0:{en_lang}",
+                    "--track-name", f"0:{brand}",
+                    "--default-track-flag", "0:no",
+                    "--forced-display-flag", "0:no",
+                    "--sub-charset", "0:UTF-8",
+                    str(en_sub_path)
+                ])
 
-        if track_order:
-            cmd.extend(["--track-order", ",".join(track_order)])
+            # ۷. چیدمان دقیق ترک‌ها (--track-order): اول ویدئو و صدا، بعد زیرنویس فارسی، بعد زیرنویس انگلیسی
+            track_order = [
+                f"0:{tr['id']}" for tr in existing_tracks if tr["type"] in ("video", "audio")
+            ]
+            if fa_file_id is not None:
+                track_order.append(f"{fa_file_id}:0")
+            if en_file_id is not None:
+                track_order.append(f"{en_file_id}:0")
+            elif kept_internal_eng_track_id is not None:
+                track_order.append(f"0:{kept_internal_eng_track_id}")
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT
-        )
+            if track_order:
+                cmd.extend(["--track-order", ",".join(track_order)])
 
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            decoded = line.decode("utf-8", errors="replace").strip()
-            if "#GUI#progress" in decoded and progress_callback:
-                pct = decoded.replace("#GUI#progress", "").strip()
-                progress_callback(pct)
-            elif "Progress:" in decoded and progress_callback:
-                progress_callback(decoded.replace("Progress:", "").strip())
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT
+            )
 
-        await proc.wait()
-        if proc.returncode not in (0, 1):
-            raise RuntimeError(f"MKVToolNix Merge Failed (Exit Code {proc.returncode})")
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="replace").strip()
+                if "#GUI#progress" in decoded and progress_callback:
+                    pct = decoded.replace("#GUI#progress", "").strip()
+                    progress_callback(pct)
+                elif "Progress:" in decoded and progress_callback:
+                    progress_callback(decoded.replace("Progress:", "").strip())
 
-        return output_path
+            await proc.wait()
+            if proc.returncode not in (0, 1):
+                raise RuntimeError(f"MKVToolNix Merge Failed (Exit Code {proc.returncode})")
+
+            return output_path
+        finally:
+            if working_fa_sub and working_fa_sub != fa_sub_path and working_fa_sub.exists():
+                working_fa_sub.unlink(missing_ok=True)

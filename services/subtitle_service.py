@@ -24,6 +24,13 @@ class SubtitleService:
         except UnicodeDecodeError:
             return raw_bytes.decode(encoding, errors="replace")
 
+    @classmethod
+    def normalize_srt_utf8(cls, sub_path: Path) -> Path:
+        """ذخیره زیرنویس با انکودینگ استاندارد UTF-8 بدون تغییر رنگ یا بولد کردن (مخصوص سافت‌ساب)"""
+        content = cls.read_subtitle_safe(sub_path)
+        sub_path.write_text(content, encoding="utf-8-sig")
+        return sub_path
+
     @staticmethod
     def _time_to_ms(h: int, m: int, s: int, ms: int) -> int:
         return ((h * 3600) + (m * 60) + s) * 1000 + ms
@@ -39,10 +46,7 @@ class SubtitleService:
 
     @classmethod
     def shift_srt_time(cls, input_srt: Path, output_srt: Path, offset_ms: int) -> Path:
-        """
-        سینک دستی زیرنویس با شیفت دادن تمامی تایم‌کدها به اندازه offset_ms (مثبت یا منفی)
-        مثال: +1500 یعنی ۱.۵ ثانیه دیرتر، -800 یعنی ۰.۸ ثانیه زودتر
-        """
+        """سینک دستی زیرنویس با شیفت دادن تمامی تایم‌کدها به اندازه offset_ms"""
         content = cls.read_subtitle_safe(input_srt)
         if offset_ms == 0:
             output_srt.write_text(content, encoding="utf-8-sig")
@@ -67,14 +71,8 @@ class SubtitleService:
         reference_srt: Path | None = None,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
-        """
-        سینک خودکار زیرنویس با فیلم:
-        - اگر زیرنویس انگلیسی/مرجع وجود داشته باشد، بر اساس آن در کمتر از ۲ ثانیه سینک می‌کند.
-        - در غیر این صورت، با استفاده از صدای فیلم (Audio VAD) توسط ffsubsync سینک را انجام می‌دهد.
-        """
-        # ابتدا نرمال‌سازی انکودینگ به UTF-8 تا ffsubsync بدون خطا فایل فارسی را بخواند
-        clean_utf8_content = cls.read_subtitle_safe(input_srt)
-        input_srt.write_text(clean_utf8_content, encoding="utf-8-sig")
+        """سینک خودکار زیرنویس با فیلم یا زیرنویس مرجع توسط ffsubsync"""
+        cls.normalize_srt_utf8(input_srt)
 
         ffsubsync_bin = cfg.get("paths", "ffsubsync_bin", "ffsubsync")
         ffmpeg_dir = cfg.get("paths", "ffmpeg_dir", "")
@@ -106,10 +104,7 @@ class SubtitleService:
 
     @staticmethod
     def html_hex_to_ass_bgr(hex_color: str) -> str:
-        """
-        تبدیل رنگ #fbff00 به فرمت استاندارد ASS یعنی &H00BBGGRR&
-        #fbff00 -> R=FB, G=FF, B=00 -> &H0000FFFB
-        """
+        """تبدیل رنگ #fbff00 به فرمت استاندارد ASS یعنی &H00BBGGRR&"""
         clean_hex = hex_color.lstrip("#")
         r, g, b = clean_hex[0:2], clean_hex[2:4], clean_hex[4:6]
         return f"&H00{b.upper()}{g.upper()}{r.upper()}"
@@ -144,7 +139,7 @@ class SubtitleService:
 
     @classmethod
     def convert_srt_to_styled_ass(cls, input_srt: Path, output_ass: Path) -> Path:
-        """تبدیل SRT سینک شده به فرمت ASS با رنگ #fbff00 و بولد کامل برای هاردساب در HandBrake"""
+        """تبدیل SRT به فرمت ASS با رنگ #fbff00 و بولد کامل منحصراً برای هاردساب در HandBrake"""
         content = cls.read_subtitle_safe(input_srt)
         style_cfg = cfg.get("subtitle_style")
         ass_color = cls.html_hex_to_ass_bgr(style_cfg.get("hex_color", "#fbff00"))

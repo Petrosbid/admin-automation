@@ -19,10 +19,10 @@ from services.cuteftp_service import CuteFTPService
 from services.monitor_service import monitor_service
 from bot.keyboards import (
     main_menu_kb, monitor_menu_kb, folder_structure_choice_kb,
-    target_folders_kb, subtitle_upload_options_kb,
-    search_categories_kb, search_sites_kb, search_results_kb,
-    file_browser_kb, video_actions_kb, presets_kb,
-    multi_video_select_kb, subtitle_mode_kb, skip_or_cancel_kb, sync_options_kb
+    target_folders_kb, search_categories_kb, search_sites_kb,
+    search_results_kb, file_browser_kb, video_actions_kb,
+    presets_kb, multi_video_select_kb, subtitle_mode_kb,
+    skip_or_cancel_kb, sync_options_kb
 )
 
 router = Router()
@@ -34,7 +34,6 @@ class BotStates(StatesGroup):
     waiting_new_folder_type = State()
 
     # آپلود زیرنویس در پوشه هدف
-    waiting_target_folder_sub_style = State()
     waiting_target_folder_sub_file = State()
 
     # ۱. جستجو در سایت‌ها
@@ -62,6 +61,27 @@ def is_admin(user_id: int) -> bool:
     return user_id in cfg.get("telegram", "admin_ids", [])
 
 
+def _format_current_filenames_prompt(data: dict) -> str:
+    """ساخت متن راهنمای تغییر نام شامل نام فعلی فایل اصلی به صورت Monospace"""
+    target_videos = [Path(p) for p in data.get("target_videos", [])]
+    if len(target_videos) == 1:
+        v_file = target_videos[0]
+        mono_info = (
+            f"📄 **نام فعلی فایل اصلی (برای کپی لمس کنید):**\n"
+            f"`{v_file.name}`\n"
+            f"🔹 نام بدون پسوند:\n"
+            f"`{v_file.stem}`\n\n"
+        )
+    else:
+        joined = "\n".join([f"• `{v.name}`" for v in target_videos[:10]])
+        mono_info = f"📄 **نام فعلی فایل‌های انتخاب شده:**\n{joined}\n\n"
+
+    return (
+        f"{mono_info}"
+        "✏️ **نام جدید فایل خروجی** را ارسال کنید (یا عدد `1` را بفرستید تا با همان نام فعلی فایل اصلی به همراه تگ سایت ذخیره شود):"
+    )
+
+
 # ==================== منوی اصلی ====================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -69,10 +89,12 @@ async def cmd_start(message: Message, state: FSMContext):
         return await message.answer("⛔ شما دسترسی ادمین ندارید.")
     await state.clear()
     brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
+    hb_workers = cfg.get("concurrency", "handbrake_workers", 2)
     await message.answer(
         f"🎬 **پنل اتوماسیون مدیا و آپلودر ({brand})**\n\n"
-        "📡 پایشگر خودکار سایت‌های **Pahe.ink**، **PSA.wf** و **YTS.gg** هر ۵ دقیقه در پس‌زمینه فعال است.\n"
-        "✅ زیرنویس فارسی در تمامی خروجی‌ها به صورت **اولین ترک + Default + Forced** تنظیم می‌شود.",
+        f"🔥 ظرفیت هاردساب همزمان HandBrake: **`{hb_workers}` پردازش موازی**\n"
+        "📡 پایشگر ۵ دقیقه‌ای سایت‌های **Pahe.ink**، **PSA.wf** و **YTS.gg** فعال است.\n"
+        "✅ زیرنویس در **سافت‌ساب به صورت عادی** (فقط فارسی و انگلیسی) و در **هاردساب به صورت بولد و زرد (`#fbff00`)** اعمال می‌شود.",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -95,7 +117,7 @@ async def cb_reload_cfg(call: CallbackQuery):
     await call.answer("✅ فایل config.yaml با موفقیت بازخوانی شد!", show_alert=True)
 
 
-# ==================== ۰. بخش مانیتورینگ ۵ دقیقه‌ای سایت‌ها (Pahe / PSA / YTS) ====================
+# ==================== ۰. بخش مانیتورینگ ۵ دقیقه‌ای سایت‌ها و حل کپچا ====================
 @router.callback_query(F.data == "menu:monitor")
 async def cb_monitor_menu(call: CallbackQuery):
     enabled = bool(cfg.get("monitor", "enabled", True))
@@ -107,7 +129,8 @@ async def cb_monitor_menu(call: CallbackQuery):
         "2️⃣ `https://psa.wf/`\n"
         "3️⃣ `https://yts.gg/home`\n\n"
         f"⏱ بازه رفرش خودکار: هر `{interval // 60}` دقیقه یک‌بار\n"
-        f"📊 وضعیت فعلی: {'🟢 فعال' if enabled else '🔴 غیرفعال'}",
+        f"📊 وضعیت فعلی: {'🟢 فعال' if enabled else '🔴 غیرفعال'}\n\n"
+        "💡 در صورت برخورد به کپچا، دکمه **«باز کردن صفحات روی سرور برای حل کپچا»** را بزنید.",
         reply_markup=monitor_menu_kb(enabled),
         parse_mode="Markdown"
     )
@@ -120,6 +143,17 @@ async def cb_monitor_toggle(call: CallbackQuery):
     mon_sec["enabled"] = not current
     await call.answer(f"وضعیت مانیتورینگ به {'فعال' if not current else 'غیرفعال'} تغییر یافت.")
     await cb_monitor_menu(call)
+
+
+@router.callback_query(F.data == "mon:open_captcha")
+async def cb_monitor_open_captcha(call: CallbackQuery):
+    await call.message.edit_text(
+        "⏳ در حال باز کردن پنجره مرورگر روی دسکتاپ ویندوز سرور برای سایت‌های **Pahe.ink**، **PSA.wf** و **YTS.gg**...",
+        parse_mode="Markdown"
+    )
+    msg = await monitor_service.open_captcha_tabs_for_admin()
+    enabled = bool(cfg.get("monitor", "enabled", True))
+    await call.message.edit_text(msg, reply_markup=monitor_menu_kb(enabled), parse_mode="Markdown")
 
 
 @router.callback_query(F.data == "mon:check_now")
@@ -144,11 +178,10 @@ async def cb_monitor_latest_site(call: CallbackQuery):
     site_key = call.data.split(":")[2]
     await call.message.edit_text(f"⏳ در حال دریافت آخرین پست‌های `{site_key.upper()}`...", parse_mode="Markdown")
     try:
-        posts = await monitor_service.fetch_site_posts(site_key)
+        posts = await monitor_service.fetch_site_posts(site_key, bot=call.bot)
         if not posts:
             return await call.message.edit_text("❌ پستی دریافت نشد.", reply_markup=monitor_menu_kb(True))
 
-        # ارسال ۳ پست آخر آن سایت به تلگرام
         for p in posts[:3]:
             await monitor_service.send_post_notification(call.bot, p)
 
@@ -162,7 +195,7 @@ async def cb_monitor_latest_site(call: CallbackQuery):
         await call.message.edit_text(f"❌ خطا در ارتباط با سایت:\n`{e}`", reply_markup=monitor_menu_kb(True), parse_mode="Markdown")
 
 
-# ==================== قابلیت جدید ۱: ساخت پوشه جدید در Workspace بدون دادن لینک ====================
+# ==================== ساخت پوشه جدید در Workspace بدون دادن لینک ====================
 @router.callback_query(F.data == "menu:create_folder")
 async def cb_create_folder_menu(call: CallbackQuery, state: FSMContext):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
@@ -191,7 +224,6 @@ async def cb_mkdir_in_current_dir(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("qmkdir:"))
 async def cb_quick_mkdir_from_monitor(call: CallbackQuery, state: FSMContext):
-    """ساخت سریع پوشه فیلم مستقیماً از روی دکمه زیر اعلان پست‌های جدید"""
     folder_title = call.data.split(":", 1)[1]
     folders = DownloaderService.create_movie_folders(folder_title)
     await state.update_data(target_sub_dir=str(folders["sub"]), target_base_dir=str(folders["base"]))
@@ -261,7 +293,7 @@ async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
     )
 
 
-# ==================== قابلیت جدید ۲: آپلود کردن زیرنویس در پوشه هدف ====================
+# ==================== آپلود کردن زیرنویس در پوشه هدف (بدون زرد کردن) ====================
 @router.callback_query(F.data == "menu:upload_sub_target")
 async def cb_upload_sub_select_folder(call: CallbackQuery, state: FSMContext):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
@@ -285,14 +317,12 @@ async def cb_target_folder_chosen(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     chosen_folder = Path(data["available_target_folders"][idx])
 
-    # اگر زیرپوشه sub داخل آن وجود دارد، به صورت پیش‌فرض زیرنویس را داخل پوشه sub قرار بده
     dest_dir = (chosen_folder / "sub") if (chosen_folder / "sub").exists() else chosen_folder
     await state.update_data(target_sub_dir=str(dest_dir))
-    await state.set_state(BotStates.waiting_target_folder_sub_style)
+    await state.set_state(BotStates.waiting_target_folder_sub_file)
     await call.message.edit_text(
         f"📂 پوشه هدف انتخاب شد:\n`{dest_dir}`\n\n"
-        "چگونه می‌خواهید زیرنویس در این پوشه ذخیره شود؟",
-        reply_markup=subtitle_upload_options_kb(),
+        "📎 لطفاً **فایل زیرنویس (`.srt` یا `.ass`)** را ارسال کنید تا در پوشه هدف ذخیره شود:",
         parse_mode="Markdown"
     )
 
@@ -307,22 +337,10 @@ async def cb_upload_sub_in_active_dir(call: CallbackQuery, state: FSMContext):
         dest_dir = (curr / "sub") if (curr / "sub").exists() else curr
 
     await state.update_data(target_sub_dir=str(dest_dir))
-    await state.set_state(BotStates.waiting_target_folder_sub_style)
-    await call.message.edit_text(
-        f"📂 مسیر ذخیره زیرنویس:\n`{dest_dir}`\n\n"
-        "چگونه می‌خواهید زیرنویس در این پوشه ذخیره شود؟",
-        reply_markup=subtitle_upload_options_kb(),
-        parse_mode="Markdown"
-    )
-
-
-@router.callback_query(BotStates.waiting_target_folder_sub_style, F.data.startswith("subsave:"))
-async def cb_sub_save_style_selected(call: CallbackQuery, state: FSMContext):
-    save_mode = call.data.split(":")[1]  # styled | raw
-    await state.update_data(sub_save_mode=save_mode)
     await state.set_state(BotStates.waiting_target_folder_sub_file)
     await call.message.edit_text(
-        "📎 لطفاً **فایل زیرنویس (`.srt` یا `.ass`)** را ارسال کنید تا در پوشه هدف ذخیره شود:",
+        f"📂 مسیر ذخیره زیرنویس:\n`{dest_dir}`\n\n"
+        "📎 لطفاً **فایل زیرنویس (`.srt` یا `.ass`)** را ارسال کنید تا در این پوشه ذخیره شود:",
         parse_mode="Markdown"
     )
 
@@ -332,17 +350,13 @@ async def handle_target_folder_sub_file(message: Message, state: FSMContext):
     data = await state.get_data()
     dest_dir = Path(data["target_sub_dir"])
     dest_dir.mkdir(parents=True, exist_ok=True)
-    save_mode = data.get("sub_save_mode", "styled")
 
     file_name = message.document.file_name or "subtitle.srt"
     dest_path = dest_dir / file_name
     await message.bot.download(message.document, destination=dest_path)
 
-    if save_mode == "styled" and dest_path.suffix.lower() == ".srt":
-        SubtitleService.style_srt_bold_yellow(dest_path, dest_path)
-        style_note = "همراه با استایل **بولد و زرد (`#fbff00`)**"
-    else:
-        style_note = "به صورت **خام (اصلی)**"
+    if dest_path.suffix.lower() == ".srt":
+        SubtitleService.normalize_srt_utf8(dest_path)
 
     await state.clear()
     await state.update_data(target_sub_dir=str(dest_dir), current_dir=str(dest_dir))
@@ -353,7 +367,7 @@ async def handle_target_folder_sub_file(message: Message, state: FSMContext):
     kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
 
     await message.answer(
-        f"✅ زیرنویس `{file_name}` {style_note} با موفقیت در پوشه هدف ذخیره شد!\n\n"
+        f"✅ زیرنویس `{file_name}` با موفقیت در پوشه هدف ذخیره شد!\n\n"
         f"📂 مسیر فایل:\n`{dest_path}`",
         reply_markup=kb.as_markup(),
         parse_mode="Markdown"
@@ -630,7 +644,7 @@ async def cb_proceed_to_subs(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         f"✅ تعداد `{len(target_videos)}` فایل فیلم انتخاب شد.\n\n"
         "🇮🇷 **مرحله ۱ زیرنویس:** لطفاً **فایل زیرنویس فارسی (`.srt` یا `.ass`)** را ارسال کنید\n"
-        "*(زیرنویس فارسی به صورت اولین زیرنویس + Default + Forced تنظیم خواهد شد)*:",
+        "*(زیرنویس در سافت‌ساب بدون تغییر رنگ و در هاردساب به رنگ زرد `#fbff00` و بولد اعمال می‌شود)*:",
         reply_markup=skip_or_cancel_kb("skip:fa_sub"),
         parse_mode="Markdown"
     )
@@ -654,14 +668,16 @@ async def handle_fa_sub_upload(message: Message, state: FSMContext):
     fa_dest = sub_dir / f"FA_{message.document.file_name}"
     await message.bot.download(message.document, destination=fa_dest)
 
+    # فقط نرمال‌سازی UTF-8 بدون زرد و بولد کردن (تا در سافت‌ساب عادی بماند)
     if fa_dest.suffix.lower() == ".srt":
-        SubtitleService.style_srt_bold_yellow(fa_dest, fa_dest)
+        SubtitleService.normalize_srt_utf8(fa_dest)
 
     await state.update_data(fa_sub_path=str(fa_dest))
     await state.set_state(BotStates.waiting_en_subtitle)
     await message.answer(
-        "✅ زیرنویس **فارسی** دریافت و به رنگ زرد (`#fbff00`) و بولد استایل‌دهی شد.\n\n"
-        "🇬🇧 **مرحله ۲ زیرنویس:** اگر **زیرنویس انگلیسی** هم دارید فایل آن را بفرستید، در غیر این صورت دکمه «رد شدن» را بزنید:",
+        "✅ زیرنویس **فارسی** دریافت شد.\n\n"
+        "🇬🇧 **مرحله ۲ زیرنویس:** اگر **زیرنویس انگلیسی** هم دارید فایل آن را بفرستید (تا تمام زیرنویس‌های قدیمی فیلم حذف شوند و فقط همین دو زیرنویس بمانند).\n"
+        "در صورت زدن دکمه «رد شدن»، اولین زیرنویس انگلیسی داخل خود فیلم (در صورت وجود) حفظ و بقیه حذف می‌شوند:",
         reply_markup=skip_or_cancel_kb("skip:en_sub"),
         parse_mode="Markdown"
     )
@@ -690,6 +706,9 @@ async def handle_en_sub_upload(message: Message, state: FSMContext):
     en_dest = sub_dir / f"EN_{message.document.file_name}"
     await message.bot.download(message.document, destination=en_dest)
 
+    if en_dest.suffix.lower() == ".srt":
+        SubtitleService.normalize_srt_utf8(en_dest)
+
     await state.update_data(en_sub_path=str(en_dest))
     await state.set_state(BotStates.waiting_sync_choice)
     await message.answer(
@@ -716,9 +735,10 @@ async def cb_sync_option_selected(call: CallbackQuery, state: FSMContext):
             parse_mode="Markdown"
         )
 
+    data = await state.get_data()
     await state.set_state(BotStates.waiting_custom_output_name)
     await call.message.edit_text(
-        "✏️ **نام پایه برای فایل(های) خروجی** را ارسال کنید (یا عدد `1` را بفرستید تا هم‌نام با خود فیلم‌ها به همراه تگ سایت ذخیره شوند):",
+        _format_current_filenames_prompt(data),
         parse_mode="Markdown"
     )
 
@@ -731,10 +751,11 @@ async def handle_manual_sync_ms(message: Message, state: FSMContext):
         return await message.answer("⚠️ لطفاً یک عدد صحیح به میلی‌ثانیه وارد کنید (مثلاً `1500` یا `-1200`):", parse_mode="Markdown")
 
     await state.update_data(sync_offset_ms=offset_ms)
+    data = await state.get_data()
     await state.set_state(BotStates.waiting_custom_output_name)
     await message.answer(
         f"✅ شیفت زمانی `{offset_ms} ms` ثبت شد.\n\n"
-        "✏️ حالا **نام پایه برای فایل(های) خروجی** را ارسال کنید (یا عدد `1` را بفرستید تا هم‌نام با خود فیلم‌ها ذخیره شوند):",
+        f"{_format_current_filenames_prompt(data)}",
         parse_mode="Markdown"
     )
 
@@ -820,7 +841,7 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
             soft_out = soft_dir / f"{base_stem}.SoftSub.{site_tag}.mkv"
             t_soft = await queue_engine.add_task(
                 "mkvtoolnix",
-                f"SoftSub (Sync={sync_mode}): {soft_out.name}",
+                f"SoftSub: {soft_out.name}",
                 MKVService.merge_softsub,
                 vid,
                 soft_out,
@@ -837,7 +858,6 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
             hard_out = hard_dir / f"{base_stem}.HardSub.{site_tag}.mp4"
             primary_sub = fa_sub or en_sub
             secondary_sub = en_sub if (fa_sub and en_sub) else None
-            hb_sync_mode = "none" if mode == "both" else sync_mode
             t_hard = await queue_engine.add_task(
                 "handbrake",
                 f"HardSub ({chosen_preset['name']}): {hard_out.name}",
@@ -848,7 +868,7 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
                 chosen_preset["file"],
                 chosen_preset["name"],
                 secondary_sub,
-                hb_sync_mode,
+                sync_mode,
                 sync_offset_ms
             )
             scheduled_ids.append(f"🔥 HardSub: `{t_hard.task_id}`")
@@ -863,7 +883,10 @@ async def _schedule_subtitle_jobs(call: CallbackQuery, state: FSMContext, chosen
     await state.clear()
     summary_text = "\n".join(scheduled_ids)
     await call.message.edit_text(
-        f"✅ عملیات با تگ `{brand}` (زیرنویس فارسی: **اولین ترک + Default + Forced**) در صف قرار گرفت!\n\n{summary_text}",
+        f"✅ عملیات با تگ `{brand}` در صف قرار گرفت!\n"
+        "• سافت‌ساب: بدون تغییر رنگ (فقط فارسی و انگلیسی)\n"
+        "• هاردساب: بولد و زرد (`#fbff00`)\n\n"
+        f"{summary_text}",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -876,7 +899,10 @@ async def _schedule_subtitle_jobs_from_msg(message: Message, state: FSMContext, 
     await state.clear()
     summary_text = "\n".join(scheduled_ids)
     await message.answer(
-        f"✅ عملیات با تگ `{brand}` (زیرنویس فارسی: **اولین ترک + Default + Forced**) در صف قرار گرفت!\n\n{summary_text}",
+        f"✅ عملیات با تگ `{brand}` در صف قرار گرفت!\n"
+        "• سافت‌ساب: بدون تغییر رنگ (فقط فارسی و انگلیسی)\n"
+        "• هاردساب: بولد و زرد (`#fbff00`)\n\n"
+        f"{summary_text}",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -985,6 +1011,7 @@ async def cb_single_video_sub_flow(call: CallbackQuery, state: FSMContext):
     )
     await state.set_state(BotStates.waiting_fa_subtitle)
     await call.message.edit_text(
+        f"🎬 فایل انتخاب شده:\n`{Path(vid).name}`\n\n"
         "🇮🇷 **مرحله ۱ زیرنویس:** لطفاً **فایل زیرنویس فارسی (`.srt` یا `.ass`)** را بفرستید (یا اگر ندارید روی رد شدن کلیک کنید):",
         reply_markup=skip_or_cancel_kb("skip:fa_sub"),
         parse_mode="Markdown"
@@ -1022,7 +1049,7 @@ async def cb_show_queues(call: CallbackQuery):
     if not tasks:
         return await call.answer("📭 در حال حاضر هیچ تسکی در صف نیست.", show_alert=True)
 
-    lines = ["📊 **وضعیت صف‌های پردازش (MKV / HandBrake / qBittorrent / CuteFTP):**\n"]
+    lines = ["📊 **وضعیت صف‌های پردازش (۲ ورکر موازی HandBrake / MKV / qbt / CuteFTP):**\n"]
     for t in reversed(tasks):
         line = f"🔹 `{t.task_id}` | **[{t.queue_type.upper()}]** {t.title}\n   └ وضعیت: {t.status} ({t.progress})"
         if t.error:

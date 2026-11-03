@@ -3,6 +3,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Awaitable, Any
+from core.config_loader import cfg
 
 
 @dataclass
@@ -17,6 +18,7 @@ class QueueTask:
     progress: str = "0%"
     result: Any = None
     error: str | None = None
+    worker_id: int = 1
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%H:%M:%S"))
 
 
@@ -32,10 +34,19 @@ class SequentialQueueEngine:
         self._workers: list[asyncio.Task] = []
 
     def start_workers(self):
-        """راه‌اندازی ورکرهای پس‌زمینه برای هر صف"""
-        for q_name in self.queues:
-            worker = asyncio.create_task(self._worker_loop(q_name))
-            self._workers.append(worker)
+        """راه‌اندازی ورکرهای پس‌زمینه (۲ ورکر همزمان برای HandBrake)"""
+        concurrency_cfg = cfg.get("concurrency") or {}
+        worker_counts = {
+            "handbrake": int(concurrency_cfg.get("handbrake_workers", 2)),
+            "mkvtoolnix": int(concurrency_cfg.get("mkvtoolnix_workers", 1)),
+            "download": int(concurrency_cfg.get("download_workers", 1)),
+            "upload": int(concurrency_cfg.get("upload_workers", 1)),
+        }
+
+        for q_name, count in worker_counts.items():
+            for w_idx in range(1, max(1, count) + 1):
+                worker = asyncio.create_task(self._worker_loop(q_name, w_idx))
+                self._workers.append(worker)
 
     async def add_task(
         self,
@@ -58,7 +69,7 @@ class SequentialQueueEngine:
         await self.queues[queue_type].put(task)
         return task
 
-    async def _worker_loop(self, queue_name: str):
+    async def _worker_loop(self, queue_name: str, worker_id: int):
         queue = self.queues[queue_name]
         while True:
             task: QueueTask = await queue.get()
@@ -66,9 +77,9 @@ class SequentialQueueEngine:
                 queue.task_done()
                 continue
 
-            task.status = "در حال اجرا ⚙️"
+            task.worker_id = worker_id
+            task.status = f"در حال اجرا (ورکر #{worker_id}) ⚙️"
             try:
-                # ارسال تابع آپدیت درصد پیشرفت به داخل سرویس‌ها
                 def update_progress(pct_text: str):
                     task.progress = pct_text
 

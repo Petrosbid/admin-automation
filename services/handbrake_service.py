@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import uuid
 from pathlib import Path
 from typing import Callable
 from core.config_loader import cfg
@@ -43,20 +44,20 @@ class HandBrakeService:
         progress_callback: Callable[[str], None] = None
     ) -> Path:
         """
-        هاردساب کردن طبق مستندات رسمی HandBrakeCLI:
+        هاردساب کردن با HandBrakeCLI (پشتیبانی از ۲ اجرای همزمان موازی):
         ۱. سینک کردن زیرنویس فارسی (در صورت انتخاب auto یا manual)
-        ۲. تبدیل زیرنویس فارسی سینک‌شده به ASS بولد و زرد (#fbff00)
-        ۳. سوار کردن زیرنویس ASS روی کانتینر موقت با پرچم Default و Forced و تگ .::EmpireBestTv.Com::.
-        ۴. اجرای HandBrakeCLI با --subtitle 1 و --subtitle-burned=1
+        ۲. اعمال انحصاری استایل بولد و زرد (#fbff00) با تبدیل به فرمت ASS
+        ۳. ساخت کانتینر موقت یکتا و اجرای HandBrakeCLI با --subtitle 1 و --subtitle-burned=1
         """
         output_media_path.parent.mkdir(parents=True, exist_ok=True)
-        working_srt = primary_srt_path.with_suffix(".synced.srt")
-        temp_ass = primary_srt_path.with_suffix(".styled.ass")
-        temp_mkv = video_path.with_name(f"_temp_hb_mux_{video_path.stem}.mkv")
+        unique_tag = str(uuid.uuid4())[:6]
+        working_srt = output_media_path.with_name(f"_temp_sync_{unique_tag}.srt")
+        temp_ass = output_media_path.with_name(f"_temp_styled_{unique_tag}.ass")
+        temp_mkv = output_media_path.with_name(f"_temp_hb_mux_{unique_tag}.mkv")
         brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
 
         try:
-            # ۱. اعمال سینک روی یک کپی کاری از زیرنویس قبل از تبدیل به ASS
+            # ۱. کپی کاری از زیرنویس و اعمال سینک در صورت نیاز
             working_srt.write_text(SubtitleService.read_subtitle_safe(primary_srt_path), encoding="utf-8-sig")
             if sync_mode == "auto" or cfg.get("subtitle_sync", "always_auto_sync", False):
                 await MKVService.sync_sub_against_video(
@@ -68,9 +69,9 @@ class HandBrakeService:
             elif sync_mode == "manual" and sync_offset_ms != 0:
                 SubtitleService.shift_srt_time(working_srt, working_srt, sync_offset_ms)
 
-            # ۲. تبدیل زیرنویس سینک‌شده به فرمت ASS زرد (#fbff00) و بولد
+            # ۲. تبدیل زیرنویس به فرمت ASS زرد (#fbff00) و بولد (مخصوص هاردساب)
             if progress_callback:
-                progress_callback("آماده‌سازی استایل زرد (#fbff00) و بولد زیرنویس سینک‌شده...")
+                progress_callback("اعمال استایل بولد و زرد (#fbff00) برای هاردساب...")
             SubtitleService.convert_srt_to_styled_ass(working_srt, temp_ass)
 
             # ۳. ساخت کانتینر موقت برای HandBrake
@@ -96,16 +97,6 @@ class HandBrakeService:
                 "--subtitle-burned=1",
             ]
 
-            # افزودن زیرنویس انگلیسی به عنوان سافت‌ساب جانبی در صورت ارسال
-            if secondary_en_srt_path and secondary_en_srt_path.exists():
-                en_lang = cfg.get("branding", "sub_en_language", "eng")
-                cmd.extend([
-                    "--srt-file", str(secondary_en_srt_path),
-                    "--srt-codeset", "UTF-8",
-                    "--srt-lang", en_lang,
-                    "--srt-default=0"
-                ])
-
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -129,13 +120,12 @@ class HandBrakeService:
             if proc.returncode != 0:
                 raise RuntimeError(f"HandBrakeCLI exited with code {proc.returncode}")
 
-            # تثبیت تگ .::EmpireBestTv.Com::. در صورت خروجی MKV
             if output_media_path.suffix.lower() == ".mkv":
-                tagged_mkv = output_media_path.with_name(f"_tagged_{output_media_path.name}")
+                tagged_mkv = output_media_path.with_name(f"_tagged_{unique_tag}_{output_media_path.name}")
                 await MKVService.merge_softsub(
                     video_path=output_media_path,
                     output_path=tagged_mkv,
-                    keep_old_subs=True,
+                    keep_old_subs=False,
                     custom_brand=brand
                 )
                 output_media_path.unlink(missing_ok=True)
