@@ -1,5 +1,5 @@
 from pathlib import Path
-
+from typing import Any
 from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton
@@ -11,7 +11,6 @@ from services.handbrake_service import HandBrakeService
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     builder.row(
@@ -69,12 +68,9 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="📊 وضعیت صف پردازش‌ها",
+            text="📊 وضعیت صف و حذف پراسس‌ها",
             callback_data="menu:queues"
-        )
-    )
-
-    builder.row(
+        ),
         InlineKeyboardButton(
             text="🔄 ریلود کانفیگ",
             callback_data="menu:reload_cfg"
@@ -89,7 +85,6 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 # ==================================================
 
 def monitor_menu_kb(is_enabled: bool) -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     status_label = (
@@ -149,7 +144,6 @@ def monitor_menu_kb(is_enabled: bool) -> InlineKeyboardMarkup:
 # ==================================================
 
 def folder_structure_choice_kb() -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     builder.row(
@@ -180,16 +174,11 @@ def target_folders_kb(
     folders: list[Path],
     base_workspace: Path
 ) -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     for idx, folder in enumerate(folders[:25]):
-
         try:
-            rel_name = folder.relative_to(
-                base_workspace
-            ).as_posix()
-
+            rel_name = folder.relative_to(base_workspace).as_posix()
         except ValueError:
             rel_name = folder.name
 
@@ -213,17 +202,9 @@ def target_folders_kb(
 def download_target_folders_kb(
     folders: list[Path]
 ) -> InlineKeyboardMarkup:
-
-    """
-    انتخاب مقصد دانلود:
-    - پوشه موجود
-    - ساخت پوشه جدید
-    """
-
     builder = InlineKeyboardBuilder()
 
     for idx, folder in enumerate(folders[:25]):
-
         builder.row(
             InlineKeyboardButton(
                 text=f"📂 {folder.name[:45]}",
@@ -248,12 +229,34 @@ def download_target_folders_kb(
     return builder.as_markup()
 
 
+def subtitle_upload_options_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="🎨 ذخیره همراه با استایل بولد و زرد (#fbff00)",
+            callback_data="subsave:styled"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="📄 ذخیره به صورت خام (بدون تغییر استایل)",
+            callback_data="subsave:raw"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 انصراف",
+            callback_data="menu:home"
+        )
+    )
+    return builder.as_markup()
+
+
 # ==================================================
 # SEARCH
 # ==================================================
 
 def search_categories_kb() -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     builder.row(
@@ -288,16 +291,11 @@ def search_categories_kb() -> InlineKeyboardMarkup:
 
 
 def search_sites_kb(category: str) -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
-    sites = ScraperService.SITE_CATEGORIES.get(
-        category,
-        {}
-    )
+    sites = ScraperService.SITE_CATEGORIES.get(category, {})
 
     for key, title in sites.items():
-
         builder.row(
             InlineKeyboardButton(
                 text=title[:60],
@@ -318,23 +316,11 @@ def search_sites_kb(category: str) -> InlineKeyboardMarkup:
 def search_results_kb(
     results: list[dict]
 ) -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     for idx, item in enumerate(results):
-
-        icon = (
-            "🧲"
-            if item.get("type") == "magnet"
-            else "📄"
-        )
-
-        # متن دکمه محدود می‌شود؛
-        # نام کامل در متن پیام جداگانه نمایش داده خواهد شد.
-
-        title = str(
-            item.get("title", "بدون عنوان")
-        )
+        icon = "🧲" if item.get("type") == "magnet" else "📄"
+        title = str(item.get("title", "بدون عنوان"))
 
         builder.row(
             InlineKeyboardButton(
@@ -361,25 +347,15 @@ def file_browser_kb(
     items: list[Path],
     is_root: bool
 ) -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     for idx, path in enumerate(items[:25]):
-
         if path.is_dir():
             icon = "📁"
-
         elif path.suffix.lower() in [
-            ".mkv",
-            ".mp4",
-            ".avi",
-            ".ts",
-            ".mov",
-            ".m4v",
-            ".webm"
+            ".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"
         ]:
             icon = "🎬"
-
         else:
             icon = "📄"
 
@@ -391,7 +367,6 @@ def file_browser_kb(
         )
 
     if not is_root:
-
         builder.row(
             InlineKeyboardButton(
                 text="⬆️ پوشه قبلی",
@@ -428,27 +403,18 @@ def file_browser_kb(
 
 
 # ==================================================
-# VIDEO SELECTION
+# VIDEO SELECTION (FOLDER BY FOLDER & MULTI-SELECT)
 # ==================================================
 
 def multi_video_select_kb(
     videos: list[Path],
     selected_indices: set[int]
 ) -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     for idx, video in enumerate(videos[:25]):
-
-        mark = (
-            "✅"
-            if idx in selected_indices
-            else "⬜"
-        )
-
-        rel_label = (
-            f"{video.parent.name}/{video.name}"
-        )
+        mark = "✅" if idx in selected_indices else "⬜"
+        rel_label = f"{video.parent.name}/{video.name}"
 
         builder.row(
             InlineKeyboardButton(
@@ -474,6 +440,114 @@ def multi_video_select_kb(
     return builder.as_markup()
 
 
+def subtitle_folder_browser_kb(
+    folders: list[Path],
+    videos: list[Path],
+    selected_paths: set[str],
+    is_root: bool
+) -> InlineKeyboardMarkup:
+    """نمایش پوشه‌به‌پوشه برای انتخاب فایل‌های ویدئویی در بخش زیرنویس"""
+    builder = InlineKeyboardBuilder()
+
+    for idx, folder in enumerate(folders[:20]):
+        builder.row(
+            InlineKeyboardButton(
+                text=f"📁 پوشه: {folder.name[:44]}",
+                callback_data=f"subnav:dir:{idx}"
+            )
+        )
+
+    for idx, vid in enumerate(videos[:25]):
+        is_sel = str(vid.resolve()) in selected_paths
+        mark = "✅" if is_sel else "⬜"
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{mark} 🎬 {vid.name[:45]}",
+                callback_data=f"subnav:vid:{idx}"
+            )
+        )
+
+    if videos:
+        builder.row(
+            InlineKeyboardButton(
+                text="☑️ انتخاب / لغو انتخاب همه فیلم‌های این پوشه",
+                callback_data="subnav:sel_all"
+            )
+        )
+
+    if not is_root:
+        builder.row(
+            InlineKeyboardButton(
+                text="⬆️ بازگشت به پوشه قبلی (Up)",
+                callback_data="subnav:up"
+            )
+        )
+
+    count = len(selected_paths)
+    builder.row(
+        InlineKeyboardButton(
+            text=f"📎 ادامه به ارسال زیرنویس ({count} فایل انتخاب شده) ➡️",
+            callback_data="mvact:proceed"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 انصراف و منوی اصلی",
+            callback_data="menu:home"
+        )
+    )
+    return builder.as_markup()
+
+
+# ==================================================
+# QUEUE MANAGEMENT (DELETE FINISHED / CANCEL ACTIVE)
+# ==================================================
+
+def queue_management_kb(tasks: list[Any]) -> InlineKeyboardMarkup:
+    """کیبورد مدیریت صف همراه با دکمه حذف تکی و پاکسازی کلی پراسس‌های تمام‌شده"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="🔄 بروزرسانی درصد پیشرفت",
+            callback_data="menu:queues"
+        ),
+        InlineKeyboardButton(
+            text="🧹 حذف تمام پراسس‌های تمام‌شده",
+            callback_data="qact:clear_finished"
+        ),
+    )
+
+    for t in reversed(tasks):
+        status_str = str(getattr(t, "status", ""))
+        is_done = getattr(
+            t,
+            "is_finished",
+            any(k in status_str for k in ("تکمیل", "خطا", "لغو"))
+        )
+        if is_done:
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"🗑 حذف پراسس تمام‌شده #{t.task_id} ({t.title[:25]})",
+                    callback_data=f"qdel:{t.task_id}"
+                )
+            )
+        else:
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"🛑 لغو و حذف #{t.task_id} ({t.title[:25]})",
+                    callback_data=f"qcancel:{t.task_id}"
+                )
+            )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 منوی اصلی",
+            callback_data="menu:home"
+        )
+    )
+    return builder.as_markup()
+
+
 # ==================================================
 # SUBTITLE SOURCE SELECTION
 # ==================================================
@@ -481,23 +555,7 @@ def multi_video_select_kb(
 def subtitle_source_kb(
     language: str
 ) -> InlineKeyboardMarkup:
-
-    """
-    language:
-        fa
-        en
-
-    کاربر می‌تواند:
-    1. پوشه را برای زیرنویس موجود بررسی کند.
-    2. فایل زیرنویس را آپلود کند.
-    3. از این زبان عبور کند.
-    """
-
-    language_name = (
-        "فارسی"
-        if language == "fa"
-        else "انگلیسی"
-    )
+    language_name = "فارسی" if language == "fa" else "انگلیسی"
 
     builder = InlineKeyboardBuilder()
 
@@ -536,11 +594,9 @@ def subtitle_file_found_kb(
     language: str,
     files: list[Path]
 ) -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     for idx, path in enumerate(files[:20]):
-
         builder.row(
             InlineKeyboardButton(
                 text=f"📄 {path.name[:45]}",
@@ -570,7 +626,6 @@ def subtitle_file_found_kb(
 # ==================================================
 
 def sync_options_kb() -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     builder.row(
@@ -609,7 +664,6 @@ def sync_options_kb() -> InlineKeyboardMarkup:
 # ==================================================
 
 def subtitle_mode_kb() -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     builder.row(
@@ -646,7 +700,6 @@ def subtitle_mode_kb() -> InlineKeyboardMarkup:
 def skip_or_cancel_kb(
     skip_cb: str
 ) -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     builder.row(
@@ -671,7 +724,6 @@ def skip_or_cancel_kb(
 # ==================================================
 
 def video_actions_kb() -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     builder.row(
@@ -724,13 +776,11 @@ def video_actions_kb() -> InlineKeyboardMarkup:
 # ==================================================
 
 def presets_kb() -> InlineKeyboardMarkup:
-
     builder = InlineKeyboardBuilder()
 
     presets = HandBrakeService.list_available_presets()
 
     for idx, preset in enumerate(presets):
-
         builder.row(
             InlineKeyboardButton(
                 text=f"⚙️ {preset['label'][:50]}",

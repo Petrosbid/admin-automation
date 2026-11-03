@@ -1,184 +1,44 @@
 import asyncio
 import json
+import logging
 import re
-import sys
+import shutil
 import time
 from pathlib import Path
-from typing import Callable, Optional
-
+from typing import Callable
+import aiohttp
+import gdown
 from core.config_loader import cfg
 from core.proxy_manager import ProxyManager
 
 
 class DownloaderService:
-    VIDEO_EXTENSIONS = {
-        ".mkv",
-        ".mp4",
-        ".avi",
-        ".mov",
-        ".ts",
-        ".m4v",
-        ".webm",
-        ".wmv",
-        ".flv",
-    }
-
-    SUBTITLE_EXTENSIONS = {
-        ".srt",
-        ".ass",
-        ".ssa",
-        ".vtt",
-        ".sub",
-    }
-
-    # ---------------------------------------------------------
-    # General helpers
-    # ---------------------------------------------------------
+    VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m4v", ".webm"}
 
     @staticmethod
-    def _safe_name(name: str) -> str:
-        """پاک‌سازی نام پوشه برای استفاده در ویندوز."""
-        name = re.sub(r'[<>:"/\\|?*]', "", name)
-        name = re.sub(r"\s+", "_", name.strip())
-        return name[:150] or "Untitled"
+    def _resolve_binary(config_key: str, exe_name: str, common_paths: list[str] = None) -> str:
+        """پیدا کردن هوشمند فایل اجرایی از کانفیگ، متغیر PATH ویندوز یا مسیرهای استاندارد"""
+        configured = cfg.get("paths", config_key)
+        if configured and Path(configured).is_file():
+            return str(Path(configured))
+
+        in_path = shutil.which(exe_name)
+        if in_path:
+            return in_path
+
+        for cp in (common_paths or []):
+            if Path(cp).is_file():
+                return cp
+
+        return configured or exe_name
 
     @staticmethod
-    def _emit_progress(
-        callback: Optional[Callable[[str], None]],
-        message: str,
-    ) -> None:
-        """ارسال گزارش پیشرفت، بدون متوقف کردن عملیات در صورت خطای callback."""
-        if callback:
-            try:
-                callback(message)
-            except Exception:
-                pass
-
-    @staticmethod
-    async def _terminate_process(
-        proc: asyncio.subprocess.Process,
-        timeout: int = 5,
-    ) -> None:
-        """
-        خاتمه امن پردازش فرزند.
-
-        ابتدا terminate و در صورت پاسخ ندادن، kill اجرا می‌شود.
-        این تابع برای پشتیبانی از لغو عملیات توسط کاربر استفاده می‌شود.
-        """
-        if proc is None or proc.returncode is not None:
-            return
-
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            return
-        except Exception:
-            pass
-
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            except Exception:
-                pass
-
-            try:
-                await proc.wait()
-            except Exception:
-                pass
-
-    @classmethod
-    async def _run_process(
-        cls,
-        cmd: list[str],
-        progress_callback: Optional[Callable[[str], None]] = None,
-        progress_filter: Optional[Callable[[str], bool]] = None,
-        error_message: str = "خطا در اجرای پردازش",
-    ) -> None:
-        """
-        اجرای یک پردازش خارجی با قابلیت لغو.
-
-        خروجی stdout و stderr خوانده می‌شود تا بافر پردازش پر نشود.
-        در صورت لغو coroutine، پردازش فرزند نیز متوقف خواهد شد.
-        """
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-
-        output_lines = []
-
-        try:
-            while True:
-                line = await proc.stdout.readline()
-
-                if not line:
-                    break
-
-                text = line.decode(
-                    "utf-8",
-                    errors="replace",
-                ).strip()
-
-                if not text:
-                    continue
-
-                if len(output_lines) < 30:
-                    output_lines.append(text)
-
-                if progress_callback:
-                    if progress_filter is None or progress_filter(text):
-                        cls._emit_progress(progress_callback, text)
-
-            await proc.wait()
-
-            if proc.returncode != 0:
-                output = "\n".join(output_lines[-10:])
-                raise RuntimeError(
-                    f"{error_message} "
-                    f"(Exit code: {proc.returncode})\n{output}"
-                )
-
-        except asyncio.CancelledError:
-            await cls._terminate_process(proc)
-            raise
-
-        except Exception:
-            if proc.returncode is None:
-                await cls._terminate_process(proc)
-            raise
-
-    # ---------------------------------------------------------
-    # Folder management
-    # ---------------------------------------------------------
-
-    @staticmethod
-    def get_workspace_dir() -> Path:
-        """دریافت مسیر workspace از تنظیمات."""
-        workspace = cfg.get("paths", "workspace_dir")
-        return Path(workspace)
-
-    @classmethod
-    def create_movie_folders(cls, movie_title: str) -> dict[str, Path]:
-        """
-        ساخت پوشه فیلم و زیرپوشه‌های موردنیاز.
-
-        ساختار:
-
-        workspace/
-            Movie_Name/
-                softsub/
-                hardsub/
-                sub/
-        """
-        workspace = cls.get_workspace_dir()
-        workspace.mkdir(parents=True, exist_ok=True)
-
-        safe_name = cls._safe_name(movie_title)
+    def create_movie_folders(movie_title: str) -> dict[str, Path]:
+        """ساخت پوشه فیلم به همراه زیرپوشه‌های softsub, hardsub, sub"""
+        workspace = Path(cfg.get("paths", "workspace_dir"))
+        safe_name = re.sub(r'[<>:"/\\|?*]', "", movie_title).strip().replace(" ", "_")
+        if not safe_name:
+            safe_name = "Media_Download"
         base_dir = workspace / safe_name
 
         folders = {
@@ -187,813 +47,427 @@ class DownloaderService:
             "hardsub": base_dir / "hardsub",
             "sub": base_dir / "sub",
         }
-
-        for folder in folders.values():
-            folder.mkdir(parents=True, exist_ok=True)
-
+        for p in folders.values():
+            p.mkdir(parents=True, exist_ok=True)
         return folders
 
     @classmethod
-    def get_existing_folders(cls) -> list[Path]:
-        """دریافت پوشه‌های موجود در workspace."""
-        workspace = cls.get_workspace_dir()
-        workspace.mkdir(parents=True, exist_ok=True)
-
-        return sorted(
-            [
-                path
-                for path in workspace.iterdir()
-                if path.is_dir()
-            ],
-            key=lambda path: path.name.lower(),
-        )
-
-    @classmethod
-    def create_download_folder(cls, folder_name: str) -> Path:
-        """ساخت پوشه جدید برای دانلود."""
-        workspace = cls.get_workspace_dir()
-        workspace.mkdir(parents=True, exist_ok=True)
-
-        folder = workspace / cls._safe_name(folder_name)
-        folder.mkdir(parents=True, exist_ok=True)
-
-        return folder
-
-    @classmethod
-    def validate_destination(cls, dest_dir: Path) -> Path:
-        """
-        بررسی و آماده‌سازی مسیر مقصد.
-
-        مسیر باید داخل workspace باشد تا دانلودها خارج از فضای
-        مدیریت‌شده برنامه ذخیره نشوند.
-        """
-        workspace = cls.get_workspace_dir().resolve()
-        destination = Path(dest_dir).resolve()
-
-        try:
-            destination.relative_to(workspace)
-        except ValueError:
-            raise ValueError(
-                "مسیر مقصد باید داخل پوشه workspace باشد."
-            )
-
-        destination.mkdir(parents=True, exist_ok=True)
-
-        return destination
-
-    # ---------------------------------------------------------
-    # File discovery
-    # ---------------------------------------------------------
-
-    @classmethod
-    def find_video_files(cls, directory: Path) -> list[Path]:
-        """پیدا کردن فایل‌های ویدئویی موجود در پوشه و زیرپوشه‌ها."""
-        directory = Path(directory)
-
-        if not directory.exists() or not directory.is_dir():
+    def find_video_files(cls, directory: Path, recursive: bool = True) -> list[Path]:
+        """پیدا کردن فایل‌های ویدئویی موجود در پوشه"""
+        if not directory.exists():
             return []
-
-        videos = []
-
-        for file_path in directory.rglob("*"):
-            try:
-                if (
-                    file_path.is_file()
-                    and file_path.suffix.lower() in cls.VIDEO_EXTENSIONS
-                    and not file_path.name.startswith("_temp_")
-                ):
-                    videos.append(file_path)
-            except OSError:
-                continue
-
-        return sorted(
-            videos,
-            key=lambda path: path.stat().st_size,
-            reverse=True,
-        )
-
-    @classmethod
-    def find_subtitle_files(
-        cls,
-        directory: Path,
-        video_path: Optional[Path] = None,
-        language: Optional[str] = None,
-    ) -> list[Path]:
-        """
-        پیدا کردن فایل‌های زیرنویس در پوشه و زیرپوشه‌ها.
-
-        language:
-            fa = فارسی
-            en = انگلیسی
-            None = همه زیرنویس‌ها
-
-        اولویت‌بندی:
-            1. زیرنویسی که نام آن با نام ویدئو مطابقت دارد.
-            2. زیرنویسی که نام زبان در آن مشخص شده است.
-            3. سایر فایل‌های زیرنویس.
-        """
-        directory = Path(directory)
-
-        if not directory.exists() or not directory.is_dir():
-            return []
-
-        video_stem = (
-            video_path.stem.lower()
-            if video_path
-            else None
-        )
-
-        fa_tokens = {
-            "fa",
-            "per",
-            "persian",
-            "farsi",
-            "فارسی",
-            "iranian",
-        }
-
-        en_tokens = {
-            "en",
-            "eng",
-            "english",
-        }
-
-        candidates = []
-
-        for file_path in directory.rglob("*"):
-            try:
-                if (
-                    not file_path.is_file()
-                    or file_path.suffix.lower() not in cls.SUBTITLE_EXTENSIONS
-                ):
-                    continue
-
-                stem = file_path.stem.lower()
-
-                # تبدیل جداکننده‌های نام فایل به فاصله
-                tokens = set(
-                    re.split(r"[\s._\-()\[\]{}]+", stem)
-                )
-
-                # تشخیص زبان بر اساس کلمات کامل
-                is_fa = bool(tokens.intersection(fa_tokens))
-                is_en = bool(tokens.intersection(en_tokens))
-
-                if language == "fa" and is_en and not is_fa:
-                    continue
-
-                if language == "en" and is_fa and not is_en:
-                    continue
-
-                score = 0
-
-                if video_stem:
-                    if stem == video_stem:
-                        score += 100
-
-                    elif stem.startswith(video_stem):
-                        score += 70
-
-                    elif video_stem in stem:
-                        score += 40
-
-                if language == "fa" and is_fa:
-                    score += 50
-
-                elif language == "en" and is_en:
-                    score += 50
-
-                candidates.append((score, file_path))
-
-            except OSError:
-                continue
-
-        candidates.sort(
-            key=lambda item: (
-                -item[0],
-                item[1].name.lower(),
-            )
-        )
-
-        return [
-            file_path
-            for _, file_path in candidates
+        iterator = directory.rglob("*") if recursive else directory.iterdir()
+        videos = [
+            f for f in iterator
+            if f.is_file()
+            and f.suffix.lower() in cls.VIDEO_EXTENSIONS
+            and not f.name.startswith("_temp_")
         ]
-
-    # ---------------------------------------------------------
-    # Target detection
-    # ---------------------------------------------------------
+        return sorted(videos, key=lambda f: f.stat().st_size, reverse=True)
 
     @staticmethod
     def is_torrent_target(target: str) -> bool:
-        """تشخیص لینک مگنت، فایل تورنت یا لینک torrent."""
-        target = str(target).strip()
-        target_lower = target.lower()
-
-        if target_lower.startswith("magnet:?"):
+        """تشخیص اینکه ورودی لینک مگنت یا فایل/لینک تورنت است یا خیر"""
+        t_low = target.lower().strip()
+        if t_low.startswith("magnet:?"):
             return True
-
-        if target_lower.endswith(".torrent"):
+        if t_low.split("?")[0].endswith(".torrent"):
             return True
-
         try:
-            local_path = Path(target)
-
-            if (
-                local_path.is_file()
-                and local_path.suffix.lower() == ".torrent"
-            ):
+            p = Path(target)
+            if p.is_file() and p.suffix.lower() == ".torrent":
                 return True
-
-        except (OSError, ValueError):
+        except OSError:
             pass
-
         return False
-
-    # ---------------------------------------------------------
-    # Main download dispatcher
-    # ---------------------------------------------------------
 
     @classmethod
     async def download(
         cls,
         url_or_magnet: str,
         dest_dir: Path,
-        progress_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Callable[[str], None] = None
     ) -> Path:
         """
-        تشخیص نوع لینک و انتخاب دانلودر مناسب.
-
-        پشتیبانی از:
-            - HTTP / HTTPS
-            - Magnet
-            - Torrent
-            - Google Drive
-            - Mega.nz
-
-        در صورت لغو task، پردازش دانلود نیز متوقف می‌شود.
+        دانلود هوشمند:
+        - تورنت و مگنت -> ۱. WebUI API مستقیم qBittorrent -> ۲. qbt.exe -> ۳. فال‌بک به aria2c
+        - گوگل درایو -> gdown
+        - مگا -> megatools
+        - لینک مستقیم -> aria2c (با فال‌بک به دانلودر استریم مستقیم aiohttp)
         """
-        if not url_or_magnet or not str(url_or_magnet).strip():
-            raise ValueError("لینک دانلود خالی است.")
-
-        dest_dir = cls.validate_destination(Path(dest_dir))
-        target = str(url_or_magnet).strip()
-        target_lower = target.lower()
-
-        cls._emit_progress(
-            progress_callback,
-            f"مسیر ذخیره‌سازی: {dest_dir}",
-        )
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        target = url_or_magnet.strip()
+        url_lower = target.lower()
 
         if cls.is_torrent_target(target):
-            qbt_bin = cfg.get("paths", "qbt_bin")
+            # تلاش اول: ارتباط مستقیم با WebUI برنامه qBittorrent
+            try:
+                return await cls._download_qbt_webui_api(target, dest_dir, progress_callback)
+            except Exception as webui_err:
+                logging.warning(f"qBittorrent WebUI API fallback ({webui_err}), trying qbt.exe / aria2c...")
 
-            if qbt_bin and Path(qbt_bin).exists():
-                return await cls._download_qbt(
-                    target,
-                    dest_dir,
-                    progress_callback,
-                )
+            # تلاش دوم: استفاده از qbt.exe در صورت وجود
+            qbt_bin = cls._resolve_binary("qbt_bin", "qbt.exe", [r"C:\Tools\qbt\qbt.exe"])
+            if Path(qbt_bin).is_file():
+                try:
+                    return await cls._download_qbt_cli(qbt_bin, target, dest_dir, progress_callback)
+                except Exception as qbt_err:
+                    logging.warning(f"qbt.exe failed ({qbt_err}), falling back to aria2c...")
 
-            return await cls._download_aria2(
-                target,
-                dest_dir,
-                progress_callback,
-            )
+            # تلاش سوم: دانلود تورنت با aria2c
+            return await cls._download_aria2(target, dest_dir, progress_callback)
 
-        if "drive.google.com" in target_lower:
-            return await cls._download_gdrive(
-                target,
-                dest_dir,
-                progress_callback,
-            )
-
-        if "mega.nz" in target_lower:
-            return await cls._download_mega(
-                target,
-                dest_dir,
-                progress_callback,
-            )
-
-        return await cls._download_aria2(
-            target,
-            dest_dir,
-            progress_callback,
-        )
-
-    # ---------------------------------------------------------
-    # qBittorrent
-    # ---------------------------------------------------------
-
-    @staticmethod
-    def _qbt_auth_args() -> list[str]:
-        """ساخت پارامترهای اتصال به qBittorrent WebUI."""
-        qbt_cfg = cfg.get("qbittorrent") or {}
-
-        args = []
-
-        if qbt_cfg.get("webui_url"):
-            args.extend([
-                "--url",
-                str(qbt_cfg["webui_url"]),
-            ])
-
-        if qbt_cfg.get("username"):
-            args.extend([
-                "--username",
-                str(qbt_cfg["username"]),
-            ])
-
-        if qbt_cfg.get("password"):
-            args.extend([
-                "--password",
-                str(qbt_cfg["password"]),
-            ])
-
-        return args
+        elif "drive.google.com" in url_lower:
+            return await cls._download_gdrive(target, dest_dir, progress_callback)
+        elif "mega.nz" in url_lower:
+            return await cls._download_mega(target, dest_dir, progress_callback)
+        else:
+            try:
+                return await cls._download_aria2(target, dest_dir, progress_callback)
+            except Exception as aria_err:
+                logging.warning(f"aria2c failed ({aria_err}), falling back to direct HTTP stream download...")
+                return await cls._download_http_direct(target, dest_dir, progress_callback)
 
     @classmethod
-    async def _qbt_list_torrents(
-        cls,
-        qbt_bin: str,
-        auth_args: list[str],
-    ) -> list[dict]:
-        """دریافت لیست تورنت‌های qBittorrent."""
-        cmd = [
-            qbt_bin,
-            "torrent",
-            "list",
-            "--format",
-            "json",
-        ] + auth_args
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        try:
-            stdout, _ = await proc.communicate()
-
-            if proc.returncode != 0:
-                return []
-
-            data = json.loads(
-                stdout.decode("utf-8", errors="replace")
-            )
-
-            return data if isinstance(data, list) else []
-
-        except asyncio.CancelledError:
-            await cls._terminate_process(proc)
-            raise
-
-        except Exception:
-            if proc.returncode is None:
-                await cls._terminate_process(proc)
-
-            return []
-
-    @classmethod
-    async def _qbt_delete_torrent(
-        cls,
-        qbt_bin: str,
-        auth_args: list[str],
-        torrent_hash: str,
-    ) -> None:
-        """
-        حذف تورنت از qBittorrent بدون حذف فایل‌های دانلودشده.
-
-        این تابع فقط ورودی تورنت را از کلاینت حذف می‌کند.
-        """
-        if not torrent_hash:
-            return
-
-        cmd = [
-            qbt_bin,
-            "torrent",
-            "delete",
-            torrent_hash,
-        ] + auth_args
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        try:
-            await proc.communicate()
-        except asyncio.CancelledError:
-            await cls._terminate_process(proc)
-            raise
-
-    @classmethod
-    async def _download_qbt(
+    async def _download_qbt_webui_api(
         cls,
         target: str,
         dest_dir: Path,
-        progress_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Callable[[str], None] = None
     ) -> Path:
-        """
-        دانلود تورنت با استفاده از qBittorrent CLI.
+        """دانلود تورنت مستقیماً از طریق HTTP API داخلی qBittorrent بدون نیاز به qbt.exe"""
+        qbt_cfg = cfg.get("qbittorrent") or {}
+        base_url = str(qbt_cfg.get("webui_url", "http://127.0.0.1:8080")).rstrip("/")
+        username = qbt_cfg.get("username", "admin")
+        password = qbt_cfg.get("password", "adminpassword")
+        dest_resolved = str(dest_dir.resolve())
 
-        برای جلوگیری از تداخل دانلودهای هم‌زمان، تورنت بر اساس
-        save_path شناسایی می‌شود؛ نه صرفاً جدیدترین تورنت.
-        """
-        qbt_bin = cfg.get("paths", "qbt_bin")
-        auth_args = cls._qbt_auth_args()
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # ۱. لاگین به WebUI
+            login_resp = await session.post(
+                f"{base_url}/api/v2/auth/login",
+                data={"username": username, "password": password}
+            )
+            if login_resp.status != 200:
+                raise RuntimeError(f"qBittorrent WebUI HTTP {login_resp.status}")
+
+            # ۲. ارسال فایل .torrent یا لینک مگنت
+            data = aiohttp.FormData()
+            data.add_field("savepath", dest_resolved)
+
+            try:
+                is_local_file = Path(target).is_file()
+            except OSError:
+                is_local_file = False
+
+            if is_local_file:
+                t_file = Path(target)
+                data.add_field(
+                    "torrents",
+                    t_file.read_bytes(),
+                    filename=t_file.name,
+                    content_type="application/x-bittorrent"
+                )
+            else:
+                data.add_field("urls", target)
+
+            add_resp = await session.post(f"{base_url}/api/v2/torrents/add", data=data)
+            if add_resp.status != 200:
+                raise RuntimeError(f"qBittorrent add failed: {await add_resp.text()}")
+
+            if progress_callback:
+                progress_callback("تورنت به qBittorrent اضافه شد. در حال دریافت متادیتا...")
+
+            completed_states = {"uploading", "stalledup", "pausedup", "queuedup", "checkingup", "forcedup"}
+            matched_hash = None
+            start_ts = time.time()
+
+            while True:
+                await asyncio.sleep(3)
+                info_resp = await session.get(f"{base_url}/api/v2/torrents/info")
+                if info_resp.status != 200:
+                    continue
+                torrents = await info_resp.json()
+                if not isinstance(torrents, list):
+                    continue
+
+                target_torrent = None
+                for t in torrents:
+                    save_p = str(t.get("save_path", "")).rstrip("\\/")
+                    if matched_hash and t.get("hash") == matched_hash:
+                        target_torrent = t
+                        break
+                    elif save_p.lower() == dest_resolved.rstrip("\\/").lower():
+                        target_torrent = t
+                        matched_hash = t.get("hash")
+                        break
+
+                if not target_torrent and torrents and (time.time() - start_ts < 30):
+                    newest = max(torrents, key=lambda x: x.get("added_on", 0))
+                    target_torrent = newest
+                    matched_hash = newest.get("hash")
+
+                if not target_torrent:
+                    continue
+
+                prog = float(target_torrent.get("progress", 0.0)) * 100.0
+                state = str(target_torrent.get("state", "")).lower()
+                dlspeed_mb = float(target_torrent.get("dlspeed", 0)) / (1024 * 1024)
+                name = target_torrent.get("name", "Torrent")
+
+                if progress_callback:
+                    progress_callback(f"{prog:.1f}% | سرعت: {dlspeed_mb:.2f} MB/s ({name[:25]})")
+
+                if prog >= 100.0 or state in completed_states:
+                    if matched_hash:
+                        await session.post(
+                            f"{base_url}/api/v2/torrents/delete",
+                            data={"hashes": matched_hash, "deleteFiles": "false"}
+                        )
+                    break
+
+        return dest_dir
+
+    @classmethod
+    async def _download_qbt_cli(
+        cls,
+        qbt_bin: str,
+        target: str,
+        dest_dir: Path,
+        progress_callback: Callable[[str], None] = None
+    ) -> Path:
+        """دانلود تورنت با استفاده از qbittorrent-cli (qbt.exe)"""
+        qbt_cfg = cfg.get("qbittorrent") or {}
+        auth_args = []
+        if qbt_cfg.get("webui_url"):
+            auth_args.extend(["--url", qbt_cfg["webui_url"]])
+        if qbt_cfg.get("username"):
+            auth_args.extend(["--username", qbt_cfg["username"]])
+        if qbt_cfg.get("password"):
+            auth_args.extend(["--password", qbt_cfg["password"]])
 
         dest_resolved = str(dest_dir.resolve())
-        normalized_dest = dest_resolved.rstrip("\\/").lower()
-
         try:
-            local_file = Path(target).is_file()
-        except (OSError, ValueError):
-            local_file = False
+            is_local_file = Path(target).is_file()
+        except OSError:
+            is_local_file = False
 
-        if local_file:
-            add_cmd = [
-                qbt_bin,
-                "torrent",
-                "add",
-                "file",
-                str(Path(target).resolve()),
-                "--folder",
-                dest_resolved,
-            ] + auth_args
+        if is_local_file:
+            add_cmd = [qbt_bin, "torrent", "add", "file", str(Path(target).resolve()), "--folder", dest_resolved] + auth_args
         else:
-            add_cmd = [
-                qbt_bin,
-                "torrent",
-                "add",
-                "url",
-                target,
-                "--folder",
-                dest_resolved,
-            ] + auth_args
+            add_cmd = [qbt_bin, "torrent", "add", "url", target, "--folder", dest_resolved] + auth_args
 
         proc = await asyncio.create_subprocess_exec(
             *add_cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=asyncio.subprocess.STDOUT
         )
-
-        try:
-            stdout, _ = await proc.communicate()
-
-        except asyncio.CancelledError:
-            await cls._terminate_process(proc)
-            raise
-
+        stdout, _ = await proc.communicate()
         if proc.returncode != 0:
-            raise RuntimeError(
-                "خطا در اضافه کردن تورنت به qBittorrent:\n"
-                + stdout.decode("utf-8", errors="replace")
-            )
+            raise RuntimeError(f"qbt error: {stdout.decode('utf-8', errors='replace')}")
 
-        cls._emit_progress(
-            progress_callback,
-            "تورنت به qBittorrent اضافه شد؛ در انتظار دریافت متادیتا...",
-        )
-
-        completed_states = {
-            "uploading",
-            "stalledup",
-            "pausedup",
-            "queuedup",
-            "checkingup",
-            "forcedup",
-            "completed",
-        }
-
+        completed_states = {"uploading", "stalledup", "pausedup", "queuedup", "checkingup", "forcedup"}
         matched_hash = None
         start_ts = time.time()
 
-        try:
-            while True:
-                await asyncio.sleep(3)
-
-                torrents = await cls._qbt_list_torrents(
-                    qbt_bin,
-                    auth_args,
-                )
-
-                target_torrent = None
-
-                # ابتدا تورنتی را پیدا می‌کنیم که hash آن قبلاً ثبت شده است.
-                if matched_hash:
-                    for torrent in torrents:
-                        if (
-                            str(torrent.get("hash", "")).lower()
-                            == str(matched_hash).lower()
-                        ):
-                            target_torrent = torrent
-                            break
-
-                # در غیر این صورت بر اساس مسیر ذخیره‌سازی جست‌وجو می‌کنیم.
-                if target_torrent is None:
-                    matching = []
-
-                    for torrent in torrents:
-                        save_path = str(
-                            torrent.get("save_path", "")
-                        ).rstrip("\\/").lower()
-
-                        if save_path == normalized_dest:
-                            matching.append(torrent)
-
-                    if matching:
-                        # در صورت وجود چند نتیجه، جدیدترین مورد انتخاب می‌شود.
-                        target_torrent = max(
-                            matching,
-                            key=lambda item: item.get("added_on", 0),
-                        )
-
-                        matched_hash = target_torrent.get("hash")
-
-                # در 30 ثانیه اول، در صورت نبود save_path،
-                # فقط برای سازگاری با نسخه‌های مختلف qbt تلاش محدود انجام می‌شود.
-                if (
-                    target_torrent is None
-                    and not matched_hash
-                    and time.time() - start_ts < 30
-                ):
-                    matching = [
-                        torrent
-                        for torrent in torrents
-                        if torrent.get("added_on", 0) >= start_ts - 5
-                    ]
-
-                    if len(matching) == 1:
-                        target_torrent = matching[0]
-                        matched_hash = target_torrent.get("hash")
-
-                if target_torrent is None:
-                    cls._emit_progress(
-                        progress_callback,
-                        "در انتظار شناسایی تورنت در qBittorrent...",
-                    )
-                    continue
-
-                progress = (
-                    float(target_torrent.get("progress", 0.0))
-                    * 100.0
-                )
-
-                state = str(
-                    target_torrent.get("state", "")
-                ).lower()
-
-                speed_mb = (
-                    float(target_torrent.get("dlspeed", 0))
-                    / (1024 * 1024)
-                )
-
-                name = str(
-                    target_torrent.get("name", "Torrent")
-                )
-
-                cls._emit_progress(
-                    progress_callback,
-                    (
-                        f"{progress:.1f}% | "
-                        f"سرعت: {speed_mb:.2f} MB/s | "
-                        f"وضعیت: {state} | "
-                        f"{name[:40]}"
-                    ),
-                )
-
-                if progress >= 100.0 or state in completed_states:
-                    if matched_hash:
-                        await cls._qbt_delete_torrent(
-                            qbt_bin,
-                            auth_args,
-                            matched_hash,
-                        )
-
-                    cls._emit_progress(
-                        progress_callback,
-                        "دانلود تورنت با موفقیت به پایان رسید.",
-                    )
-
-                    return dest_dir
-
-        except asyncio.CancelledError:
-            # هنگام لغو، تلاش می‌کنیم تورنت مربوط به همین مسیر را پیدا کنیم.
+        while True:
+            await asyncio.sleep(3)
+            list_cmd = [qbt_bin, "torrent", "list", "--format", "json"] + auth_args
+            l_proc = await asyncio.create_subprocess_exec(
+                *list_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            l_out, _ = await l_proc.communicate()
             try:
-                if not matched_hash:
-                    torrents = await cls._qbt_list_torrents(
-                        qbt_bin,
-                        auth_args,
-                    )
-
-                    matching = [
-                        torrent
-                        for torrent in torrents
-                        if str(
-                            torrent.get("save_path", "")
-                        ).rstrip("\\/").lower() == normalized_dest
-                    ]
-
-                    if len(matching) == 1:
-                        matched_hash = matching[0].get("hash")
-
-                if matched_hash:
-                    await cls._qbt_delete_torrent(
-                        qbt_bin,
-                        auth_args,
-                        matched_hash,
-                    )
-
+                torrents = json.loads(l_out.decode("utf-8", errors="replace"))
             except Exception:
-                pass
+                continue
 
-            raise
+            if not isinstance(torrents, list):
+                continue
 
-    # ---------------------------------------------------------
-    # Aria2
-    # ---------------------------------------------------------
+            target_torrent = None
+            for t in torrents:
+                save_p = str(t.get("save_path", "")).rstrip("\\/")
+                if matched_hash and t.get("hash") == matched_hash:
+                    target_torrent = t
+                    break
+                elif save_p.lower() == dest_resolved.rstrip("\\/").lower():
+                    target_torrent = t
+                    matched_hash = t.get("hash")
+                    break
+
+            if not target_torrent and torrents and (time.time() - start_ts < 30):
+                newest = max(torrents, key=lambda x: x.get("added_on", 0))
+                target_torrent = newest
+                matched_hash = newest.get("hash")
+
+            if not target_torrent:
+                continue
+
+            prog = float(target_torrent.get("progress", 0.0)) * 100.0
+            state = str(target_torrent.get("state", "")).lower()
+            dlspeed_mb = float(target_torrent.get("dlspeed", 0)) / (1024 * 1024)
+            if progress_callback:
+                progress_callback(f"{prog:.1f}% | {dlspeed_mb:.2f} MB/s")
+
+            if prog >= 100.0 or state in completed_states:
+                if matched_hash:
+                    del_cmd = [qbt_bin, "torrent", "delete", matched_hash] + auth_args
+                    d_proc = await asyncio.create_subprocess_exec(*del_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                    await d_proc.communicate()
+                break
+
+        return dest_dir
 
     @classmethod
     async def _download_aria2(
         cls,
         target: str,
         dest_dir: Path,
-        progress_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Callable[[str], None] = None
     ) -> Path:
-        """دانلود لینک مستقیم یا تورنت با aria2c."""
-        aria2_bin = cfg.get("paths", "aria2c_bin")
-
-        if not aria2_bin:
-            raise RuntimeError("مسیر aria2c در config.yaml تنظیم نشده است.")
-
+        aria2_bin = cls._resolve_binary(
+            "aria2c_bin",
+            "aria2c.exe",
+            [r"C:\Tools\aria2\aria2c.exe", r"C:\Program Files\aria2\aria2c.exe"]
+        )
         cmd = [
-            str(aria2_bin),
-            f"--dir={dest_dir}",
+            aria2_bin,
+            f"--dir={dest_dir.resolve()}",
             "--seed-time=0",
             "--max-connection-per-server=16",
             "--split=16",
             "--continue=true",
+            "--check-certificate=false",
             "--summary-interval=2",
-            "--console-log-level=notice",
         ]
-
         proxy_url = ProxyManager.get_proxy_url()
-
-        if proxy_url and proxy_url.startswith(("http://", "https://")):
+        if proxy_url and proxy_url.startswith("http"):
             cmd.append(f"--all-proxy={proxy_url}")
 
         cmd.append(target)
 
-        cls._emit_progress(
-            progress_callback,
-            "دانلود با aria2 شروع شد.",
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT
         )
 
-        await cls._run_process(
-            cmd,
-            progress_callback=progress_callback,
-            progress_filter=lambda line: (
-                "[#" in line
-                or "Download complete" in line
-                or "ERROR" in line.upper()
-            ),
-            error_message="دانلود با aria2 ناموفق بود",
-        )
+        last_err_lines = []
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").strip()
+            if text:
+                last_err_lines.append(text)
+                if len(last_err_lines) > 10:
+                    last_err_lines.pop(0)
+            if ("%" in text or "[#" in text) and progress_callback:
+                progress_callback(text[:70])
 
-        cls._emit_progress(
-            progress_callback,
-            "دانلود با aria2 به پایان رسید.",
-        )
+        await proc.wait()
+        if proc.returncode != 0:
+            err_detail = " | ".join(last_err_lines[-3:])
+            raise RuntimeError(f"Aria2c Exit {proc.returncode}: {err_detail}")
 
         return dest_dir
 
-    # ---------------------------------------------------------
-    # Google Drive
-    # ---------------------------------------------------------
+    @staticmethod
+    async def _download_http_direct(
+        url: str,
+        dest_dir: Path,
+        progress_callback: Callable[[str], None] = None
+    ) -> Path:
+        """دانلودر مستقیم داخلی پایتون (فال‌بک در صورت نصب نبودن aria2c روی سیستم تست)"""
+        filename = url.split("?")[0].rstrip("/").split("/")[-1] or "downloaded_video.mkv"
+        if "." not in filename:
+            filename += ".mkv"
+        out_file = dest_dir / filename
 
-    @classmethod
+        connector = ProxyManager.get_aiohttp_connector()
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(url, ssl=False) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
+                last_report = 0.0
+
+                with open(out_file, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 256):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        now = time.time()
+                        if progress_callback and (now - last_report >= 2.0):
+                            last_report = now
+                            if total > 0:
+                                pct = (downloaded / total) * 100
+                                progress_callback(f"{pct:.1f}% ({downloaded / (1024*1024):.1f} MB)")
+                            else:
+                                progress_callback(f"{downloaded / (1024*1024):.1f} MB دانلود شد...")
+
+        return dest_dir
+
+    @staticmethod
     async def _download_gdrive(
-        cls,
         gdrive_url: str,
         dest_dir: Path,
-        progress_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Callable[[str], None] = None
     ) -> Path:
-        """
-        دانلود از Google Drive با gdown به‌صورت subprocess.
-
-        استفاده از subprocess به‌جای asyncio.to_thread باعث می‌شود
-        در زمان لغو task بتوان پردازش دانلود را نیز متوقف کرد.
-        """
-        cls._emit_progress(
-            progress_callback,
-            "در حال دانلود از Google Drive...",
-        )
+        if progress_callback:
+            progress_callback("در حال دانلود از Google Drive...")
 
         proxy_url = ProxyManager.get_proxy_url()
 
-        cmd = [
-            sys.executable,
-            "-m",
-            "gdown",
-        ]
+        def _sync_gdown():
+            if "/folders/" in gdrive_url:
+                gdown.download_folder(url=gdrive_url, output=str(dest_dir), quiet=False, proxy=proxy_url)
+            else:
+                gdown.download(url=gdrive_url, output=str(dest_dir) + "\\", quiet=False, fuzzy=True, proxy=proxy_url)
 
-        if "/folders/" in gdrive_url.lower():
-            cmd.extend([
-                "--folder",
-                gdrive_url,
-                "--output",
-                str(dest_dir),
-            ])
-        else:
-            cmd.extend([
-                gdrive_url,
-                "--output",
-                str(dest_dir),
-                "--fuzzy",
-            ])
-
-        if proxy_url:
-            cmd.extend([
-                "--proxy",
-                proxy_url,
-            ])
-
-        await cls._run_process(
-            cmd,
-            progress_callback=progress_callback,
-            error_message="دانلود از Google Drive ناموفق بود",
-        )
-
-        cls._emit_progress(
-            progress_callback,
-            "دانلود Google Drive به پایان رسید.",
-        )
-
+        await asyncio.to_thread(_sync_gdown)
         return dest_dir
-
-    # ---------------------------------------------------------
-    # Mega
-    # ---------------------------------------------------------
 
     @classmethod
     async def _download_mega(
         cls,
         mega_url: str,
         dest_dir: Path,
-        progress_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Callable[[str], None] = None
     ) -> Path:
-        """دانلود از Mega.nz با megadl یا megatools."""
-        megadl_bin = cfg.get("paths", "megadl_bin")
-
-        if not megadl_bin:
-            raise RuntimeError("مسیر megadl در config.yaml تنظیم نشده است.")
-
-        if "megatools" in str(megadl_bin).lower():
-            cmd = [
-                str(megadl_bin),
-                "dl",
-                "--path",
-                str(dest_dir),
-            ]
-        else:
-            cmd = [
-                str(megadl_bin),
-                "--path",
-                str(dest_dir),
-            ]
-
+        megadl_bin = cls._resolve_binary(
+            "megadl_bin",
+            "megatools.exe",
+            [r"C:\Tools\megatools\megatools.exe", r"C:\Tools\megatools\megadl.exe"]
+        )
+        cmd = (
+            [megadl_bin, "dl", "--path", str(dest_dir)]
+            if "megatools" in megadl_bin.lower()
+            else [megadl_bin, "--path", str(dest_dir)]
+        )
         proxy_url = ProxyManager.get_proxy_url()
-
         if proxy_url:
-            cmd.extend([
-                "--proxy",
-                proxy_url,
-            ])
-
+            cmd.extend(["--proxy", proxy_url])
         cmd.append(mega_url)
 
-        cls._emit_progress(
-            progress_callback,
-            "دانلود از Mega.nz شروع شد.",
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT
         )
 
-        await cls._run_process(
-            cmd,
-            progress_callback=progress_callback,
-            progress_filter=lambda line: (
-                "%" in line
-                or "error" in line.lower()
-                or "download" in line.lower()
-            ),
-            error_message="دانلود از Mega.nz ناموفق بود",
-        )
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").strip()
+            if "%" in text and progress_callback:
+                progress_callback(text)
 
-        cls._emit_progress(
-            progress_callback,
-            "دانلود Mega.nz به پایان رسید.",
-        )
-
+        await proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError("خطا در دانلود از Mega.nz")
         return dest_dir

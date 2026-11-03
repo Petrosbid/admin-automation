@@ -3,7 +3,7 @@ import uuid
 from pathlib import Path
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardButton
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -21,8 +21,8 @@ from bot.keyboards import (
     main_menu_kb, monitor_menu_kb, folder_structure_choice_kb,
     target_folders_kb, search_categories_kb, search_sites_kb,
     search_results_kb, file_browser_kb, video_actions_kb,
-    presets_kb, multi_video_select_kb, subtitle_mode_kb,
-    skip_or_cancel_kb, sync_options_kb
+    presets_kb, subtitle_folder_browser_kb, queue_management_kb,
+    subtitle_mode_kb, skip_or_cancel_kb, sync_options_kb
 )
 
 router = Router()
@@ -46,7 +46,7 @@ class BotStates(StatesGroup):
     # ۳. دانلود لینک و استخراج خودکار زیرنویس و ارسال در تلگرام
     waiting_link_for_sub_extract = State()
 
-    # ۴. انتخاب فایل‌ها، دریافت زیرنویس (FA/EN)، سینک زیرنویس و مرج/هاردساب
+    # ۴. انتخاب پوشه‌به‌پوشه فایل‌ها، دریافت زیرنویس (FA/EN)، سینک زیرنویس و مرج/هاردساب
     selecting_target_videos = State()
     waiting_fa_subtitle = State()
     waiting_en_subtitle = State()
@@ -59,6 +59,34 @@ class BotStates(StatesGroup):
 
 def is_admin(user_id: int) -> bool:
     return user_id in cfg.get("telegram", "admin_ids", [])
+
+
+def _resolve_media_dirs(video_path: Path, custom_base_stem: str) -> dict[str, Path]:
+    """
+    تشخیص هوشمند پوشه مادر فیلم تا خروجی هاردساب همیشه در پوشه hardsub
+    و خروجی سافت‌ساب همیشه در پوشه softsub ذخیره شود (حتی اگر فیلم ورودی داخل پوشه softsub باشد).
+    """
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    vid_parent = video_path.resolve().parent
+
+    # اگر فایل ویدئو خودش داخل یکی از زیرپوشه‌های softsub / hardsub / sub است، یک سطح به پوشه اصلی فیلم برگرد
+    if vid_parent.name.lower() in ("softsub", "hardsub", "sub", "raw_temp"):
+        movie_base_dir = vid_parent.parent
+    elif vid_parent == workspace:
+        safe_name = re.sub(r'[<>:"/\\|?*]', "", custom_base_stem).strip().replace(" ", "_")
+        movie_base_dir = workspace / (safe_name or "Media_Output")
+    else:
+        movie_base_dir = vid_parent
+
+    folders = {
+        "base": movie_base_dir,
+        "softsub": movie_base_dir / "softsub",
+        "hardsub": movie_base_dir / "hardsub",
+        "sub": movie_base_dir / "sub",
+    }
+    for p in folders.values():
+        p.mkdir(parents=True, exist_ok=True)
+    return folders
 
 
 def _format_current_filenames_prompt(data: dict) -> str:
@@ -93,6 +121,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         f"🎬 **پنل اتوماسیون مدیا و آپلودر ({brand})**\n\n"
         f"🔥 ظرفیت هاردساب همزمان HandBrake: **`{hb_workers}` پردازش موازی**\n"
+        "☁️ آپلود CuteFTP 9: **متصل به نرم‌افزار بازِ روی سرور (بدون نیاز به پسورد)**\n"
         "📡 پایشگر ۵ دقیقه‌ای سایت‌های **Pahe.ink**، **PSA.wf** و **YTS.gg** فعال است.\n"
         "✅ زیرنویس در **سافت‌ساب به صورت عادی** (فقط فارسی و انگلیسی) و در **هاردساب به صورت بولد و زرد (`#fbff00`)** اعمال می‌شود.",
         reply_markup=main_menu_kb(),
@@ -167,7 +196,7 @@ async def cb_monitor_check_now(call: CallbackQuery):
         f"🔹 پست‌های جدید Pahe.ink: `{counts['pahe']}`\n"
         f"🔹 پست‌های جدید PSA.wf: `{counts['psa']}`\n"
         f"🔹 پست‌های جدید YTS.gg: `{counts['yts']}`\n\n"
-        f"합 مجموع پست‌های جدید ارسال شده: `{total_new}`",
+        f"مجموع پست‌های جدید ارسال شده: `{total_new}`",
         reply_markup=monitor_menu_kb(enabled),
         parse_mode="Markdown"
     )
@@ -244,7 +273,7 @@ async def cb_quick_mkdir_from_monitor(call: CallbackQuery, state: FSMContext):
 
 @router.message(BotStates.waiting_new_folder_name)
 async def handle_new_folder_name(message: Message, state: FSMContext):
-    raw_name = message.text.strip()
+    raw_name = (message.text or "").strip()
     safe_name = re.sub(r'[<>:"/\\|?*]', "", raw_name).strip().replace(" ", "_")
     if not safe_name:
         return await message.answer("⚠️ نام پوشه معتبر نیست. دوباره ارسال کنید:")
@@ -407,7 +436,7 @@ async def handle_search_query(message: Message, state: FSMContext):
 
         await state.update_data(search_results=results)
         await wait_msg.edit_text(
-            f"✅ نتایج یافت شده برای `{message.text}`:\nروی گزینه دلخواه کلیک کنید تا با `qbt` یا `aria2c` دانلود شود:",
+            f"✅ نتایج یافت شده برای `{message.text}`:\nروی گزینه دلخواه کلیک کنید تا دانلود شود:",
             reply_markup=search_results_kb(results),
             parse_mode="Markdown"
         )
@@ -420,6 +449,9 @@ async def cb_click_search_result(call: CallbackQuery, state: FSMContext):
     idx = int(call.data.split(":")[1])
     data = await state.get_data()
     results = data.get("search_results", [])
+    if idx >= len(results):
+        return await call.answer("⚠️ نتیجه منقضی شده است، دوباره جستجو کنید.", show_alert=True)
+
     chosen = results[idx]
 
     if chosen.get("type") == "page":
@@ -443,8 +475,9 @@ async def cb_click_search_result(call: CallbackQuery, state: FSMContext):
         chosen["target"],
         folders["base"]
     )
+    await state.clear()
     await call.message.edit_text(
-        f"✅ به صف دانلود (`qbt` / `aria2c`) اضافه شد!\n"
+        f"✅ به صف دانلود اضافه شد!\n"
         f"🆔 کد تسک: `{task.task_id}`\n📂 پوشه ساخته شده: `{folders['base'].name}`",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
@@ -454,6 +487,7 @@ async def cb_click_search_result(call: CallbackQuery, state: FSMContext):
 # ==================== ۲. دانلود لینک مستقیم / تورنت (qbt) / مگا / گوگل درایو ====================
 @router.callback_query(F.data == "menu:direct_dl")
 async def cb_direct_dl(call: CallbackQuery, state: FSMContext):
+    await state.clear()
     await state.set_state(BotStates.waiting_direct_folder_name)
     await call.message.edit_text(
         "📁 ابتدا **نام پوشه فیلم یا سریال** را وارد کنید (مثلاً `Severance S02E01 1080p`):",
@@ -463,6 +497,9 @@ async def cb_direct_dl(call: CallbackQuery, state: FSMContext):
 
 @router.message(BotStates.waiting_direct_folder_name)
 async def handle_direct_folder_name(message: Message, state: FSMContext):
+    if not message.text:
+        return await message.answer("⚠️ لطفاً نام پوشه را به صورت متن ارسال کنید:")
+
     folder_name = message.text.strip()
     data = await state.get_data()
 
@@ -488,7 +525,8 @@ async def handle_direct_folder_name(message: Message, state: FSMContext):
     await state.update_data(dl_folder_name=folder_name)
     await state.set_state(BotStates.waiting_direct_link)
     await message.answer(
-        "🔗 حالا **لینک مستقیم، لینک Magnet، لینک تورنت، Mega.nz یا Google Drive** را ارسال کنید (یا فایل `.torrent` بفرستید):",
+        f"📂 پوشه هدف: `{folder_name}`\n\n"
+        "🔗 حالا **لینک مستقیم، لینک Magnet، لینک تورنت، Mega.nz یا Google Drive** را ارسال کنید (یا **فایل `.torrent`** بفرستید):",
         parse_mode="Markdown"
     )
 
@@ -496,14 +534,16 @@ async def handle_direct_folder_name(message: Message, state: FSMContext):
 @router.message(BotStates.waiting_direct_link)
 async def handle_direct_link(message: Message, state: FSMContext):
     data = await state.get_data()
-    folders = DownloaderService.create_movie_folders(data["dl_folder_name"])
+    folders = DownloaderService.create_movie_folders(data.get("dl_folder_name", "Downloaded_Media"))
 
-    if message.document and message.document.file_name.lower().endswith(".torrent"):
+    if message.document and message.document.file_name and message.document.file_name.lower().endswith(".torrent"):
         torrent_path = folders["base"] / message.document.file_name
         await message.bot.download(message.document, destination=torrent_path)
-        target = str(torrent_path)
+        target = str(torrent_path.resolve())
+    elif message.text:
+        target = message.text.strip()
     else:
-        target = (message.text or "").strip()
+        return await message.answer("⚠️ لطفاً یک لینک معتبر یا یک فایل `.torrent` ارسال کنید:")
 
     task = await queue_engine.add_task(
         "download",
@@ -557,6 +597,7 @@ async def _download_and_extract_subs_job(
 
 @router.callback_query(F.data == "menu:link_extract_sub")
 async def cb_link_extract_sub(call: CallbackQuery, state: FSMContext):
+    await state.clear()
     await state.set_state(BotStates.waiting_link_for_sub_extract)
     await call.message.edit_text(
         "📤 **دانلود فیلم و استخراج خودکار زیرنویس**\n\n"
@@ -572,12 +613,14 @@ async def handle_link_for_sub_extract(message: Message, state: FSMContext):
     temp_dir = Path(cfg.get("paths", "workspace_dir")) / f"SubExtract_{job_uid}"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    if message.document and message.document.file_name.lower().endswith(".torrent"):
+    if message.document and message.document.file_name and message.document.file_name.lower().endswith(".torrent"):
         t_path = temp_dir / message.document.file_name
         await message.bot.download(message.document, destination=t_path)
-        target = str(t_path)
+        target = str(t_path.resolve())
+    elif message.text:
+        target = message.text.strip()
     else:
-        target = (message.text or "").strip()
+        return await message.answer("⚠️ لطفاً لینک یا فایل `.torrent` ارسال کنید:")
 
     task = await queue_engine.add_task(
         "download",
@@ -597,54 +640,116 @@ async def handle_link_for_sub_extract(message: Message, state: FSMContext):
     )
 
 
-# ==================== ۴. انتخاب فیلم(ها)، دریافت زیرنویس (FA/EN) و سینک کردن ====================
-@router.callback_query(F.data == "menu:sub_to_files")
-async def cb_sub_to_files_start(call: CallbackQuery, state: FSMContext):
-    workspace = Path(cfg.get("paths", "workspace_dir"))
-    videos = DownloaderService.find_video_files(workspace)
-    if not videos:
-        return await call.answer("❌ هیچ فایل ویدئویی در پوشه workspace یافت نشد!", show_alert=True)
+# ==================== ۴. انتخاب پوشه‌به‌پوشه فیلم(ها)، دریافت زیرنویس (FA/EN) و سینک کردن ====================
+async def _render_sub_folder_browser(call: CallbackQuery, state: FSMContext, browse_dir: Path):
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    browse_dir = browse_dir.resolve()
+    browse_dir.mkdir(parents=True, exist_ok=True)
 
-    await state.set_state(BotStates.selecting_target_videos)
-    await state.update_data(all_videos=[str(v) for v in videos], selected_indices=[], operation_mode=None)
+    folders = sorted(
+        [p for p in browse_dir.iterdir() if p.is_dir() and not p.name.startswith("_")],
+        key=lambda x: x.name.lower()
+    )
+    videos = DownloaderService.find_video_files(browse_dir, recursive=False)
+
+    data = await state.get_data()
+    selected_paths = set(data.get("selected_video_paths", []))
+
+    await state.update_data(
+        sub_browse_dir=str(browse_dir),
+        sub_dir_folders=[str(f.resolve()) for f in folders],
+        sub_dir_videos=[str(v.resolve()) for v in videos],
+        selected_video_paths=list(selected_paths)
+    )
+
+    is_root = (browse_dir == workspace)
     await call.message.edit_text(
-        "🎬 **انتخاب فیلم(ها) برای سافت‌ساب / هاردساب**\n"
-        "روی فایل‌های مورد نظر کلیک کنید تا تیک (`✅`) بخورند، سپس دکمه «ادامه به مرحله ارسال زیرنویس» را بزنید:",
-        reply_markup=multi_video_select_kb(videos, set()),
+        f"🎬 **انتخاب پوشه‌به‌پوشه فیلم‌ها برای زیرنویس**\n"
+        f"📂 مسیر فعلی:\n`{browse_dir}`\n"
+        f"✅ فایل‌های انتخاب شده تا الان: `{len(selected_paths)}` فایل\n\n"
+        "روی پوشه مورد نظر کلیک کنید تا باز شود، سپس فایل‌های داخل آن را تیک (`✅`) بزنید:",
+        reply_markup=subtitle_folder_browser_kb(folders, videos, selected_paths, is_root),
         parse_mode="Markdown"
     )
 
 
-@router.callback_query(BotStates.selecting_target_videos, F.data.startswith("mvsel:"))
-async def cb_toggle_video_selection(call: CallbackQuery, state: FSMContext):
-    idx = int(call.data.split(":")[1])
+@router.callback_query(F.data == "menu:sub_to_files")
+async def cb_sub_to_files_start(call: CallbackQuery, state: FSMContext):
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    await state.set_state(BotStates.selecting_target_videos)
+    await state.update_data(selected_video_paths=[], operation_mode=None)
+    await _render_sub_folder_browser(call, state, workspace)
+
+
+@router.callback_query(BotStates.selecting_target_videos, F.data.startswith("subnav:dir:"))
+async def cb_subnav_open_dir(call: CallbackQuery, state: FSMContext):
+    idx = int(call.data.split(":")[2])
     data = await state.get_data()
-    videos = [Path(p) for p in data["all_videos"]]
-    sel = set(data.get("selected_indices", []))
+    folders = data.get("sub_dir_folders", [])
+    if idx < len(folders):
+        await _render_sub_folder_browser(call, state, Path(folders[idx]))
 
-    if idx in sel:
-        sel.remove(idx)
+
+@router.callback_query(BotStates.selecting_target_videos, F.data == "subnav:up")
+async def cb_subnav_up(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    curr = Path(data.get("sub_browse_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    parent = curr.parent if curr != workspace else workspace
+    await _render_sub_folder_browser(call, state, parent)
+
+
+@router.callback_query(BotStates.selecting_target_videos, F.data.startswith("subnav:vid:"))
+async def cb_subnav_toggle_video(call: CallbackQuery, state: FSMContext):
+    idx = int(call.data.split(":")[2])
+    data = await state.get_data()
+    videos = data.get("sub_dir_videos", [])
+    if idx >= len(videos):
+        return
+    vid_str = str(Path(videos[idx]).resolve())
+    selected_paths = set(data.get("selected_video_paths", []))
+
+    if vid_str in selected_paths:
+        selected_paths.remove(vid_str)
     else:
-        sel.add(idx)
+        selected_paths.add(vid_str)
 
-    await state.update_data(selected_indices=list(sel))
-    await call.message.edit_reply_markup(reply_markup=multi_video_select_kb(videos, sel))
+    await state.update_data(selected_video_paths=list(selected_paths))
+    curr = Path(data.get("sub_browse_dir", cfg.get("paths", "workspace_dir")))
+    await _render_sub_folder_browser(call, state, curr)
+
+
+@router.callback_query(BotStates.selecting_target_videos, F.data == "subnav:sel_all")
+async def cb_subnav_select_all_in_folder(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    videos = [str(Path(v).resolve()) for v in data.get("sub_dir_videos", [])]
+    selected_paths = set(data.get("selected_video_paths", []))
+
+    if all(v in selected_paths for v in videos):
+        for v in videos:
+            selected_paths.discard(v)
+    else:
+        for v in videos:
+            selected_paths.add(v)
+
+    await state.update_data(selected_video_paths=list(selected_paths))
+    curr = Path(data.get("sub_browse_dir", cfg.get("paths", "workspace_dir")))
+    await _render_sub_folder_browser(call, state, curr)
 
 
 @router.callback_query(BotStates.selecting_target_videos, F.data == "mvact:proceed")
 async def cb_proceed_to_subs(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    sel = data.get("selected_indices", [])
+    sel = sorted(data.get("selected_video_paths", []))
     if not sel:
-        return await call.answer("⚠️ حداقل یک فایل ویدئویی را تیک بزنید!", show_alert=True)
+        return await call.answer("⚠️ حداقل یک فایل ویدئویی را از داخل پوشه‌ها تیک بزنید!", show_alert=True)
 
-    target_videos = [data["all_videos"][i] for i in sorted(sel)]
-    await state.update_data(target_videos=target_videos, fa_sub_path=None, en_sub_path=None)
+    await state.update_data(target_videos=sel, fa_sub_path=None, en_sub_path=None)
     await state.set_state(BotStates.waiting_fa_subtitle)
     await call.message.edit_text(
-        f"✅ تعداد `{len(target_videos)}` فایل فیلم انتخاب شد.\n\n"
+        f"✅ تعداد `{len(sel)}` فایل فیلم انتخاب شد.\n\n"
         "🇮🇷 **مرحله ۱ زیرنویس:** لطفاً **فایل زیرنویس فارسی (`.srt` یا `.ass`)** را ارسال کنید\n"
-        "*(زیرنویس در سافت‌ساب بدون تغییر رنگ و در هاردساب به رنگ زرد `#fbff00` و بولد اعمال می‌شود)*:",
+        "*(در سافت‌ساب بدون تغییر رنگ و در هاردساب به رنگ زرد `#fbff00` و بولد اعمال می‌شود)*:",
         reply_markup=skip_or_cancel_kb("skip:fa_sub"),
         parse_mode="Markdown"
     )
@@ -664,8 +769,8 @@ async def cb_skip_fa_sub(call: CallbackQuery, state: FSMContext):
 async def handle_fa_sub_upload(message: Message, state: FSMContext):
     data = await state.get_data()
     first_video = Path(data["target_videos"][0])
-    sub_dir = first_video.parent / "sub" if (first_video.parent / "sub").exists() else first_video.parent
-    fa_dest = sub_dir / f"FA_{message.document.file_name}"
+    dirs = _resolve_media_dirs(first_video, first_video.stem)
+    fa_dest = dirs["sub"] / f"FA_{message.document.file_name}"
     await message.bot.download(message.document, destination=fa_dest)
 
     # فقط نرمال‌سازی UTF-8 بدون زرد و بولد کردن (تا در سافت‌ساب عادی بماند)
@@ -675,7 +780,7 @@ async def handle_fa_sub_upload(message: Message, state: FSMContext):
     await state.update_data(fa_sub_path=str(fa_dest))
     await state.set_state(BotStates.waiting_en_subtitle)
     await message.answer(
-        "✅ زیرنویس **فارسی** دریافت شد.\n\n"
+        "✅ زیرنویس **فارسی** دریافت و در پوشه `sub` ذخیره شد.\n\n"
         "🇬🇧 **مرحله ۲ زیرنویس:** اگر **زیرنویس انگلیسی** هم دارید فایل آن را بفرستید (تا تمام زیرنویس‌های قدیمی فیلم حذف شوند و فقط همین دو زیرنویس بمانند).\n"
         "در صورت زدن دکمه «رد شدن»، اولین زیرنویس انگلیسی داخل خود فیلم (در صورت وجود) حفظ و بقیه حذف می‌شوند:",
         reply_markup=skip_or_cancel_kb("skip:en_sub"),
@@ -702,8 +807,8 @@ async def cb_skip_en_sub(call: CallbackQuery, state: FSMContext):
 async def handle_en_sub_upload(message: Message, state: FSMContext):
     data = await state.get_data()
     first_video = Path(data["target_videos"][0])
-    sub_dir = first_video.parent / "sub" if (first_video.parent / "sub").exists() else first_video.parent
-    en_dest = sub_dir / f"EN_{message.document.file_name}"
+    dirs = _resolve_media_dirs(first_video, first_video.stem)
+    en_dest = dirs["sub"] / f"EN_{message.document.file_name}"
     await message.bot.download(message.document, destination=en_dest)
 
     if en_dest.suffix.lower() == ".srt":
@@ -712,7 +817,7 @@ async def handle_en_sub_upload(message: Message, state: FSMContext):
     await state.update_data(en_sub_path=str(en_dest))
     await state.set_state(BotStates.waiting_sync_choice)
     await message.answer(
-        "✅ زیرنویس **انگلیسی** نیز دریافت شد.\n\n"
+        "✅ زیرنویس **انگلیسی** نیز دریافت و در پوشه `sub` ذخیره شد.\n\n"
         "🔄 **مرحله سینک (هماهنگ‌سازی) زیرنویس قبل از پردازش:**\n"
         "چگونه می‌خواهید تایمینگ زیرنویس فارسی با فیلم سینک شود؟",
         reply_markup=sync_options_kb(),
@@ -829,13 +934,10 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
             f"{Path(custom_name).stem}_{idx+1}" if len(target_videos) > 1 else Path(custom_name).stem
         )
 
-        if mode == "both":
-            folders = DownloaderService.create_movie_folders(base_stem)
-            soft_dir = folders["softsub"]
-            hard_dir = folders["hardsub"]
-        else:
-            soft_dir = (vid.parent / "softsub") if (vid.parent / "softsub").exists() else vid.parent
-            hard_dir = (vid.parent / "hardsub") if (vid.parent / "hardsub").exists() else vid.parent
+        # تشخیص پوشه مادر فیلم و ساخت تضمینی پوشه‌های مجزای softsub و hardsub
+        dirs = _resolve_media_dirs(vid, base_stem)
+        soft_dir = dirs["softsub"]
+        hard_dir = dirs["hardsub"]
 
         if mode in ("softsub", "both"):
             soft_out = soft_dir / f"{base_stem}.SoftSub.{site_tag}.mkv"
@@ -852,7 +954,7 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
                 sync_mode,
                 sync_offset_ms
             )
-            scheduled_ids.append(f"📎 SoftSub: `{t_soft.task_id}`")
+            scheduled_ids.append(f"📎 SoftSub (`softsub/`): `{t_soft.task_id}`")
 
         if mode in ("hardsub", "both") and chosen_preset:
             hard_out = hard_dir / f"{base_stem}.HardSub.{site_tag}.mp4"
@@ -871,7 +973,7 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
                 sync_mode,
                 sync_offset_ms
             )
-            scheduled_ids.append(f"🔥 HardSub: `{t_hard.task_id}`")
+            scheduled_ids.append(f"🔥 HardSub (`hardsub/`): `{t_hard.task_id}`")
 
     return scheduled_ids
 
@@ -884,8 +986,8 @@ async def _schedule_subtitle_jobs(call: CallbackQuery, state: FSMContext, chosen
     summary_text = "\n".join(scheduled_ids)
     await call.message.edit_text(
         f"✅ عملیات با تگ `{brand}` در صف قرار گرفت!\n"
-        "• سافت‌ساب: بدون تغییر رنگ (فقط فارسی و انگلیسی)\n"
-        "• هاردساب: بولد و زرد (`#fbff00`)\n\n"
+        "• سافت‌ساب در پوشه `softsub` (بدون تغییر رنگ)\n"
+        "• هاردساب در پوشه `hardsub` (بولد و زرد `#fbff00`)\n\n"
         f"{summary_text}",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
@@ -900,8 +1002,8 @@ async def _schedule_subtitle_jobs_from_msg(message: Message, state: FSMContext, 
     summary_text = "\n".join(scheduled_ids)
     await message.answer(
         f"✅ عملیات با تگ `{brand}` در صف قرار گرفت!\n"
-        "• سافت‌ساب: بدون تغییر رنگ (فقط فارسی و انگلیسی)\n"
-        "• هاردساب: بولد و زرد (`#fbff00`)\n\n"
+        "• سافت‌ساب در پوشه `softsub` (بدون تغییر رنگ)\n"
+        "• هاردساب در پوشه `hardsub` (بولد و زرد `#fbff00`)\n\n"
         f"{summary_text}",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
@@ -1034,7 +1136,7 @@ async def cb_cuteftp_upload(call: CallbackQuery, state: FSMContext):
         target
     )
     await call.message.edit_text(
-        f"☁️ ارسال `{target.name}` به صف **CuteFTP 9 Pro** انجام شد!\n"
+        f"☁️ ارسال `{target.name}` به نرم‌افزار بازِ **CuteFTP 9** انجام شد!\n"
         f"🆔 کد تسک: `{task.task_id}`\n"
         f"از بخش «وضعیت صف‌ها» لینک‌های دانلود نهایی را دریافت کنید.",
         reply_markup=main_menu_kb(),
@@ -1042,33 +1144,71 @@ async def cb_cuteftp_upload(call: CallbackQuery, state: FSMContext):
     )
 
 
-# ==================== نمایش لحظه‌ای وضعیت صف‌ها ====================
-@router.callback_query(F.data == "menu:queues")
-async def cb_show_queues(call: CallbackQuery):
+# ==================== نمایش لحظه‌ای وضعیت صف‌ها و حذف پراسس‌های تمام‌شده ====================
+async def _render_queue_message(call: CallbackQuery):
     tasks = queue_engine.get_queue_summary()
     if not tasks:
-        return await call.answer("📭 در حال حاضر هیچ تسکی در صف نیست.", show_alert=True)
+        try:
+            await call.message.edit_text(
+                "📭 **در حال حاضر هیچ پراسسی در صف وجود ندارد.**",
+                reply_markup=main_menu_kb(),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            await call.answer("📭 در حال حاضر هیچ تسکی در صف نیست.", show_alert=True)
+        return
 
-    lines = ["📊 **وضعیت صف‌های پردازش (۲ ورکر موازی HandBrake / MKV / qbt / CuteFTP):**\n"]
+    lines = ["📊 **وضعیت صف‌های پردازش (۲ ورکر موازی HandBrake / MKV / Download / CuteFTP):**\n"]
     for t in reversed(tasks):
         line = f"🔹 `{t.task_id}` | **[{t.queue_type.upper()}]** {t.title}\n   └ وضعیت: {t.status} ({t.progress})"
         if t.error:
-            line += f"\n   └ ⚠️ خطا: `{t.error[:80]}`"
+            line += f"\n   └ ⚠️ خطا: `{t.error[:90]}`"
         if t.result and isinstance(t.result, list):
             links_str = "\n".join([f"   🔗 {u}" for u in t.result[:6]])
             line += f"\n{links_str}"
         lines.append(line)
 
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🔄 بروزرسانی درصد پیشرفت", callback_data="menu:queues")
-    kb.button(text="🔙 منوی اصلی", callback_data="menu:home")
-    kb.adjust(1)
+    try:
+        await call.message.edit_text(
+            "\n\n".join(lines),
+            reply_markup=queue_management_kb(tasks),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        await call.answer("بروزرسانی شد.")
 
-    await call.message.edit_text("\n\n".join(lines), reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+@router.callback_query(F.data == "menu:queues")
+async def cb_show_queues(call: CallbackQuery):
+    await _render_queue_message(call)
 
 
-# ==================== تشخیص هوشمند ارسال مستقیم لینک یا فایل تورنت در چت ====================
-@router.message(F.document)
+@router.callback_query(F.data == "qact:clear_finished")
+async def cb_clear_finished_tasks(call: CallbackQuery):
+    removed_count = queue_engine.clear_finished_tasks()
+    await call.answer(f"🧹 تعداد {removed_count} پراسس تمام‌شده از لیست حذف شد!", show_alert=True)
+    await _render_queue_message(call)
+
+
+@router.callback_query(F.data.startswith("qdel:"))
+async def cb_delete_single_task(call: CallbackQuery):
+    task_id = call.data.split(":")[1]
+    queue_engine.remove_task(task_id)
+    await call.answer(f"🗑 پراسس #{task_id} حذف شد.")
+    await _render_queue_message(call)
+
+
+@router.callback_query(F.data.startswith("qcancel:"))
+async def cb_cancel_and_remove_task(call: CallbackQuery):
+    task_id = call.data.split(":")[1]
+    queue_engine.cancel_task(task_id)
+    queue_engine.remove_task(task_id)
+    await call.answer(f"🛑 پراسس #{task_id} متوقف و حذف شد.", show_alert=True)
+    await _render_queue_message(call)
+
+
+# ==================== تشخیص هوشمند ارسال مستقیم لینک یا فایل تورنت در حالت بدون استیت ====================
+@router.message(StateFilter(None), F.document)
 async def catch_direct_torrent_file(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
@@ -1078,15 +1218,15 @@ async def catch_direct_torrent_file(message: Message, state: FSMContext):
         t_path = temp_dir / message.document.file_name
         await message.bot.download(message.document, destination=t_path)
 
-        await state.update_data(pending_direct_target=str(t_path))
+        await state.update_data(pending_direct_target=str(t_path.resolve()))
         await state.set_state(BotStates.waiting_direct_folder_name)
         await message.answer(
-            "🧲 فایل `.torrent` دریافت شد!\n📁 لطفاً **نام پوشه فیلم یا سریال** را وارد کنید تا با `qbt` دانلود شود:",
+            "🧲 فایل `.torrent` دریافت شد!\n📁 لطفاً **نام پوشه فیلم یا سریال** را وارد کنید تا دانلود آغاز شود:",
             parse_mode="Markdown"
         )
 
 
-@router.message(F.text.regexp(r"^(magnet:\?xt=|https?://)"))
+@router.message(StateFilter(None), F.text.regexp(r"^(magnet:\?xt=|https?://)"))
 async def catch_direct_links_in_chat(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
