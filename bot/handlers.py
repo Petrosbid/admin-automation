@@ -1,10 +1,12 @@
+import re
 import uuid
 from pathlib import Path
 from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery, FSInputFile
+from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardButton
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.config_loader import cfg
 from core.queue_manager import queue_engine
@@ -14,17 +16,27 @@ from services.subtitle_service import SubtitleService
 from services.mkv_service import MKVService
 from services.handbrake_service import HandBrakeService
 from services.cuteftp_service import CuteFTPService
+from services.monitor_service import monitor_service
 from bot.keyboards import (
-    main_menu_kb, search_categories_kb, search_sites_kb,
-    search_results_kb, file_browser_kb, video_actions_kb,
-    presets_kb, multi_video_select_kb, subtitle_mode_kb,
-    skip_or_cancel_kb, sync_options_kb
+    main_menu_kb, monitor_menu_kb, folder_structure_choice_kb,
+    target_folders_kb, subtitle_upload_options_kb,
+    search_categories_kb, search_sites_kb, search_results_kb,
+    file_browser_kb, video_actions_kb, presets_kb,
+    multi_video_select_kb, subtitle_mode_kb, skip_or_cancel_kb, sync_options_kb
 )
 
 router = Router()
 
 
 class BotStates(StatesGroup):
+    # ساخت پوشه جدید بدون لینک
+    waiting_new_folder_name = State()
+    waiting_new_folder_type = State()
+
+    # آپلود زیرنویس در پوشه هدف
+    waiting_target_folder_sub_style = State()
+    waiting_target_folder_sub_file = State()
+
     # ۱. جستجو در سایت‌ها
     waiting_search_query = State()
 
@@ -59,7 +71,8 @@ async def cmd_start(message: Message, state: FSMContext):
     brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
     await message.answer(
         f"🎬 **پنل اتوماسیون مدیا و آپلودر ({brand})**\n\n"
-        "✅ زیرنویس فارسی در تمامی خروجی‌ها به صورت **اولین ترک + Default + Forced** تنظیم و قبل از پردازش سینک می‌شود.",
+        "📡 پایشگر خودکار سایت‌های **Pahe.ink**، **PSA.wf** و **YTS.gg** هر ۵ دقیقه در پس‌زمینه فعال است.\n"
+        "✅ زیرنویس فارسی در تمامی خروجی‌ها به صورت **اولین ترک + Default + Forced** تنظیم می‌شود.",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -80,6 +93,271 @@ async def cb_home(call: CallbackQuery, state: FSMContext):
 async def cb_reload_cfg(call: CallbackQuery):
     cfg.reload()
     await call.answer("✅ فایل config.yaml با موفقیت بازخوانی شد!", show_alert=True)
+
+
+# ==================== ۰. بخش مانیتورینگ ۵ دقیقه‌ای سایت‌ها (Pahe / PSA / YTS) ====================
+@router.callback_query(F.data == "menu:monitor")
+async def cb_monitor_menu(call: CallbackQuery):
+    enabled = bool(cfg.get("monitor", "enabled", True))
+    interval = cfg.get("monitor", "interval_seconds", 300)
+    await call.message.edit_text(
+        "📡 **پنل مانیتورینگ خودکار سایت‌ها**\n\n"
+        "🌐 سایت‌های تحت رصد:\n"
+        "1️⃣ `https://pahe.ink/`\n"
+        "2️⃣ `https://psa.wf/`\n"
+        "3️⃣ `https://yts.gg/home`\n\n"
+        f"⏱ بازه رفرش خودکار: هر `{interval // 60}` دقیقه یک‌بار\n"
+        f"📊 وضعیت فعلی: {'🟢 فعال' if enabled else '🔴 غیرفعال'}",
+        reply_markup=monitor_menu_kb(enabled),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "mon:toggle")
+async def cb_monitor_toggle(call: CallbackQuery):
+    mon_sec = cfg.get("monitor") or {}
+    current = bool(mon_sec.get("enabled", True))
+    mon_sec["enabled"] = not current
+    await call.answer(f"وضعیت مانیتورینگ به {'فعال' if not current else 'غیرفعال'} تغییر یافت.")
+    await cb_monitor_menu(call)
+
+
+@router.callback_query(F.data == "mon:check_now")
+async def cb_monitor_check_now(call: CallbackQuery):
+    await call.message.edit_text("⏳ در حال رفرش و بررسی فوری سایت‌های **Pahe.ink**، **PSA.wf** و **YTS.gg**...", parse_mode="Markdown")
+    counts = await monitor_service.check_all_sites_once(call.bot, notify_on_first_seed=True)
+    total_new = sum(counts.values())
+    enabled = bool(cfg.get("monitor", "enabled", True))
+    await call.message.edit_text(
+        f"✅ **بررسی فوری انجام شد!**\n\n"
+        f"🔹 پست‌های جدید Pahe.ink: `{counts['pahe']}`\n"
+        f"🔹 پست‌های جدید PSA.wf: `{counts['psa']}`\n"
+        f"🔹 پست‌های جدید YTS.gg: `{counts['yts']}`\n\n"
+        f"합 مجموع پست‌های جدید ارسال شده: `{total_new}`",
+        reply_markup=monitor_menu_kb(enabled),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("mon:latest:"))
+async def cb_monitor_latest_site(call: CallbackQuery):
+    site_key = call.data.split(":")[2]
+    await call.message.edit_text(f"⏳ در حال دریافت آخرین پست‌های `{site_key.upper()}`...", parse_mode="Markdown")
+    try:
+        posts = await monitor_service.fetch_site_posts(site_key)
+        if not posts:
+            return await call.message.edit_text("❌ پستی دریافت نشد.", reply_markup=monitor_menu_kb(True))
+
+        # ارسال ۳ پست آخر آن سایت به تلگرام
+        for p in posts[:3]:
+            await monitor_service.send_post_notification(call.bot, p)
+
+        enabled = bool(cfg.get("monitor", "enabled", True))
+        await call.message.edit_text(
+            f"✅ ۳ پست آخر سایت `{site_key.upper()}` در چت ارسال شد.",
+            reply_markup=monitor_menu_kb(enabled),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await call.message.edit_text(f"❌ خطا در ارتباط با سایت:\n`{e}`", reply_markup=monitor_menu_kb(True), parse_mode="Markdown")
+
+
+# ==================== قابلیت جدید ۱: ساخت پوشه جدید در Workspace بدون دادن لینک ====================
+@router.callback_query(F.data == "menu:create_folder")
+async def cb_create_folder_menu(call: CallbackQuery, state: FSMContext):
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    await state.update_data(mkdir_parent=str(workspace))
+    await state.set_state(BotStates.waiting_new_folder_name)
+    await call.message.edit_text(
+        f"📁 **ساخت پوشه جدید در Workspace (بدون لینک دانلود)**\n"
+        f"مسیر پایه: `{workspace}`\n\n"
+        "✏️ لطفاً **نام پوشه جدید** (نام فیلم یا سریال) را ارسال کنید:",
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "fact:mkdir_here")
+async def cb_mkdir_in_current_dir(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    parent_dir = data.get("current_dir", cfg.get("paths", "workspace_dir"))
+    await state.update_data(mkdir_parent=parent_dir)
+    await state.set_state(BotStates.waiting_new_folder_name)
+    await call.message.edit_text(
+        f"📁 **ساخت پوشه جدید در مسیر:**\n`{parent_dir}`\n\n"
+        "✏️ لطفاً **نام پوشه جدید** را ارسال کنید:",
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("qmkdir:"))
+async def cb_quick_mkdir_from_monitor(call: CallbackQuery, state: FSMContext):
+    """ساخت سریع پوشه فیلم مستقیماً از روی دکمه زیر اعلان پست‌های جدید"""
+    folder_title = call.data.split(":", 1)[1]
+    folders = DownloaderService.create_movie_folders(folder_title)
+    await state.update_data(target_sub_dir=str(folders["sub"]), target_base_dir=str(folders["base"]))
+
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="📥 آپلود زیرنویس در همین پوشه", callback_data="qsub:now"))
+    kb.row(InlineKeyboardButton(text="📂 باز کردن در فایل‌منیجر", callback_data="menu:file_mgr"))
+    kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
+
+    await call.message.answer(
+        f"✅ پوشه `{folders['base'].name}` به همراه زیرپوشه‌های `softsub`، `hardsub` و `sub` در Workspace ساخته شد!\n\n"
+        f"📂 مسیر: `{folders['base']}`",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+    await call.answer("پوشه ساخته شد!")
+
+
+@router.message(BotStates.waiting_new_folder_name)
+async def handle_new_folder_name(message: Message, state: FSMContext):
+    raw_name = message.text.strip()
+    safe_name = re.sub(r'[<>:"/\\|?*]', "", raw_name).strip().replace(" ", "_")
+    if not safe_name:
+        return await message.answer("⚠️ نام پوشه معتبر نیست. دوباره ارسال کنید:")
+
+    await state.update_data(new_folder_name=safe_name)
+    await state.set_state(BotStates.waiting_new_folder_type)
+    await message.answer(
+        f"📁 نام پوشه: `{safe_name}`\n"
+        "نوع ساختار پوشه را انتخاب کنید:",
+        reply_markup=folder_structure_choice_kb(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(BotStates.waiting_new_folder_type, F.data.startswith("mktype:"))
+async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
+    mk_type = call.data.split(":")[1]  # standard | empty
+    data = await state.get_data()
+    parent_dir = Path(data.get("mkdir_parent", cfg.get("paths", "workspace_dir")))
+    folder_name = data["new_folder_name"]
+    new_dir = parent_dir / folder_name
+    new_dir.mkdir(parents=True, exist_ok=True)
+
+    if mk_type == "standard":
+        for sub_name in ("softsub", "hardsub", "sub"):
+            (new_dir / sub_name).mkdir(parents=True, exist_ok=True)
+        sub_target = new_dir / "sub"
+        desc = "به همراه زیرپوشه‌های `softsub`، `hardsub` و `sub`"
+    else:
+        sub_target = new_dir
+        desc = "به صورت پوشه خام"
+
+    await state.clear()
+    await state.update_data(target_sub_dir=str(sub_target), current_dir=str(new_dir))
+
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="📥 آپلود زیرنویس در این پوشه", callback_data="qsub:now"))
+    kb.row(InlineKeyboardButton(text="📂 مشاهده پوشه در فایل‌منیجر", callback_data="menu:file_mgr"))
+    kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
+
+    await call.message.edit_text(
+        f"✅ پوشه جدید {desc} ساخته شد!\n\n"
+        f"📂 مسیر: `{new_dir}`",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+
+
+# ==================== قابلیت جدید ۲: آپلود کردن زیرنویس در پوشه هدف ====================
+@router.callback_query(F.data == "menu:upload_sub_target")
+async def cb_upload_sub_select_folder(call: CallbackQuery, state: FSMContext):
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    folders = [p for p in sorted(workspace.iterdir(), key=lambda x: x.name.lower()) if p.is_dir() and not p.name.startswith("_")]
+
+    if not folders:
+        return await call.answer("⚠️ هنوز هیچ پوشه‌ای در Workspace وجود ندارد! ابتدا یک پوشه بسازید.", show_alert=True)
+
+    await state.update_data(available_target_folders=[str(f) for f in folders])
+    await call.message.edit_text(
+        "📥 **آپلود زیرنویس در پوشه هدف**\n\n"
+        "پوشه فیلم یا سریال مورد نظر را از لیست زیر انتخاب کنید:",
+        reply_markup=target_folders_kb(folders, workspace),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("tsubdir:"))
+async def cb_target_folder_chosen(call: CallbackQuery, state: FSMContext):
+    idx = int(call.data.split(":")[1])
+    data = await state.get_data()
+    chosen_folder = Path(data["available_target_folders"][idx])
+
+    # اگر زیرپوشه sub داخل آن وجود دارد، به صورت پیش‌فرض زیرنویس را داخل پوشه sub قرار بده
+    dest_dir = (chosen_folder / "sub") if (chosen_folder / "sub").exists() else chosen_folder
+    await state.update_data(target_sub_dir=str(dest_dir))
+    await state.set_state(BotStates.waiting_target_folder_sub_style)
+    await call.message.edit_text(
+        f"📂 پوشه هدف انتخاب شد:\n`{dest_dir}`\n\n"
+        "چگونه می‌خواهید زیرنویس در این پوشه ذخیره شود؟",
+        reply_markup=subtitle_upload_options_kb(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.in_({"fact:upload_sub_here", "qsub:now"}))
+async def cb_upload_sub_in_active_dir(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if call.data == "qsub:now" and data.get("target_sub_dir"):
+        dest_dir = Path(data["target_sub_dir"])
+    else:
+        curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
+        dest_dir = (curr / "sub") if (curr / "sub").exists() else curr
+
+    await state.update_data(target_sub_dir=str(dest_dir))
+    await state.set_state(BotStates.waiting_target_folder_sub_style)
+    await call.message.edit_text(
+        f"📂 مسیر ذخیره زیرنویس:\n`{dest_dir}`\n\n"
+        "چگونه می‌خواهید زیرنویس در این پوشه ذخیره شود؟",
+        reply_markup=subtitle_upload_options_kb(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(BotStates.waiting_target_folder_sub_style, F.data.startswith("subsave:"))
+async def cb_sub_save_style_selected(call: CallbackQuery, state: FSMContext):
+    save_mode = call.data.split(":")[1]  # styled | raw
+    await state.update_data(sub_save_mode=save_mode)
+    await state.set_state(BotStates.waiting_target_folder_sub_file)
+    await call.message.edit_text(
+        "📎 لطفاً **فایل زیرنویس (`.srt` یا `.ass`)** را ارسال کنید تا در پوشه هدف ذخیره شود:",
+        parse_mode="Markdown"
+    )
+
+
+@router.message(BotStates.waiting_target_folder_sub_file, F.document)
+async def handle_target_folder_sub_file(message: Message, state: FSMContext):
+    data = await state.get_data()
+    dest_dir = Path(data["target_sub_dir"])
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    save_mode = data.get("sub_save_mode", "styled")
+
+    file_name = message.document.file_name or "subtitle.srt"
+    dest_path = dest_dir / file_name
+    await message.bot.download(message.document, destination=dest_path)
+
+    if save_mode == "styled" and dest_path.suffix.lower() == ".srt":
+        SubtitleService.style_srt_bold_yellow(dest_path, dest_path)
+        style_note = "همراه با استایل **بولد و زرد (`#fbff00`)**"
+    else:
+        style_note = "به صورت **خام (اصلی)**"
+
+    await state.clear()
+    await state.update_data(target_sub_dir=str(dest_dir), current_dir=str(dest_dir))
+
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="➕ آپلود یک زیرنویس دیگر در همین پوشه", callback_data="qsub:now"))
+    kb.row(InlineKeyboardButton(text="📂 مشاهده در فایل‌منیجر", callback_data="menu:file_mgr"))
+    kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
+
+    await message.answer(
+        f"✅ زیرنویس `{file_name}` {style_note} با موفقیت در پوشه هدف ذخیره شد!\n\n"
+        f"📂 مسیر فایل:\n`{dest_path}`",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
 
 
 # ==================== ۱. جستجو و دانلود از ۹ سایت ====================
@@ -466,7 +744,6 @@ async def handle_custom_output_name(message: Message, state: FSMContext):
     await state.update_data(custom_output_name=message.text.strip())
     data = await state.get_data()
 
-    # اگر کاربر از داخل فایل‌منیجر از قبل نوع عملیات (softsub/hardsub/both) را انتخاب کرده بود
     preselected_mode = data.get("operation_mode")
     if preselected_mode:
         if preselected_mode in ("hardsub", "both"):
@@ -560,7 +837,6 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
             hard_out = hard_dir / f"{base_stem}.HardSub.{site_tag}.mp4"
             primary_sub = fa_sub or en_sub
             secondary_sub = en_sub if (fa_sub and en_sub) else None
-            # اگر در حالت both قبلاً در مرحله سافت‌ساب سینک روی فایل اعمال شده، دوباره شیفت نده
             hb_sync_mode = "none" if mode == "both" else sync_mode
             t_hard = await queue_engine.add_task(
                 "handbrake",
@@ -610,6 +886,7 @@ async def _schedule_subtitle_jobs_from_msg(message: Message, state: FSMContext, 
 async def render_directory(call: CallbackQuery, state: FSMContext, current_dir: Path):
     root_dir = Path(cfg.get("paths", "workspace_dir")).resolve()
     current_dir = current_dir.resolve()
+    current_dir.mkdir(parents=True, exist_ok=True)
     items = sorted(list(current_dir.iterdir()), key=lambda p: (not p.is_dir(), p.name.lower()))
     await state.update_data(
         current_dir=str(current_dir),
@@ -625,8 +902,11 @@ async def render_directory(call: CallbackQuery, state: FSMContext, current_dir: 
 
 @router.callback_query(F.data == "menu:file_mgr")
 async def cb_file_mgr(call: CallbackQuery, state: FSMContext):
-    root_dir = Path(cfg.get("paths", "workspace_dir"))
-    await render_directory(call, state, root_dir)
+    data = await state.get_data()
+    start_dir = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
+    if not start_dir.exists():
+        start_dir = Path(cfg.get("paths", "workspace_dir"))
+    await render_directory(call, state, start_dir)
 
 
 @router.callback_query(F.data == "fnav:up")
@@ -662,7 +942,6 @@ async def cb_extract_sub_list(call: CallbackQuery, state: FSMContext):
     if not tracks:
         return await call.answer("❌ هیچ زیرنویسی داخل این فایل پیدا نشد!", show_alert=True)
 
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
     kb = InlineKeyboardBuilder()
     for t in tracks:
         kb.button(
@@ -753,7 +1032,6 @@ async def cb_show_queues(call: CallbackQuery):
             line += f"\n{links_str}"
         lines.append(line)
 
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
     kb = InlineKeyboardBuilder()
     kb.button(text="🔄 بروزرسانی درصد پیشرفت", callback_data="menu:queues")
     kb.button(text="🔙 منوی اصلی", callback_data="menu:home")

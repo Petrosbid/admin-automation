@@ -5,7 +5,15 @@ telegram:
 proxy:
   enabled: true
   # مثال: socks5://127.0.0.1:10808 یا http://user:pass@ip:port
-  url: "https://t.me/proxy?server=me.foltmeingop.co.uk&port=8880&secret=eeNEgYdJvXrFGRMCIMJdCQ"
+  url: ""
+
+monitor:
+  enabled: true
+  interval_seconds: 300  # هر ۵ دقیقه (۳۰۰ ثانیه)
+  sites:
+    pahe: "https://pahe.ink/"
+    psa: "https://psa.wf/"
+    yts: "https://yts.gg/home"
 
 paths:
   workspace_dir: "C:\\MediaBot\\workspace"

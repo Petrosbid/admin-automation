@@ -8,6 +8,13 @@ from services.handbrake_service import HandBrakeService
 def main_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
+        InlineKeyboardButton(text="📡 مانیتورینگ خودکار (Pahe / PSA / YTS)", callback_data="menu:monitor"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📁 ساخت پوشه جدید در Workspace (بدون لینک)", callback_data="menu:create_folder"),
+        InlineKeyboardButton(text="📥 آپلود زیرنویس در پوشه هدف", callback_data="menu:upload_sub_target"),
+    )
+    builder.row(
         InlineKeyboardButton(text="🔍 ۱. جستجو در ۹ سایت (تورنت/انیمه/کره‌ای)", callback_data="menu:search"),
     )
     builder.row(
@@ -26,6 +33,66 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📊 وضعیت صف‌ها (HandBrake / MKV / qbt)", callback_data="menu:queues"),
         InlineKeyboardButton(text="🔄 ریلود کانفیگ", callback_data="menu:reload_cfg"),
     )
+    return builder.as_markup()
+
+
+def monitor_menu_kb(is_enabled: bool) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    status_label = "🟢 فعال (توقف مانیتورینگ)" if is_enabled else "🔴 غیرفعال (شروع مانیتورینگ)"
+    builder.row(InlineKeyboardButton(text=status_label, callback_data="mon:toggle"))
+    builder.row(InlineKeyboardButton(text="🔄 بررسی فوری هر ۳ سایت همین الان", callback_data="mon:check_now"))
+    builder.row(
+        InlineKeyboardButton(text="🎬 آخرین‌های Pahe", callback_data="mon:latest:pahe"),
+        InlineKeyboardButton(text="📺 آخرین‌های PSA", callback_data="mon:latest:psa"),
+        InlineKeyboardButton(text="🍿 آخرین‌های YTS", callback_data="mon:latest:yts"),
+    )
+    builder.row(InlineKeyboardButton(text="🔙 بازگشت به منوی اصلی", callback_data="menu:home"))
+    return builder.as_markup()
+
+
+def folder_structure_choice_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="📂 استاندارد فیلم/سریال (همراه با softsub, hardsub, sub)",
+            callback_data="mktype:standard"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="📁 فقط پوشه ساده (خالی)",
+            callback_data="mktype:empty"
+        )
+    )
+    builder.row(InlineKeyboardButton(text="🔙 انصراف", callback_data="menu:home"))
+    return builder.as_markup()
+
+
+def target_folders_kb(folders: list[Path], base_workspace: Path) -> InlineKeyboardMarkup:
+    """لیست پوشه‌های موجود در Workspace برای انتخاب پوشه هدف جهت آپلود زیرنویس"""
+    builder = InlineKeyboardBuilder()
+    for idx, folder in enumerate(folders[:25]):
+        try:
+            rel_name = folder.relative_to(base_workspace).as_posix()
+        except ValueError:
+            rel_name = folder.name
+        builder.row(
+            InlineKeyboardButton(text=f"📁 {rel_name[:50]}", callback_data=f"tsubdir:{idx}")
+        )
+    builder.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
+    return builder.as_markup()
+
+
+def subtitle_upload_options_kb() -> InlineKeyboardMarkup:
+    """انتخاب نحوه ذخیره زیرنویس در پوشه هدف"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="🎨 ذخیره همراه با استایل بولد و زرد (#fbff00)", callback_data="subsave:styled")
+    )
+    builder.row(
+        InlineKeyboardButton(text="📄 ذخیره به صورت خام (بدون تغییر استایل)", callback_data="subsave:raw")
+    )
+    builder.row(InlineKeyboardButton(text="🔙 انصراف", callback_data="menu:home"))
     return builder.as_markup()
 
 
@@ -68,6 +135,10 @@ def file_browser_kb(items: list[Path], is_root: bool) -> InlineKeyboardMarkup:
         )
     if not is_root:
         builder.row(InlineKeyboardButton(text="⬆️ پوشه قبلی (Up)", callback_data="fnav:up"))
+    builder.row(
+        InlineKeyboardButton(text="📁 ساخت پوشه جدید در اینجا", callback_data="fact:mkdir_here"),
+        InlineKeyboardButton(text="📥 آپلود زیرنویس در این پوشه", callback_data="fact:upload_sub_here"),
+    )
     builder.row(
         InlineKeyboardButton(text="☁️ آپلود کل این پوشه با CuteFTP 9", callback_data="fact:upload_current_dir")
     )

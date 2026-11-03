@@ -5,6 +5,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from core.config_loader import cfg
 from core.proxy_manager import ProxyManager
 from core.queue_manager import queue_engine
+from services.monitor_service import monitor_service
 from bot.handlers import router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -20,9 +21,12 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    # راه‌اندازی ورکرهای صف ترتیبی (HandBrake, MKVToolNix, Download, CuteFTP)
+    # ۱. راه‌اندازی ورکرهای صف ترتیبی (HandBrake, MKVToolNix, Download, CuteFTP)
     queue_engine.start_workers()
     logging.info("All Sequential Queue Workers Started (MKVToolNix, HandBrake, Download, CuteFTP).")
+
+    # ۲. راه‌اندازی سرویس مانیتورینگ ۵ دقیقه‌ای سایت‌های Pahe.ink, PSA.wf و YTS.gg
+    monitor_service.start(bot)
 
     await bot.delete_webhook(drop_pending_updates=True)
     logging.info("Telegram Bot Polling Started...")
