@@ -52,9 +52,7 @@ subtitle_sync:
   default_offset_ms: 0
 
 subtitle_style:
-  font_name: "Vazirmatn"
-  font_size: 22
-  hex_color: "#fbff00"     # رنگ زرد (فقط برای هاردساب HandBrake)
+  hex_color: "#fbff00"
   bold: true
   outline_width: 2.0
   shadow_depth: 1.0
@@ -62,7 +60,7 @@ subtitle_style:
 cuteftp:
   host: "ftp.dl.example.com"
   port: 21
-  protocol: "FTP"          # FTP, FTPS, SFTP
+  protocol: "FTP"
   username: "ftpuser"
   password: "ftppassword"
   remote_base_dir: "/public_html/media"
