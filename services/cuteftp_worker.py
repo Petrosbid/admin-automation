@@ -1,4 +1,5 @@
 import ctypes
+import logging
 import struct
 import threading
 import time
@@ -10,6 +11,8 @@ import win32con
 import win32gui
 import win32process
 from core.config_loader import cfg
+
+logger = logging.getLogger(__name__)
 
 user32 = ctypes.windll.user32
 _CUTEFTP_GUI_LOCK = threading.RLock()
