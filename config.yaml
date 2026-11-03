@@ -8,9 +8,9 @@ proxy:
   url: "socks5://127.0.0.1:10808"
 
 concurrency:
-  handbrake_workers: 2     # اجرای همزمان ۲ هاردساب با HandBrake
+  handbrake_workers: 2
   mkvtoolnix_workers: 1
-  download_workers: 1
+  download_workers: 3
   upload_workers: 1
 
 monitor:
