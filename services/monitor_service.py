@@ -2,6 +2,7 @@ import asyncio
 import importlib.util
 import json
 import logging
+import re
 import webbrowser
 from pathlib import Path
 from urllib.parse import urljoin
@@ -62,11 +63,28 @@ class SiteMonitorService:
         return {"pahe": [], "psa": [], "yts": [], "digimovie": [], "avamovie": []}
 
     def _save_state(self, state: dict[str, list[str]]):
-        trimmed = {k: v[-200:] for k, v in state.items()}
+        trimmed = {k: v[-250:] for k, v in state.items()}
         self.state_file.write_text(
             json.dumps(trimmed, ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
+
+    async def send_error_notification(self, bot: Bot | None, site_key: str, error_text: str):
+        """ارسال پیام خطای باز کردن یا بررسی سایت‌ها به ادمین در تلگرام"""
+        if not bot:
+            return
+        url = self.SITE_URLS.get(site_key, site_key)
+        msg = (
+            f"⚠️ **خطا در مانیتورینگ سایت `{site_key.upper()}`**\n"
+            f"🌐 آدرس: `{url}`\n"
+            f"❌ علت خطا:\n`{str(error_text)[:350]}`\n\n"
+            "💡 در صورتی که سایت نیاز به حل کپچا دارد، از منوی مانیتورینگ دکمه باز کردن مرورگر روی سرور را بزنید."
+        )
+        for admin_id in cfg.get("telegram", "admin_ids", []):
+            try:
+                await bot.send_message(chat_id=admin_id, text=msg, parse_mode="Markdown")
+            except Exception as e:
+                logging.error(f"Failed to send monitor error alert to {admin_id}: {e}")
 
     async def ensure_real_browser_open(self) -> bool:
         if not self._pw_installed:
@@ -118,7 +136,6 @@ class SiteMonitorService:
                 return False
 
     async def open_captcha_tabs_for_admin(self) -> str:
-        """باز کردن پنجره مرورگر روی دسکتاپ سرور برای حل کپچا"""
         self._pw_installed = importlib.util.find_spec("playwright") is not None
         ok = await self.ensure_real_browser_open()
         if ok and self._browser_context:
@@ -186,6 +203,8 @@ class SiteMonitorService:
                             html = await page.content()
                             if not self._is_captcha_page(html):
                                 break
+                        if self._is_captcha_page(html):
+                            raise RuntimeError("صفحه درگیر کپچای کلودفلر است و نیاز به حل دستی روی سرور دارد.")
 
                     return html
 
@@ -200,7 +219,10 @@ class SiteMonitorService:
             resp.raise_for_status()
             return resp.text
 
-        return await asyncio.to_thread(_sync_get)
+        html = await asyncio.to_thread(_sync_get)
+        if self._is_captcha_page(html):
+            raise RuntimeError("سایت با چالش کپچا/کلودفلر مواجه شد.")
+        return html
 
     @staticmethod
     def _parse_pahe_html(html: str) -> list[dict]:
@@ -324,12 +346,60 @@ class SiteMonitorService:
 
     @staticmethod
     def _parse_digimovie_html(html: str) -> list[dict]:
+        """
+        استخراج هم‌زمان:
+        ۱. بخش «سریال‌های جدید و محبوب -> جدیدترین» (div.last_series #box_tab1 div.item_dubbled) برای اعلام قسمت جدید سریال‌ها
+        ۲. پست‌های اصلی صفحه اول (div.holder_seactions div.item_def_loop)
+        """
         base_url = "https://digimoviez53.top/"
         soup = _make_soup(html)
         posts = []
-        items = soup.select("div.holder_seactions div.item_def_loop")
 
-        for item in items[:12]:
+        # ۱. رصد بخش «سریال‌های جدید و محبوب» (جدیدترین قسمت‌های منتشر شده)
+        series_cards = soup.select("div.last_series div#box_tab1 div.item_dubbled")
+        if not series_cards:
+            series_cards = soup.select("div.last_series div.item_dubbled")
+
+        for s_card in series_cards[:15]:
+            a_tag = s_card.select_one("a")
+            if not a_tag:
+                continue
+            post_url = urljoin(base_url, a_tag.get("href", "").strip())
+            if not post_url:
+                continue
+
+            img_el = s_card.select_one("div.cover img")
+            raw_title = a_tag.get("title", "").strip()
+            if not raw_title and img_el:
+                raw_title = img_el.get("alt", "").strip()
+            if not raw_title:
+                raw_title = post_url.rstrip("/").split("/")[-1].replace("-", " ").title()
+
+            poster = ""
+            if img_el:
+                raw_src = (img_el.get("src") or img_el.get("data-src") or "").strip()
+                if raw_src:
+                    poster = urljoin(base_url, raw_src)
+
+            ep_el = s_card.select_one("div.text_holder_series")
+            ep_update_text = re.sub(r"\s+", " ", ep_el.get_text(" ", strip=True)) if ep_el else "قسمت جدید منتشر شد"
+
+            # شناسه یکتا شامل لینک سریال + متن قسمت جدید است تا با انتشار هر قسمت جدید اطلاع‌رسانی شود
+            unique_id = f"{post_url}|{ep_update_text}"
+            posts.append({
+                "id": unique_id,
+                "site": "Digimoviez (بروزرسانی سریال)",
+                "title": raw_title,
+                "url": post_url,
+                "details": f"🔥 {ep_update_text}",
+                "categories": "سریال جدید / قسمت جدید",
+                "poster": poster,
+                "summary": ""
+            })
+
+        # ۲. رصد پست‌های اصلی فیلم و سریال در بدنه صفحه
+        items = soup.select("div.holder_seactions div.item_def_loop")
+        for item in items[:10]:
             title_el = item.select_one("div.title_h h2 a")
             if not title_el:
                 continue
@@ -337,9 +407,8 @@ class SiteMonitorService:
             post_url = urljoin(base_url, title_el.get("href", "").strip())
 
             img_el = item.select_one("div.cover img")
-            poster = urljoin(base_url, img_el.get("src") or img_el.get("data-src", "").strip()) if img_el else ""
+            poster = urljoin(base_url, (img_el.get("src") or img_el.get("data-src") or "").strip()) if img_el else ""
 
-            # استخراج کیفیت یا آپدیت (مثل نسخه BluRay اضافه شد)
             notif_el = item.select_one("div.notif_items div.item_notif")
             notif_text = notif_el.get_text(strip=True) if notif_el else ""
 
@@ -352,11 +421,12 @@ class SiteMonitorService:
                 "site": "Digimoviez",
                 "title": post_title,
                 "url": post_url,
-                "details": notif_text or "جدید",
+                "details": notif_text or "پست جدید",
                 "categories": "",
                 "poster": poster,
                 "summary": plot[:250]
             })
+
         return posts
 
     @staticmethod
@@ -364,11 +434,10 @@ class SiteMonitorService:
         base_url = "https://avasaraw.top/"
         soup = _make_soup(html)
         posts = []
-        # بررسی سریال‌های به‌روز‌شده و فیلم‌های جدید در آوامووی
         series_items = soup.select("section.update-series div.item-series")
         movie_items = soup.select("section.home-section.movie div.item-movie")
 
-        for item in series_items[:8]:
+        for item in series_items[:10]:
             title_el = item.select_one("div.title")
             link_el = item.select_one("a")
             if not title_el or not link_el:
@@ -385,11 +454,11 @@ class SiteMonitorService:
             unique_id = f"{post_url}|{update_txt}"
             posts.append({
                 "id": unique_id,
-                "site": "AvaMovie",
+                "site": "AvaMovie (سریال)",
                 "title": f"سریال {post_title}",
                 "url": post_url,
                 "details": update_txt,
-                "categories": "سریال",
+                "categories": "بروزرسانی سریال",
                 "poster": "",
                 "summary": plot[:250]
             })
@@ -408,7 +477,7 @@ class SiteMonitorService:
             unique_id = f"{post_url}|movie"
             posts.append({
                 "id": unique_id,
-                "site": "AvaMovie",
+                "site": "AvaMovie (فیلم)",
                 "title": f"فیلم {post_title}",
                 "url": post_url,
                 "details": genres,
@@ -421,16 +490,21 @@ class SiteMonitorService:
     async def fetch_site_posts(self, site_key: str, bot: Bot | None = None) -> list[dict]:
         html = await self._get_site_html(site_key, bot=bot)
         if site_key == "pahe":
-            return self._parse_pahe_html(html)
+            posts = self._parse_pahe_html(html)
         elif site_key == "psa":
-            return self._parse_psa_html(html)
+            posts = self._parse_psa_html(html)
         elif site_key == "yts":
-            return self._parse_yts_html(html)
+            posts = self._parse_yts_html(html)
         elif site_key == "digimovie":
-            return self._parse_digimovie_html(html)
+            posts = self._parse_digimovie_html(html)
         elif site_key == "avamovie":
-            return self._parse_avamovie_html(html)
-        return []
+            posts = self._parse_avamovie_html(html)
+        else:
+            posts = []
+
+        if not posts:
+            raise RuntimeError("سایت باز شد اما هیچ پستی استخراج نشد (احتمال تغییر ساختار یا صفحه کپچا).")
+        return posts
 
     @staticmethod
     def _build_post_caption(post: dict) -> str:
@@ -441,7 +515,7 @@ class SiteMonitorService:
         if post.get("details"):
             lines.append(f"📌 `{post['details']}`")
         if post.get("categories"):
-            lines.append(f"🎭 ژانر: {post['categories']}")
+            lines.append(f"🎭 دسته: {post['categories']}")
         if post.get("summary"):
             lines.append(f"\n📝 _{post['summary']}_")
         lines.append(f"\n🔗 [مشاهده صفحه در سایت]({post['url']})")
@@ -495,9 +569,6 @@ class SiteMonitorService:
         for site_key in site_keys:
             try:
                 posts = await self.fetch_site_posts(site_key, bot=bot)
-                if not posts:
-                    continue
-
                 seen_ids = set(state.get(site_key, []))
                 is_first_run = len(seen_ids) == 0
                 new_posts = [p for p in reversed(posts) if p["id"] not in seen_ids]
@@ -515,6 +586,8 @@ class SiteMonitorService:
 
             except Exception as e:
                 logging.warning(f"Monitor error on {site_key}: {e}")
+                # ارسال خطای باز شدن یا خواندن سایت به ربات تلگرام
+                await self.send_error_notification(bot, site_key, str(e))
 
         self._save_state(state)
         return new_counts

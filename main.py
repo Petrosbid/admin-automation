@@ -1,6 +1,6 @@
 import ssl
 
-# ۱. غیرفعال‌سازی سراسری بررسی گواهی Self-Signed SSL در ابتدای برنامه (قبل از ایمپورت aiohttp و aiogram)
+# غیرفعال‌سازی سراسری بررسی گواهی Self-Signed SSL در ابتدای برنامه
 _orig_create_default_context = ssl.create_default_context
 
 
@@ -41,7 +41,6 @@ logging.basicConfig(
 
 
 def create_bot_session(proxy_url: str | None) -> AiohttpSession:
-    """ساخت سشن تلگرام با SSL بدون بررسی سخت‌گیرانه گواهی (سازگار با پروکسی و بدون پروکسی)"""
     session = AiohttpSession(proxy=proxy_url) if proxy_url else AiohttpSession()
     session._connector_init["ssl"] = _unverified_ssl_context()
     if not proxy_url:
@@ -64,7 +63,7 @@ async def main():
     bot = Bot(token=bot_token, session=session)
     dp = Dispatcher()
 
-    # ثبت روترها
+    # ثبت روترها (دستور /settings داخل main_router تعبیه شده است)
     dp.include_router(queue_router)
     dp.include_router(download_router)
     dp.include_router(subtitle_router)
@@ -73,22 +72,18 @@ async def main():
     logging.info("Telegram routers registered successfully.")
 
     try:
-        # ابتدا تست اتصال به تلگرام قبل از روشن کردن سرویس‌های پس‌زمینه
         logging.info("Connecting to Telegram...")
         await bot.delete_webhook(drop_pending_updates=True)
         logging.info("Telegram connection established.")
 
-        # راه‌اندازی صف پردازش‌ها
         if hasattr(queue_engine, "set_bot"):
             queue_engine.set_bot(bot)
         queue_engine.start_workers()
         logging.info("Queue workers started.")
 
-        # راه‌اندازی سرویس مانیتورینگ ۵ دقیقه‌ای سایت‌ها
         monitor_service.start(bot)
         logging.info("Monitor service started.")
 
-        # شروع دریافت پیام‌ها
         logging.info("Telegram Bot Polling Started...")
         await dp.start_polling(bot, close_bot_session=False)
 

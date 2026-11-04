@@ -15,7 +15,8 @@ from services.handbrake_service import HandBrakeService
 from bot.keyboards import (
     main_menu_kb, subtitle_folder_browser_kb, subtitle_source_kb,
     subtitle_file_found_kb, sync_options_kb, subtitle_mode_kb,
-    skip_or_cancel_kb, presets_kb
+    skip_or_cancel_kb, presets_kb, hardsub_destination_choice_kb,
+    hardsub_custom_folders_kb
 )
 
 router = Router()
@@ -30,13 +31,12 @@ class SubtitleStates(StatesGroup):
     waiting_custom_output_name = State()
     waiting_operation_mode = State()
     waiting_preset_choice = State()
+    waiting_hardsub_dest_choice = State()
+    waiting_hardsub_custom_folder_name = State()
 
 
 def _resolve_media_dirs(video_path: Path, custom_base_stem: str) -> dict[str, Path]:
-    """
-    تشخیص هوشمند پوشه مادر فیلم تا خروجی هاردساب همیشه در پوشه hardsub
-    و خروجی سافت‌ساب همیشه در پوشه softsub قرار بگیرد.
-    """
+    """ساخت ساختار ۳ پوشه‌ای پیش‌فرض (softsub, hardsub, sub) فقط در حالت پیش‌فرض"""
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     vid_parent = video_path.resolve().parent
 
@@ -59,12 +59,23 @@ def _resolve_media_dirs(video_path: Path, custom_base_stem: str) -> dict[str, Pa
     return folders
 
 
+def _get_sub_upload_dir_without_creating_3_folders(video_path: Path) -> Path:
+    """
+    پیدا کردن محل ذخیره موقت زیرنویس آپلود شده بدون اینکه قبل از انتخاب کاربر،
+    ۳ پوشه softsub/hardsub/sub را به اجبار بسازد.
+    """
+    vid_parent = video_path.resolve().parent
+    if (vid_parent / "sub").is_dir():
+        return vid_parent / "sub"
+    if vid_parent.name.lower() in ("softsub", "hardsub") and (vid_parent.parent / "sub").is_dir():
+        return vid_parent.parent / "sub"
+    return vid_parent
+
+
 def _find_local_subtitles_for_video(video_path: Path) -> list[Path]:
-    """
-    جستجوی تمامی فایل‌های زیرنویس (.srt و .ass) موجود در پوشه sub و پوشه خود فیلم
-    """
-    dirs = _resolve_media_dirs(video_path, video_path.stem)
-    search_dirs = [dirs["sub"], dirs["base"], video_path.parent]
+    vid_parent = video_path.resolve().parent
+    base_dir = vid_parent.parent if vid_parent.name.lower() in ("softsub", "hardsub", "sub") else vid_parent
+    search_dirs = [base_dir / "sub", base_dir, vid_parent]
     found: list[Path] = []
     seen: set[str] = set()
 
@@ -109,11 +120,11 @@ async def _prompt_fa_subtitle_step(msg_or_call: Message | CallbackQuery, state: 
     data = await state.get_data()
     first_video = Path(data["target_videos"][0])
     local_subs = _find_local_subtitles_for_video(first_video)
-    await state.update_data(local_sub_candidates=[str(p) for p in local_subs])
+    await state.update_data(local_sub_candidates=[str(p) for p in local_subs], custom_hardsub_dir=None)
     await state.set_state(SubtitleStates.waiting_fa_subtitle)
 
     text = (
-        f"🎬 فیلم هدف: `{first_video.name}`\n"
+        f"🎬 **فیلم هدف:**\n`{first_video.name}`\n"
         f"📂 تعداد زیرنویس‌های موجود در پوشه فیلم / `sub`: **`{len(local_subs)}` فایل**\n\n"
         "🇮🇷 **مرحله ۱: زیرنویس فارسی**\n"
         "می‌توانید زیرنویس فارسی را از داخل پوشه انتخاب کنید، یا فایل جدیدی آپلود نمایید (یا اگر زیرنویس فارسی ندارید رد کنید):"
@@ -135,7 +146,8 @@ async def _prompt_en_subtitle_step(msg_or_call: Message | CallbackQuery, state: 
     text = (
         f"{prefix_note}"
         "🇬🇧 **مرحله ۲: زیرنویس انگلیسی**\n"
-        "می‌توانید زیرنویس انگلیسی را از داخل پوشه `sub` انتخاب کنید، فایل جدید بفرستید و یا رد کنید:"
+        "می‌توانید زیرنویس انگلیسی را از داخل پوشه انتخاب کنید، فایل جدید بفرستید و یا رد کنید\n"
+        "*(در صورت رد کردن، اگر داخل خود فایل فیلم زیرنویس انگلیسی وجود داشته باشد، بدون هاردساب شدن و بدون زرد شدن به فایل اضافه می‌شود)*:"
     )
     kb = subtitle_source_kb("en", len(local_subs))
     if isinstance(msg_or_call, CallbackQuery):
@@ -144,7 +156,7 @@ async def _prompt_en_subtitle_step(msg_or_call: Message | CallbackQuery, state: 
         await msg_or_call.answer(text, reply_markup=kb, parse_mode="Markdown")
 
 
-# ==================== مرورگر پوشه‌به‌پوشه برای انتخاب فیلم‌ها ====================
+# ==================== مرورگر پوشه‌به‌پوشه با نمایش نام کامل فایل‌ها ====================
 async def _render_sub_folder_browser(call: CallbackQuery, state: FSMContext, browse_dir: Path):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     browse_dir = browse_dir.resolve()
@@ -167,11 +179,28 @@ async def _render_sub_folder_browser(call: CallbackQuery, state: FSMContext, bro
     )
 
     is_root = (browse_dir == workspace)
-    await call.message.edit_text(
+
+    full_lines = []
+    for idx, folder in enumerate(folders[:20]):
+        full_lines.append(f"`[{idx+1}]` 📁 `{folder.name}`")
+    for idx, vid in enumerate(videos[:25]):
+        is_sel = str(vid.resolve()) in selected_paths
+        mark = "✅" if is_sel else "⬜"
+        size_mb = vid.stat().st_size / (1024 * 1024)
+        full_lines.append(f"{mark} `[F{idx+1}]` 🎬 `{vid.name}` _({size_mb:.1f} MB)_")
+
+    details_block = "\n".join(full_lines) if full_lines else "_(در این مسیر پوشه یا فایل ویدئویی وجود ندارد)_"
+
+    msg_text = (
         f"🎬 **انتخاب پوشه‌به‌پوشه فیلم‌ها برای زیرنویس / انکود**\n"
         f"📂 مسیر فعلی:\n`{browse_dir}`\n"
-        f"✅ فایل‌های انتخاب شده تا الان: `{len(selected_paths)}` فایل\n\n"
-        "روی پوشه مورد نظر کلیک کنید تا باز شود، سپس فایل‌های داخل آن را تیک (`✅`) بزنید:",
+        f"✅ کل فایل‌های انتخاب شده: `{len(selected_paths)}` فایل\n\n"
+        f"📋 **نام کامل پوشه‌ها و فایل‌های این مسیر:**\n{details_block}\n\n"
+        "روی دکمه متناظر در زیر کلیک کنید:"
+    )
+
+    await call.message.edit_text(
+        msg_text[:4000],
         reply_markup=subtitle_folder_browser_kb(folders, videos, selected_paths, is_root),
         parse_mode="Markdown"
     )
@@ -181,7 +210,7 @@ async def _render_sub_folder_browser(call: CallbackQuery, state: FSMContext, bro
 async def cb_sub_to_files_start(call: CallbackQuery, state: FSMContext):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     await state.set_state(SubtitleStates.selecting_target_videos)
-    await state.update_data(selected_video_paths=[], operation_mode=None)
+    await state.update_data(selected_video_paths=[], operation_mode=None, custom_hardsub_dir=None)
     await _render_sub_folder_browser(call, state, workspace)
 
 
@@ -255,7 +284,7 @@ async def cb_proceed_to_subs(call: CallbackQuery, state: FSMContext):
 # ==================== اسکن، انتخاب از پوشه یا آپلود زیرنویس فارسی و انگلیسی ====================
 @router.callback_query(F.data.startswith("subscan:"))
 async def cb_scan_directory_for_subs(call: CallbackQuery, state: FSMContext):
-    lang = call.data.split(":")[1]  # fa | en
+    lang = call.data.split(":")[1]
     data = await state.get_data()
     first_video = Path(data["target_videos"][0])
     local_subs = _find_local_subtitles_for_video(first_video)
@@ -264,12 +293,16 @@ async def cb_scan_directory_for_subs(call: CallbackQuery, state: FSMContext):
     lang_label = "فارسی" if lang == "fa" else "انگلیسی"
     if not local_subs:
         return await call.answer(
-            f"❌ هیچ فایل زیرنویسی (.srt / .ass) در پوشه sub یا کنار فیلم پیدا نشد! لطفاً گزینه آپلود را بزنید.",
+            "❌ هیچ فایل زیرنویسی (.srt / .ass) در پوشه sub یا کنار فیلم پیدا نشد! لطفاً گزینه آپلود را بزنید.",
             show_alert=True
         )
 
+    sub_lines = [f"`[{i+1}]` 📄 `{p.name}`" for i, p in enumerate(local_subs[:20])]
+    full_subs_block = "\n".join(sub_lines)
+
     await call.message.edit_text(
-        f"📂 **فایل‌های زیرنویس موجود در پوشه فیلم و `sub/`:**\n"
+        f"📂 **لیست کامل زیرنویس‌های موجود در پوشه فیلم و `sub/`:**\n"
+        f"{full_subs_block}\n\n"
         f"کدام فایل به عنوان **زیرنویس {lang_label}** استفاده شود؟",
         reply_markup=subtitle_file_found_kb(lang, local_subs),
         parse_mode="Markdown"
@@ -335,8 +368,9 @@ async def cb_skip_fa_sub(call: CallbackQuery, state: FSMContext):
 async def handle_fa_sub_upload(message: Message, state: FSMContext):
     data = await state.get_data()
     first_video = Path(data["target_videos"][0])
-    dirs = _resolve_media_dirs(first_video, first_video.stem)
-    fa_dest = dirs["sub"] / f"FA_{message.document.file_name}"
+    sub_dir = _get_sub_upload_dir_without_creating_3_folders(first_video)
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    fa_dest = sub_dir / f"FA_{message.document.file_name}"
     await message.bot.download(message.document, destination=fa_dest)
 
     if fa_dest.suffix.lower() == ".srt":
@@ -345,7 +379,7 @@ async def handle_fa_sub_upload(message: Message, state: FSMContext):
     await state.update_data(fa_sub_path=str(fa_dest))
     await _prompt_en_subtitle_step(
         message, state,
-        prefix_note=f"✅ زیرنویس فارسی آپلود و در پوشه `sub` ذخیره شد:\n`{fa_dest.name}`\n\n"
+        prefix_note=f"✅ زیرنویس فارسی دریافت شد:\n`{fa_dest.name}`\n\n"
     )
 
 
@@ -356,15 +390,13 @@ async def cb_skip_en_sub(call: CallbackQuery, state: FSMContext):
     has_en = bool(data.get("en_sub_path"))
     preselected_mode = data.get("operation_mode")
 
-    # اگر هیچ زیرنویسی (نه فارسی و نه انگلیسی) انتخاب نشده باشد:
     if not has_fa and not has_en:
         if preselected_mode == "softsub":
             return await call.answer("⚠️ برای عملیات سافت‌ساب حداقل یک زیرنویس باید انتخاب شود!", show_alert=True)
-        # برای هاردساب (انکود بدون زیرنویس): نیازی به مرحله سینک نیست، مستقیم به تغییر نام فایل برو
         await state.update_data(sync_mode="none", sync_offset_ms=0, operation_mode="hardsub")
         await state.set_state(SubtitleStates.waiting_custom_output_name)
         return await call.message.edit_text(
-            "ℹ️ **انکود با HandBrake بدون زیرنویس** (زیرنویس‌های داخلی فیلم نیز حذف می‌شوند تا هیچ زیرنویسی هاردساب نشود).\n\n"
+            "ℹ️ **انکود با HandBrake بدون زیرنویس فارسی** (در صورت وجود زیرنویس انگلیسی در خود فیلم، بدون Burn-in به فایل اضافه می‌شود).\n\n"
             f"{_format_current_filenames_prompt(data)}",
             parse_mode="Markdown"
         )
@@ -382,8 +414,9 @@ async def cb_skip_en_sub(call: CallbackQuery, state: FSMContext):
 async def handle_en_sub_upload(message: Message, state: FSMContext):
     data = await state.get_data()
     first_video = Path(data["target_videos"][0])
-    dirs = _resolve_media_dirs(first_video, first_video.stem)
-    en_dest = dirs["sub"] / f"EN_{message.document.file_name}"
+    sub_dir = _get_sub_upload_dir_without_creating_3_folders(first_video)
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    en_dest = sub_dir / f"EN_{message.document.file_name}"
     await message.bot.download(message.document, destination=en_dest)
 
     if en_dest.suffix.lower() == ".srt":
@@ -392,7 +425,7 @@ async def handle_en_sub_upload(message: Message, state: FSMContext):
     await state.update_data(en_sub_path=str(en_dest))
     await state.set_state(SubtitleStates.waiting_sync_choice)
     await message.answer(
-        "✅ زیرنویس **انگلیسی** نیز دریافت و در پوشه `sub` ذخیره شد.\n\n"
+        "✅ زیرنویس **انگلیسی** نیز دریافت شد.\n\n"
         "🔄 **مرحله سینک (هماهنگ‌سازی) زیرنویس قبل از پردازش:**\n"
         "چگونه می‌خواهید تایمینگ زیرنویس فارسی با فیلم سینک شود؟",
         reply_markup=sync_options_kb(),
@@ -402,7 +435,7 @@ async def handle_en_sub_upload(message: Message, state: FSMContext):
 
 @router.callback_query(SubtitleStates.waiting_sync_choice, F.data.startswith("syncopt:"))
 async def cb_sync_option_selected(call: CallbackQuery, state: FSMContext):
-    sync_opt = call.data.split(":")[1]  # auto | manual | none
+    sync_opt = call.data.split(":")[1]
     await state.update_data(sync_mode=sync_opt, sync_offset_ms=0)
 
     if sync_opt == "manual":
@@ -469,7 +502,7 @@ async def handle_custom_output_name(message: Message, state: FSMContext):
 
 @router.callback_query(SubtitleStates.waiting_operation_mode, F.data.startswith("submode:"))
 async def cb_select_operation_mode(call: CallbackQuery, state: FSMContext):
-    mode = call.data.split(":")[1]  # softsub | hardsub | both
+    mode = call.data.split(":")[1]
     await state.update_data(operation_mode=mode)
 
     if mode in ("hardsub", "both"):
@@ -483,12 +516,99 @@ async def cb_select_operation_mode(call: CallbackQuery, state: FSMContext):
     await _schedule_subtitle_jobs(call, state, chosen_preset=None)
 
 
+# ==================== انتخاب مقصد ذخیره هاردساب (پیش‌فرض با ۳ پوشه یا مقصد دلخواه بدون ۳ پوشه) ====================
 @router.callback_query(SubtitleStates.waiting_preset_choice, F.data.startswith("preset:"))
 async def cb_select_preset_for_jobs(call: CallbackQuery, state: FSMContext):
     idx = int(call.data.split(":")[1])
     presets = HandBrakeService.list_available_presets()
     chosen_preset = presets[idx]
+    await state.update_data(chosen_preset=chosen_preset)
+
+    data = await state.get_data()
+    if data.get("operation_mode") == "hardsub":
+        await state.set_state(SubtitleStates.waiting_hardsub_dest_choice)
+        return await call.message.edit_text(
+            f"⚙️ پریست `{chosen_preset['name']}` انتخاب شد.\n\n"
+            "📂 **فایل خروجی هاردساب در چه مقصدی ذخیره شود؟**\n"
+            "• اگر **حالت پیش‌فرض** را بزنید، ۳ پوشه (`softsub`, `hardsub`, `sub`) ساخته شده و فایل در `hardsub` قرار می‌گیرد.\n"
+            "• اگر **مقصد دلخواه** یا **کنار خود فیلم** را انتخاب کنید، ۳ پوشه ساخته نمی‌شود و فایل مستقیماً در همان مقصد ذخیره می‌گردد:",
+            reply_markup=hardsub_destination_choice_kb(),
+            parse_mode="Markdown"
+        )
+
+    # در حالت پکیج کامل (both)، به صورت استاندارد در ۳ پوشه ذخیره کن
     await _schedule_subtitle_jobs(call, state, chosen_preset=chosen_preset)
+
+
+@router.callback_query(SubtitleStates.waiting_hardsub_dest_choice, F.data == "hbdest:default")
+async def cb_hbdest_default(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(custom_hardsub_dir=None)
+    await _schedule_subtitle_jobs(call, state, chosen_preset=data["chosen_preset"])
+
+
+@router.callback_query(SubtitleStates.waiting_hardsub_dest_choice, F.data == "hbdest:same_dir")
+async def cb_hbdest_same_dir(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    first_vid = Path(data["target_videos"][0]).resolve()
+    await state.update_data(custom_hardsub_dir=str(first_vid.parent))
+    await _schedule_subtitle_jobs(call, state, chosen_preset=data["chosen_preset"])
+
+
+@router.callback_query(SubtitleStates.waiting_hardsub_dest_choice, F.data == "hbdest:custom_pick")
+async def cb_hbdest_custom_pick(call: CallbackQuery, state: FSMContext):
+    folders = DownloaderService.list_workspace_folders()
+    await state.update_data(hb_dest_folders=[str(f.resolve()) for f in folders])
+    folder_lines = [f"`[{i+1}]` 📁 `{f.name}`" for i, f in enumerate(folders[:20])]
+    list_text = "\n".join(folder_lines) if folder_lines else "_(پوشه‌ای در Workspace نیست)_"
+
+    await call.message.edit_text(
+        "📁 **انتخاب پوشه مقصد برای ذخیره مستقیم هاردساب (بدون ساخت ۳ پوشه):**\n\n"
+        f"{list_text}\n\n"
+        "یکی از پوشه‌های زیر را انتخاب کنید یا دکمه تایپ نام پوشه را بزنید:",
+        reply_markup=hardsub_custom_folders_kb(folders),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(SubtitleStates.waiting_hardsub_dest_choice, F.data.startswith("hbdest_dir:"))
+async def cb_hbdest_dir_selected(call: CallbackQuery, state: FSMContext):
+    idx = int(call.data.split(":")[1])
+    data = await state.get_data()
+    folders = data.get("hb_dest_folders", [])
+    chosen_dir = folders[idx]
+    await state.update_data(custom_hardsub_dir=chosen_dir)
+    await _schedule_subtitle_jobs(call, state, chosen_preset=data["chosen_preset"])
+
+
+@router.callback_query(SubtitleStates.waiting_hardsub_dest_choice, F.data == "hbdest:custom_type")
+async def cb_hbdest_custom_type(call: CallbackQuery, state: FSMContext):
+    await state.set_state(SubtitleStates.waiting_hardsub_custom_folder_name)
+    await call.message.edit_text(
+        "✏️ **نام پوشه در Workspace** (مثلاً `MyOutput`) یا **مسیر کامل پوشه در سرور** (مثلاً `C:\\MediaBot\\workspace\\Series\\S01`) را ارسال کنید\n"
+        "*(فایل هاردساب بدون ساخت ۳ پوشه مستقیماً داخل این مسیر ذخیره می‌شود)*:",
+        parse_mode="Markdown"
+    )
+
+
+@router.message(SubtitleStates.waiting_hardsub_custom_folder_name)
+async def handle_hbdest_custom_folder_name(message: Message, state: FSMContext):
+    raw_input = (message.text or "").strip()
+    if not raw_input:
+        return await message.answer("⚠️ لطفاً یک نام یا مسیر معتبر وارد کنید:")
+
+    p = Path(raw_input)
+    if not p.is_absolute():
+        workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+        safe_rel = re.sub(r'[<>:"|?*]', "", raw_input).strip()
+        target_dir = workspace / safe_rel
+    else:
+        target_dir = p
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    data = await state.get_data()
+    await state.update_data(custom_hardsub_dir=str(target_dir.resolve()))
+    await _schedule_subtitle_jobs_from_msg(message, state, chosen_preset=data["chosen_preset"])
 
 
 async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> list[str]:
@@ -499,6 +619,7 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
     mode = data.get("operation_mode", "softsub")
     sync_mode = data.get("sync_mode", "none")
     sync_offset_ms = int(data.get("sync_offset_ms", 0))
+    custom_hardsub_dir = data.get("custom_hardsub_dir")
     site_tag = cfg.get("branding", "site_tag", "EmpireBestTv")
     brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
 
@@ -509,9 +630,15 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
             f"{Path(custom_name).stem}_{idx+1}" if len(target_videos) > 1 else Path(custom_name).stem
         )
 
-        dirs = _resolve_media_dirs(vid, base_stem)
-        soft_dir = dirs["softsub"]
-        hard_dir = dirs["hardsub"]
+        # اگر کاربر برای هاردساب مقصد دلخواه تعیین کرده، ۳ پوشه را نساز!
+        if mode == "hardsub" and custom_hardsub_dir:
+            hard_dir = Path(custom_hardsub_dir)
+            hard_dir.mkdir(parents=True, exist_ok=True)
+            soft_dir = vid.parent
+        else:
+            dirs = _resolve_media_dirs(vid, base_stem)
+            soft_dir = dirs["softsub"]
+            hard_dir = dirs["hardsub"]
 
         if mode in ("softsub", "both") and (fa_sub or en_sub):
             soft_out = soft_dir / f"{base_stem}.SoftSub.{site_tag}.mkv"
@@ -528,12 +655,12 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
                 sync_mode,
                 sync_offset_ms
             )
-            scheduled_ids.append(f"📎 SoftSub (`softsub/`): `{t_soft.task_id}`")
+            scheduled_ids.append(f"📎 SoftSub (`{soft_dir.name}/`): `{t_soft.task_id}`")
 
         if mode in ("hardsub", "both") and chosen_preset:
             hard_out = hard_dir / f"{base_stem}.HardSub.{site_tag}.mp4"
-            primary_sub = fa_sub or en_sub  # اگر هر دو None باشند، بدون زیرنویس انکود می‌شود
-            secondary_sub = en_sub if (fa_sub and en_sub) else None
+            primary_sub = fa_sub
+            secondary_sub = en_sub
             t_hard = await queue_engine.add_task(
                 "handbrake",
                 f"HardSub ({chosen_preset['name']}): {hard_out.name}",
@@ -547,7 +674,7 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
                 sync_mode,
                 sync_offset_ms
             )
-            scheduled_ids.append(f"🔥 HardSub (`hardsub/`): `{t_hard.task_id}`")
+            scheduled_ids.append(f"🔥 HardSub (`{hard_dir}`): `{t_hard.task_id}`")
 
     return scheduled_ids
 
@@ -559,10 +686,7 @@ async def _schedule_subtitle_jobs(call: CallbackQuery, state: FSMContext, chosen
     await state.clear()
     summary_text = "\n".join(scheduled_ids)
     await call.message.edit_text(
-        f"✅ عملیات با تگ `{brand}` در صف قرار گرفت!\n"
-        "• سافت‌ساب در پوشه `softsub` (بدون تغییر رنگ)\n"
-        "• هاردساب در پوشه `hardsub` (SRT بولد و زرد `#fbff00` با فونت بزرگ پیش‌فرض)\n\n"
-        f"{summary_text}",
+        f"✅ عملیات با تگ `{brand}` در صف قرار گرفت!\n\n{summary_text}",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -575,10 +699,7 @@ async def _schedule_subtitle_jobs_from_msg(message: Message, state: FSMContext, 
     await state.clear()
     summary_text = "\n".join(scheduled_ids)
     await message.answer(
-        f"✅ عملیات با تگ `{brand}` در صف قرار گرفت!\n"
-        "• سافت‌ساب در پوشه `softsub` (بدون تغییر رنگ)\n"
-        "• هاردساب در پوشه `hardsub` (SRT بولد و زرد `#fbff00` با فونت بزرگ پیش‌فرض)\n\n"
-        f"{summary_text}",
+        f"✅ عملیات با تگ `{brand}` در صف قرار گرفت!\n\n{summary_text}",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -632,6 +753,7 @@ async def cb_single_video_sub_flow(call: CallbackQuery, state: FSMContext):
         target_videos=[vid],
         operation_mode=mode_map[call.data],
         fa_sub_path=None,
-        en_sub_path=None
+        en_sub_path=None,
+        custom_hardsub_dir=None
     )
     await _prompt_fa_subtitle_step(call, state)

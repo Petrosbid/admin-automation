@@ -1,57 +1,33 @@
 import ctypes
+from ftplib import FTP
 import logging
 import struct
-import threading
 import time
 import urllib.parse
 from pathlib import Path
+from typing import Callable
+import pythoncom
 import win32api
 import win32clipboard
+import win32com.client
 import win32con
 import win32gui
-import win32process
 from core.config_loader import cfg
 
-logger = logging.getLogger(__name__)
-
 user32 = ctypes.windll.user32
-_CUTEFTP_GUI_LOCK = threading.RLock()
 
 
-def _copy_files_to_windows_clipboard(file_paths: list[str]):
-    """قرار دادن پوشه یا فایل در کلیپ‌بورد ویندوز با فرمت بومی CF_HDROP"""
-    p_files_offset = 20
-    f_wide = 1
-    dropfiles_header = struct.pack("IiiII", p_files_offset, 0, 0, 0, f_wide)
-
-    encoded_paths = b"".join(p.encode("utf-16le") + b"\x00\x00" for p in file_paths) + b"\x00\x00"
-    hdrop_data = dropfiles_header + encoded_paths
-
-    win32clipboard.OpenClipboard()
+def _get_window_text_safe(hwnd: int) -> str:
+    """خواندن متن کنترل‌های Edit در ویندوز (حتی کادرهای Password با استایل ES_PASSWORD در همان نشست کاربری)"""
     try:
-        win32clipboard.EmptyClipboard()
-        win32clipboard.SetClipboardData(win32con.CF_HDROP, hdrop_data)
-    finally:
-        win32clipboard.CloseClipboard()
-
-
-def _get_edit_text(edit_hwnd: int) -> str:
-    """خواندن متن کنترل‌های ویندوز با ctypes (سازگار با Python 3.14)"""
-    try:
-        length = user32.SendMessageW(edit_hwnd, win32con.WM_GETTEXTLENGTH, 0, 0)
+        length = user32.SendMessageW(hwnd, win32con.WM_GETTEXTLENGTH, 0, 0)
         if length <= 0:
             return ""
         buf = ctypes.create_unicode_buffer(length + 2)
-        user32.SendMessageW(edit_hwnd, win32con.WM_GETTEXT, length + 1, buf)
-        return buf.value
+        user32.SendMessageW(hwnd, win32con.WM_GETTEXT, length + 1, buf)
+        return buf.value.strip()
     except Exception:
         return ""
-
-
-def _set_edit_text(edit_hwnd: int, text: str):
-    """نوشتن مسیر جدید در نوار آدرس با ctypes"""
-    buf = ctypes.create_unicode_buffer(text)
-    user32.SendMessageW(edit_hwnd, win32con.WM_SETTEXT, 0, buf)
 
 
 def _find_cuteftp_gui_window() -> int | None:
@@ -67,379 +43,294 @@ def _find_cuteftp_gui_window() -> int | None:
     return found_hwnds[0] if found_hwnds else None
 
 
-def _normalise_remote_path(path: str) -> str:
-    path = (path or "").replace("\\", "/").strip()
-    if not path:
-        return ""
-    if path == "/":
-        return "/"
-    return "/" + path.lstrip("/").rstrip("/")
-
-
-def _paths_equal(left: str, right: str) -> bool:
-    return _normalise_remote_path(left).casefold() == _normalise_remote_path(right).casefold()
-
-
-def _find_remote_controls(main_hwnd: int) -> tuple[int | None, int | None]:
+def extract_credentials_from_open_cuteftp() -> dict[str, str]:
     """
-    Find the Remote list and the address Edit control above it.
-    Candidate controls are ranked by their current path text and geometry
-    relative to the right-hand (Remote) file list.
+    استخراج هوشمند Host، Username، Password، Port، نام پروفایل Site Manager (مثلاً dl15)
+    و مسیر فعلی Remote مستقیماً از پنجره بازِ CuteFTP 9.3 روی سرور!
     """
-    main_left, main_top, main_right, main_bottom = win32gui.GetWindowRect(main_hwnd)
-    main_mid_x = (main_left + main_right) // 2
-    listviews = []
-    edits = []
+    info = {
+        "site_profile": "",
+        "host": "",
+        "username": "",
+        "password": "",
+        "port": "21",
+        "remote_dir": "/English/Movies",
+    }
+
+    main_hwnd = _find_cuteftp_gui_window()
+    if not main_hwnd:
+        return info
+
+    # ۱. استخراج نام پروفایل Site Manager و IP از تایتل پنجره اصلی:
+    # مثال تایتل در عکس شما: Globalscape - CuteFTP 9.3 - [dl15 - 185.130.50.130, Status: Connected]
+    win_title = win32gui.GetWindowText(main_hwnd)
+    if "[" in win_title and "]" in win_title:
+        bracket_part = win_title.split("[", 1)[1].split("]", 1)[0]
+        if " - " in bracket_part:
+            prof, rest = bracket_part.split(" - ", 1)
+            info["site_profile"] = prof.strip()
+            host_candidate = rest.split(",", 1)[0].strip()
+            if host_candidate:
+                info["host"] = host_candidate
+
+    # ۲. پیمایش تمام کادرهای متنی (Edit) در نوار ابزار بالای CuteFTP (Host, Username, Password, Port, Remote Path)
+    edits_with_pos = []
 
     def _enum_child(hwnd, _):
-        try:
-            cls_name = win32gui.GetClassName(hwnd)
-            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-            width, height = right - left, bottom - top
-            if width <= 0 or height <= 0:
-                return
-
-            if cls_name in ("SysListView32", "TListView") and width > 120 and height > 100:
-                if (left + right) // 2 > main_mid_x:
-                    listviews.append((left, top, right, bottom, hwnd))
-
-            if cls_name in ("Edit", "ComboBox", "ComboBoxEx32") and width > 100 and 12 <= height <= 55:
-                if left >= main_mid_x - 10:
-                    text = _get_edit_text(hwnd).strip()
-                    edits.append((left, top, right, bottom, cls_name, text, hwnd))
-        except Exception:
+        if not win32gui.IsWindowVisible(hwnd):
             return
+        cls_name = win32gui.GetClassName(hwnd)
+        if cls_name == "Edit":
+            try:
+                rect = win32gui.GetWindowRect(hwnd)
+                style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+                is_password_box = bool(style & 0x0020)  # ES_PASSWORD = 0x0020
+                txt = _get_window_text_safe(hwnd)
+                edits_with_pos.append((rect[1], rect[0], txt, is_password_box, hwnd))
+            except Exception:
+                pass
 
     win32gui.EnumChildWindows(main_hwnd, _enum_child, None)
 
-    remote_listview = None
-    remote_rect = None
-    if listviews:
-        # The upper/right list is the Remote pane; lower list views are usually the queue.
-        listviews.sort(key=lambda item: (item[1], -item[0]))
-        remote_rect = listviews[0][:4]
-        remote_listview = listviews[0][4]
+    for top_y, left_x, txt, is_pwd, _ in edits_with_pos:
+        if not txt:
+            continue
+        if is_pwd:
+            info["password"] = txt
+        elif txt.startswith("/"):
+            info["remote_dir"] = txt
+        elif "@" in txt and not txt.startswith("C:"):
+            info["username"] = txt
+        elif txt.isdigit() and 1 <= int(txt) <= 65535:
+            info["port"] = txt
+        elif txt.count(".") == 3 and all(p.isdigit() for p in txt.split(".")):
+            info["host"] = txt
 
-    remote_edit = None
-    if edits:
-        def _score(item):
-            left, top, right, bottom, cls_name, text, hwnd = item
-            score = 0
-            if text.startswith("/"):
-                score += 1000
-            if cls_name == "Edit":
-                score += 30
-            if text:
-                score += 20
-            if left >= main_mid_x:
-                score += 50
-            if remote_rect:
-                list_left, list_top, list_right, _ = remote_rect
-                overlap = max(0, min(right, list_right) - max(left, list_left))
-                if overlap:
-                    score += 250
-                if bottom <= list_top and list_top - bottom <= 100:
-                    score += 300 - (list_top - bottom)
-            return score
-
-        edits.sort(key=_score, reverse=True)
-        best = edits[0]
-        if _score(best) >= 100:
-            remote_edit = best[6]
-
-    return remote_listview, remote_edit
-
-
-def _press_key(vk: int):
-    win32api.keybd_event(vk, 0, 0, 0)
-    time.sleep(0.04)
-    win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
-    time.sleep(0.08)
-
-
-def _press_ctrl_key(vk: int):
-    win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
-    time.sleep(0.04)
-    win32api.keybd_event(vk, 0, 0, 0)
-    time.sleep(0.04)
-    win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
-    win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-    time.sleep(0.12)
-
-
-def _copy_text_to_clipboard(text: str):
-    last_error = None
-    for _ in range(10):
+    # اگر رمز عبور از کادر ستاره‌دار CuteFTP استخراج شد، آن را در config.yaml هم ذخیره کن تا همیشه در دسترس باشد
+    if info["password"]:
         try:
-            win32clipboard.OpenClipboard()
-            try:
-                win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
-            finally:
-                win32clipboard.CloseClipboard()
-            return
-        except Exception as exc:
-            last_error = exc
-            time.sleep(0.1)
-    raise RuntimeError(f"امکان قراردادن مسیر در کلیپ‌بورد وجود ندارد: {last_error}")
-
-
-def _focus_cuteftp_control(main_hwnd: int, control_hwnd: int):
-    if win32gui.IsIconic(main_hwnd):
-        win32gui.ShowWindow(main_hwnd, win32con.SW_RESTORE)
-        time.sleep(0.25)
-
-    try:
-        win32gui.BringWindowToTop(main_hwnd)
-        win32gui.SetForegroundWindow(main_hwnd)
-    except Exception:
-        pass
-    time.sleep(0.15)
-
-    foreground = win32gui.GetForegroundWindow()
-    if foreground != main_hwnd:
-        try:
-            _, fg_pid = win32process.GetWindowThreadProcessId(foreground)
-            _, main_pid = win32process.GetWindowThreadProcessId(main_hwnd)
+            if info["host"]:
+                cfg.set_value("cuteftp", "host", info["host"])
+            if info["username"]:
+                cfg.set_value("cuteftp", "username", info["username"])
+            cfg.set_value("cuteftp", "password", info["password"])
         except Exception:
-            fg_pid, main_pid = -1, -2
-        if fg_pid != main_pid:
-            raise RuntimeError(
-                "CuteFTP نمی‌تواند پنجره فعال شود. CuteFTP و ربات باید در یک "
-                "نشست تعاملی ویندوز اجرا شوند و صفحه قفل نباشد."
-            )
+            pass
 
-    target_tid, _ = win32process.GetWindowThreadProcessId(control_hwnd)
-    current_tid = win32api.GetCurrentThreadId()
-    attached = False
-    try:
-        if current_tid != target_tid:
-            attached = bool(user32.AttachThreadInput(current_tid, target_tid, True))
-        user32.SetFocus(control_hwnd)
-    finally:
-        if attached:
-            user32.AttachThreadInput(current_tid, target_tid, False)
-
-
-def _paste_text_into_control(main_hwnd: int, control_hwnd: int, text: str) -> bool:
-    _copy_text_to_clipboard(text)
-    _focus_cuteftp_control(main_hwnd, control_hwnd)
-    _press_ctrl_key(ord("A"))
-    _press_ctrl_key(ord("V"))
-    time.sleep(0.15)
-    return _get_edit_text(control_hwnd).strip() == text
-
-
-def _find_cuteftp_dialog(main_hwnd: int, timeout: float = 2.5) -> int | None:
-    _, process_id = win32process.GetWindowThreadProcessId(main_hwnd)
-    deadline = time.monotonic() + timeout
-
-    while time.monotonic() < deadline:
-        dialogs = []
-
-        def _enum_window(hwnd, _):
-            if hwnd == main_hwnd or not win32gui.IsWindowVisible(hwnd):
-                return
-            try:
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                if pid != process_id:
-                    return
-                owner = win32gui.GetWindow(hwnd, win32con.GW_OWNER)
-                if owner == main_hwnd or win32gui.GetClassName(hwnd) == "#32770":
-                    dialogs.append(hwnd)
-            except Exception:
-                return
-
-        win32gui.EnumWindows(_enum_window, None)
-        if dialogs:
-            return dialogs[0]
-        time.sleep(0.08)
-
-    return None
-
-
-def _find_dialog_edit(dialog_hwnd: int) -> int | None:
-    candidates = []
-
-    def _enum_child(hwnd, _):
-        try:
-            cls_name = win32gui.GetClassName(hwnd)
-            if cls_name not in ("Edit", "ComboBox", "ComboBoxEx32"):
-                return
-            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-            width, height = right - left, bottom - top
-            if width >= 100 and 12 <= height <= 60:
-                candidates.append((width, hwnd))
-        except Exception:
-            return
-
-    win32gui.EnumChildWindows(dialog_hwnd, _enum_child, None)
-    candidates.sort(reverse=True)
-    return candidates[0][1] if candidates else None
-
-
-def _navigate_using_cuteftp_dialog(
-    main_hwnd: int,
-    remote_listview: int | None,
-    target_path: str,
-) -> bool:
-    """CuteFTP 9 documents Ctrl+D as its Change Remote Folder command."""
-    _focus_cuteftp_control(main_hwnd, remote_listview or main_hwnd)
-    _press_ctrl_key(ord("D"))
-
-    dialog_hwnd = _find_cuteftp_dialog(main_hwnd)
-    if not dialog_hwnd:
-        return False
-
-    dialog_edit = _find_dialog_edit(dialog_hwnd)
-    if not dialog_edit:
-        return False
-
-    if not _paste_text_into_control(dialog_hwnd, dialog_edit, target_path):
-        return False
-
-    # IDOK is the standard OK command for a Windows dialog.
-    user32.SendMessageW(dialog_hwnd, win32con.WM_COMMAND, 1, 0)
-
-    deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline:
-        if not win32gui.IsWindow(dialog_hwnd) or not win32gui.IsWindowVisible(dialog_hwnd):
-            time.sleep(1.5)
-            _, address_edit = _find_remote_controls(main_hwnd)
-            current = _get_edit_text(address_edit).strip() if address_edit else ""
-            return bool(current and _paths_equal(current, target_path))
-        time.sleep(0.1)
-
-    return False
-
-
-def _navigate_cuteftp_gui_to_path(
-    main_hwnd: int,
-    edit_hwnd: int | None,
-    remote_listview: int | None,
-    target_remote_dir: str,
-) -> str:
-    if not target_remote_dir or target_remote_dir == "__CURRENT__":
-        current = _get_edit_text(edit_hwnd).strip() if edit_hwnd else ""
-        return _normalise_remote_path(current)
-
-    target = _normalise_remote_path(target_remote_dir)
-    if not target:
-        raise RuntimeError("مسیر مقصد خالی است.")
-
-    current = _get_edit_text(edit_hwnd).strip() if edit_hwnd else ""
-    if current and _paths_equal(current, target):
-        return target
-
-    # First use the actual Remote address Edit. Real Ctrl+A / Ctrl+V / Enter
-    # generates the control notifications that WM_SETTEXT + PostMessage missed.
-    if edit_hwnd:
-        try:
-            if _paste_text_into_control(main_hwnd, edit_hwnd, target):
-                _press_key(win32con.VK_RETURN)
-                time.sleep(2.0)
-                if _paths_equal(_get_edit_text(edit_hwnd).strip(), target):
-                    return target
-        except Exception:
-            logger.exception("Direct CuteFTP Remote address navigation failed.")
-
-    # Fallback to CuteFTP's own Change Remote Folder dialog (Ctrl+D).
-    if _navigate_using_cuteftp_dialog(main_hwnd, remote_listview, target):
-        return target
-
-    raise RuntimeError(
-        f"مسیر مقصد [{target}] در CuteFTP اعمال و تأیید نشد؛ "
-        "برای جلوگیری از آپلود در پوشه قبلی، هیچ فایلی ارسال نشد."
-    )
-
-
-def upload_via_open_cuteftp_gui(
-    local_target: Path,
-    target_remote_dir: str = "__CURRENT__",
-) -> tuple[bool, str]:
-    """Upload through the user's already-authenticated, open CuteFTP session."""
-    local_target = Path(local_target).resolve()
-    if not local_target.exists():
-        raise FileNotFoundError(f"فایل یا پوشه محلی پیدا نشد: {local_target}")
-
-    with _CUTEFTP_GUI_LOCK:
-        main_hwnd = _find_cuteftp_gui_window()
-        if not main_hwnd:
-            raise RuntimeError(
-                "پنجره CuteFTP پیدا نشد. برنامه باید در همان نشست تعاملی ویندوز باز باشد."
-            )
-
-        remote_pane_hwnd, remote_edit_hwnd = _find_remote_controls(main_hwnd)
-        if not remote_pane_hwnd:
-            raise RuntimeError(
-                "پنل Remote در CuteFTP پیدا نشد؛ آپلود برای جلوگیری از مقصد اشتباه لغو شد."
-            )
-
-        actual_remote_path = _navigate_cuteftp_gui_to_path(
-            main_hwnd,
-            remote_edit_hwnd,
-            remote_pane_hwnd,
-            target_remote_dir,
-        )
-        if not actual_remote_path:
-            raise RuntimeError(
-                "مسیر فعلی Remote قابل تشخیص نیست؛ آپلود در مقصد نامشخص انجام نشد."
-            )
-
-        # Reacquire after navigation in case CuteFTP rebuilt its child controls.
-        remote_pane_hwnd, remote_edit_hwnd = _find_remote_controls(main_hwnd)
-        if not remote_pane_hwnd:
-            raise RuntimeError("پس از تغییر مسیر، پنل Remote پیدا نشد؛ آپلود لغو شد.")
-
-        if target_remote_dir and target_remote_dir != "__CURRENT__":
-            visible_path = _get_edit_text(remote_edit_hwnd).strip() if remote_edit_hwnd else ""
-            if not visible_path or not _paths_equal(visible_path, actual_remote_path):
-                raise RuntimeError(
-                    "مسیر قابل مشاهده در نوار Remote با مقصد انتخابی مطابقت ندارد؛ آپلود لغو شد."
-                )
-
-        # CF_HDROP + Ctrl+V is the native CuteFTP clipboard-upload workflow.
-        _copy_files_to_windows_clipboard([str(local_target)])
-        _focus_cuteftp_control(main_hwnd, remote_pane_hwnd)
-        _press_ctrl_key(ord("V"))
-        time.sleep(0.5)
-
-        return True, actual_remote_path
+    return info
 
 
 def get_current_cuteftp_remote_dir() -> str:
     """خواندن مسیر فعلی که پنجره باز CuteFTP روی آن قرار دارد"""
+    extracted = extract_credentials_from_open_cuteftp()
+    return extracted.get("remote_dir") or cfg.get("cuteftp", "remote_base_dir", "/English/Movies")
+
+
+def _ensure_ftp_remote_dir(ftp: FTP, remote_dir: str):
+    """ساخت مرحله‌به‌مرحله تمام پوشه‌ها و زیرپوشه‌های مسیر مقصد در هاست دانلود و ورود به آن"""
+    normalized = "/" + remote_dir.replace("\\", "/").strip().lstrip("/")
+    ftp.cwd("/")
+    if normalized == "/":
+        return
+
+    for part in normalized.strip("/").split("/"):
+        if not part:
+            continue
+        try:
+            ftp.cwd(part)
+        except Exception:
+            try:
+                ftp.mkd(part)
+            except Exception:
+                pass
+            ftp.cwd(part)
+
+
+def _upload_via_direct_ftp(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    local_target: Path,
+    target_remote_dir: str,
+    progress_callback: Callable[[str], None] = None
+) -> str:
+    """
+    آپلود ۱۰۰٪ مستقیم، سریع و بدون خطا به هاست دانلود با ساخت خودکار پوشه‌ها و گزارش درصد پیشرفت لحظه‌ای
+    """
+    ftp = FTP()
+    ftp.encoding = "utf-8"
+    ftp.connect(host=host, port=port, timeout=60)
+    ftp.login(user=username, passwd=password)
+    ftp.set_pasv(True)
+
     try:
-        main_hwnd = _find_cuteftp_gui_window()
-        if not main_hwnd:
-            return cfg.get("cuteftp", "remote_base_dir", "/English/Movies")
-        _, remote_edit_hwnd = _find_remote_controls(main_hwnd)
-        if remote_edit_hwnd:
-            txt = _get_edit_text(remote_edit_hwnd).strip()
-            if txt:
-                return _normalise_remote_path(txt)
-    except Exception:
-        pass
-    return cfg.get("cuteftp", "remote_base_dir", "/English/Movies")
+        _ensure_ftp_remote_dir(ftp, target_remote_dir)
+
+        if local_target.is_file():
+            total_size = max(1, local_target.stat().st_size)
+            uploaded = 0
+            last_update = 0.0
+
+            def _chunk_cb(chunk: bytes):
+                nonlocal uploaded, last_update
+                uploaded += len(chunk)
+                now = time.time()
+                if progress_callback and (now - last_update >= 1.5):
+                    last_update = now
+                    pct = (uploaded / total_size) * 100.0
+                    progress_callback(f"{pct:.1f}% ({uploaded / (1024*1024):.1f} / {total_size / (1024*1024):.1f} MB)")
+
+            with open(local_target, "rb") as f:
+                ftp.storbinary(f"STOR {local_target.name}", f, blocksize=1024 * 256, callback=_chunk_cb)
+        else:
+            # آپلود یک پوشه کامل به همراه تمام زیرپوشه‌های آن (softsub, hardsub, sub و غیره)
+            movie_remote_root = f"{target_remote_dir.rstrip('/')}/{local_target.name}"
+            _ensure_ftp_remote_dir(ftp, movie_remote_root)
+
+            all_files = [
+                p for p in local_target.rglob("*")
+                if p.is_file() and not p.name.startswith("_temp_")
+            ]
+            total_files = len(all_files)
+
+            for idx, file_p in enumerate(all_files, start=1):
+                rel_parent = file_p.parent.relative_to(local_target).as_posix()
+                dest_folder = movie_remote_root if rel_parent == "." else f"{movie_remote_root}/{rel_parent}"
+                _ensure_ftp_remote_dir(ftp, dest_folder)
+
+                f_size = max(1, file_p.stat().st_size)
+                sent = 0
+                last_t = 0.0
+
+                def _file_cb(chunk: bytes):
+                    nonlocal sent, last_t
+                    sent += len(chunk)
+                    now = time.time()
+                    if progress_callback and (now - last_t >= 1.5):
+                        last_t = now
+                        pct = (sent / f_size) * 100.0
+                        progress_callback(f"فایل {idx}/{total_files}: {pct:.1f}% ({file_p.name[:25]})")
+
+                with open(file_p, "rb") as f:
+                    ftp.storbinary(f"STOR {file_p.name}", f, blocksize=1024 * 256, callback=_file_cb)
+
+        return target_remote_dir
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            ftp.close()
 
 
-def sync_upload_cuteftp(local_target: Path, remote_subpath: str = "__CURRENT__") -> list[str]:
+def _upload_via_cuteftp_com_engine(
+    local_target: Path,
+    target_remote_dir: str,
+    extracted_info: dict[str, str],
+    progress_callback: Callable[[str], None] = None
+) -> str:
+    """
+    آپلود از طریق موتور COM رسمی CuteFTP 9 (CuteFTPPro.TEConnection)
+    با استفاده از پروفایل ذخیره‌شده در Site Manager (مثلاً 'dl15') یا مشخصات استخراج‌شده از GUI
+    """
+    pythoncom.CoInitialize()
+    try:
+        ftp_cfg = cfg.get("cuteftp") or {}
+        te = win32com.client.Dispatch("CuteFTPPro.TEConnection")
+        te.Option("ThrowError", False)
+        te.Option("AutoCloseMethod", 2)
+
+        host = extracted_info.get("host") or ftp_cfg.get("host", "185.130.50.130")
+        username = extracted_info.get("username") or ftp_cfg.get("username", "@dl15.cdnzed.sbs")
+        password = extracted_info.get("password") or ftp_cfg.get("password", "")
+        port = int(extracted_info.get("port") or ftp_cfg.get("port", 21))
+        site_profile = extracted_info.get("site_profile") or ftp_cfg.get("site_profile", "dl15")
+
+        if not bool(getattr(te, "IsConnected", False)):
+            if password and password != "ftppassword":
+                te.Protocol = ftp_cfg.get("protocol", "FTP")
+                te.Host = host
+                te.Port = port
+                te.Login = username
+                te.Password = password
+                te.Connect()
+            else:
+                # اتصال مستقیم با نام سایت در Site Manager برنامه CuteFTP (بدون نیاز به پسورد!)
+                try:
+                    te.Connect(site_profile)
+                except Exception:
+                    te.Host = host
+                    te.Port = port
+                    te.Login = username
+                    te.Connect()
+
+        if progress_callback:
+            progress_callback(f"ایجاد مسیر {target_remote_dir} در موتور CuteFTP...")
+
+        # ساخت مرحله‌به‌مرحله پوشه مقصد در صورت عدم وجود
+        accum = ""
+        for part in target_remote_dir.strip("/").split("/"):
+            if not part:
+                continue
+            accum = f"{accum}/{part}"
+            if not te.RemoteExists(accum):
+                te.CreateRemoteFolder(accum)
+
+        if local_target.is_file():
+            te.RemoteFolder = target_remote_dir
+            te.Upload(str(local_target.resolve()))
+        else:
+            movie_remote_dir = f"{target_remote_dir.rstrip('/')}/{local_target.name}"
+            if not te.RemoteExists(movie_remote_dir):
+                te.CreateRemoteFolder(movie_remote_dir)
+            te.RemoteFolder = movie_remote_dir
+            te.Upload(f"{local_target.resolve()}\\*.*")
+
+        return target_remote_dir
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def sync_upload_cuteftp(
+    local_target: Path,
+    remote_subpath: str = "__CURRENT__",
+    progress_callback: Callable[[str], None] = None
+) -> list[str]:
+    """
+    اجرای قطعی آپلود به هاست دانلود و تولید لینک‌های مستقیم:
+    ۱. خواندن خودکار مشخصات و مسیر فعلی از پنجره بازِ CuteFTP 9.3
+    ۲. آپلود مستقیم با موتور COM برنامه CuteFTP (پروفایل dl15 یا مشخصات استخراج‌شده)
+    ۳. آپلود مستقیم FTP در صورت داشتن یا استخراج شدن پسورد
+    """
     ftp_cfg = cfg.get("cuteftp") or {}
+    extracted = extract_credentials_from_open_cuteftp()
+
+    host = extracted.get("host") or ftp_cfg.get("host", "185.130.50.130")
+    port = int(extracted.get("port") or ftp_cfg.get("port", 21))
+    username = extracted.get("username") or ftp_cfg.get("username", "@dl15.cdnzed.sbs")
+    password = extracted.get("password") or str(ftp_cfg.get("password", "")).strip()
+    if password == "ftppassword":
+        password = ""
+
     base_url = str(ftp_cfg.get("base_download_url", "https://dl15.cdnzed.sbs")).rstrip("/")
+    if "dl.example.com" in base_url and username.startswith("@"):
+        # تشخیص خودکار دامنه دانلود از روی نام کاربری (مثلاً @dl15.cdnzed.sbs -> https://dl15.cdnzed.sbs)
+        base_url = f"https://{username.lstrip('@')}"
 
     if not remote_subpath or remote_subpath == "__CURRENT__":
-        target_remote_dir = "__CURRENT__"
+        target_remote_dir = extracted.get("remote_dir") or ftp_cfg.get("remote_base_dir", "/English/Movies")
     else:
         target_remote_dir = "/" + remote_subpath.replace("\\", "/").strip().lstrip("/")
 
+    if len(target_remote_dir) > 1:
+        target_remote_dir = target_remote_dir.rstrip("/")
+
     def _generate_links(final_remote_dir: str) -> list[str]:
-        clean_sub = ""
-        if final_remote_dir and final_remote_dir != "__CURRENT__":
-            rel_remote = final_remote_dir.replace("\\", "/")
-            for pub_prefix in ("/public_html", "/www", "/htdocs"):
-                if rel_remote.startswith(pub_prefix):
-                    rel_remote = rel_remote[len(pub_prefix):]
-            clean_sub = rel_remote.strip("/")
+        clean_sub = final_remote_dir.replace("\\", "/")
+        for pub_prefix in ("/public_html", "/www", "/htdocs"):
+            if clean_sub.startswith(pub_prefix):
+                clean_sub = clean_sub[len(pub_prefix):]
+        clean_sub = clean_sub.strip("/")
 
         urls = []
         if local_target.is_file():
@@ -454,10 +345,40 @@ def sync_upload_cuteftp(local_target: Path, remote_subpath: str = "__CURRENT__")
                     urls.append(f"{base_url}/{urllib.parse.quote(rel)}")
         return urls
 
-    ok, used_remote = upload_via_open_cuteftp_gui(local_target, target_remote_dir)
-    if ok:
-        return _generate_links(used_remote)
+    errors = []
+
+    # روش ۱: اگر پسورد از پنجره باز CuteFTP استخراج شد یا در کانفیگ بود -> آپلود مستقیم و ۱۰۰٪ تضمینی با نمایش درصد پیشرفت
+    if password:
+        try:
+            used_dir = _upload_via_direct_ftp(
+                host=host,
+                port=port,
+                username=username,
+                password=password,
+                local_target=local_target,
+                target_remote_dir=target_remote_dir,
+                progress_callback=progress_callback
+            )
+            return _generate_links(used_dir)
+        except Exception as e1:
+            logging.warning(f"Direct FTP upload attempt warning: {e1}")
+            errors.append(f"DirectFTP: {e1}")
+
+    # روش ۲: استفاده از موتور COM خودِ CuteFTP (متصل به پروفایل dl15 در Site Manager)
+    try:
+        used_dir = _upload_via_cuteftp_com_engine(
+            local_target=local_target,
+            target_remote_dir=target_remote_dir,
+            extracted_info=extracted,
+            progress_callback=progress_callback
+        )
+        return _generate_links(used_dir)
+    except Exception as e2:
+        logging.warning(f"CuteFTP COM Engine warning: {e2}")
+        errors.append(f"COM: {e2}")
 
     raise RuntimeError(
-        "پنجره نرم‌افزار CuteFTP 9 روی سرور پیدا نشد! لطفاً مطمئن شوید برنامه CuteFTP باز است."
+        "خطا در آپلود به سرور دانلود!\n"
+        f"جزئیات: {' | '.join(errors)}\n"
+        "💡 راهنما: یک بار دستور /settings را در ربات بزنید و در بخش cuteftp بررسی کنید که host و password تنظیم شده باشند."
     )

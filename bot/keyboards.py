@@ -71,19 +71,19 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="📂 ۵. فایل‌منیجر و آپلود با CuteFTP",
+            text="📂 ۵. فایل‌منیجر (حذف / تغییر نام / CuteFTP)",
             callback_data="menu:file_mgr"
         )
     )
 
     builder.row(
         InlineKeyboardButton(
-            text="📊 وضعیت صف و مدیریت پراسس‌ها",
+            text="📊 وضعیت صف و پراسس‌ها",
             callback_data="menu:queues"
         ),
         InlineKeyboardButton(
-            text="🔄 ریلود کانفیگ",
-            callback_data="menu:reload_cfg"
+            text="⚙️ تنظیمات کانفیگ (/settings)",
+            callback_data="menu:settings"
         )
     )
 
@@ -375,8 +375,18 @@ def file_browser_kb(
     if not is_root:
         builder.row(
             InlineKeyboardButton(
-                text="⬆️ پوشه قبلی",
+                text="⬆️ پوشه قبلی (Up)",
                 callback_data="fnav:up"
+            )
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text="✏️ تغییر نام این پوشه",
+                callback_data="fact:rename_dir"
+            ),
+            InlineKeyboardButton(
+                text="🗑 حذف این پوشه",
+                callback_data="fact:delete_dir"
             )
         )
 
@@ -661,7 +671,7 @@ def subtitle_mode_kb() -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="🔥 فقط HardSub (در پوشه hardsub)",
+            text="🔥 فقط HardSub (انتخاب مقصد یا پیش‌فرض)",
             callback_data="submode:hardsub"
         )
     )
@@ -680,6 +690,65 @@ def subtitle_mode_kb() -> InlineKeyboardMarkup:
         )
     )
 
+    return builder.as_markup()
+
+
+def hardsub_destination_choice_kb() -> InlineKeyboardMarkup:
+    """
+    انتخاب مقصد ذخیره فایل هاردساب:
+    - پیش‌فرض (ساخت ۳ پوشه و ذخیره در پوشه hardsub)
+    - کنار خودِ فایل فیلم (بدون ساخت ۳ پوشه)
+    - انتخاب یا تایپ پوشه دلخواه در Workspace (بدون ساخت ۳ پوشه)
+    """
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="📂 حالت پیش‌فرض (ساخت ۳ پوشه و ذخیره در hardsub)",
+            callback_data="hbdest:default"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="📍 ذخیره مستقیم کنار خود فایل فیلم (بدون ساخت ۳ پوشه)",
+            callback_data="hbdest:same_dir"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="📁 انتخاب پوشه مقصد دلخواه (بدون ساخت ۳ پوشه)",
+            callback_data="hbdest:custom_pick"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 انصراف",
+            callback_data="menu:home"
+        )
+    )
+    return builder.as_markup()
+
+
+def hardsub_custom_folders_kb(folders: list[Path]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for idx, folder in enumerate(folders[:20]):
+        builder.row(
+            InlineKeyboardButton(
+                text=f"📁 [{idx+1}] {smart_middle_truncate(folder.name, 38)}",
+                callback_data=f"hbdest_dir:{idx}"
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="✏️ تایپ نام یا مسیر پوشه مقصد دلخواه",
+            callback_data="hbdest:custom_type"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 انصراف",
+            callback_data="menu:home"
+        )
+    )
     return builder.as_markup()
 
 
@@ -705,31 +774,43 @@ def skip_or_cancel_kb(
     return builder.as_markup()
 
 
-def video_actions_kb() -> InlineKeyboardMarkup:
+def video_actions_kb(is_video: bool = True) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
-    builder.row(
-        InlineKeyboardButton(
-            text="📤 استخراج زیرنویس",
-            callback_data="vact:extract_sub"
+    if is_video:
+        builder.row(
+            InlineKeyboardButton(
+                text="📤 استخراج زیرنویس",
+                callback_data="vact:extract_sub"
+            )
         )
-    )
+
+        builder.row(
+            InlineKeyboardButton(
+                text="📎 SoftSub",
+                callback_data="vact:softsub"
+            ),
+            InlineKeyboardButton(
+                text="🔥 HardSub",
+                callback_data="vact:hardsub"
+            )
+        )
+
+        builder.row(
+            InlineKeyboardButton(
+                text="🚀 اتوماسیون کامل (SoftSub + HardSub)",
+                callback_data="vact:full_auto"
+            )
+        )
 
     builder.row(
         InlineKeyboardButton(
-            text="📎 SoftSub",
-            callback_data="vact:softsub"
+            text="✏️ تغییر نام این فایل",
+            callback_data="vact:rename_file"
         ),
         InlineKeyboardButton(
-            text="🔥 HardSub",
-            callback_data="vact:hardsub"
-        )
-    )
-
-    builder.row(
-        InlineKeyboardButton(
-            text="🚀 اتوماسیون کامل (SoftSub + HardSub)",
-            callback_data="vact:full_auto"
+            text="🗑 حذف این فایل",
+            callback_data="vact:delete_file"
         )
     )
 
