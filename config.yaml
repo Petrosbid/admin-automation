@@ -16,11 +16,13 @@ concurrency:
 monitor:
   enabled: true
   interval_seconds: 300    # هر ۵ دقیقه (۳۰۰ ثانیه)
-  use_real_browser: true   # باز کردن مرورگر واقعی برای حل کپچا و حفظ کوکی‌ها
+  use_real_browser: true
   sites:
     pahe: "https://pahe.ink/"
     psa: "https://psa.wf/"
     yts: "https://yts.gg/home"
+    digimovie: "https://digimoviez53.top/"
+    avamovie: "https://avasaraw.top/"
 
 paths:
   workspace_dir: "C:\\MediaBot\\workspace"

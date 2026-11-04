@@ -16,7 +16,6 @@ from core.proxy_manager import ProxyManager
 
 
 def _make_soup(html: str) -> BeautifulSoup:
-    """ساخت ایمن BeautifulSoup با فال‌بک خودکار به html.parser داخلی پایتون در صورت نبودن lxml"""
     try:
         return BeautifulSoup(html, "lxml")
     except FeatureNotFound:
@@ -28,6 +27,8 @@ class SiteMonitorService:
         "pahe": "https://pahe.ink/",
         "psa": "https://psa.wf/",
         "yts": "https://yts.gg/home",
+        "digimovie": "https://digimoviez53.top/",
+        "avamovie": "https://avasaraw.top/",
     }
 
     def __init__(self):
@@ -58,7 +59,7 @@ class SiteMonitorService:
                 return json.loads(self.state_file.read_text(encoding="utf-8"))
             except Exception:
                 pass
-        return {"pahe": [], "psa": [], "yts": []}
+        return {"pahe": [], "psa": [], "yts": [], "digimovie": [], "avamovie": []}
 
     def _save_state(self, state: dict[str, list[str]]):
         trimmed = {k: v[-200:] for k, v in state.items()}
@@ -109,7 +110,7 @@ class SiteMonitorService:
                     except Exception as e:
                         logging.warning(f"Initial navigation warning for {key}: {e}")
 
-                logging.info("Real Browser opened with 3 tabs (Pahe, PSA, YTS) for Captcha solving.")
+                logging.info("Real Browser opened with 5 tabs for Captcha solving.")
                 return True
             except Exception as e:
                 logging.warning(f"Playwright browser could not start: {e}")
@@ -117,7 +118,7 @@ class SiteMonitorService:
                 return False
 
     async def open_captcha_tabs_for_admin(self) -> str:
-        """باز کردن پنجره مرورگر روی دسکتاپ سرور برای حل کپچا (فقط هنگام کلیک دکمه توسط ادمین)"""
+        """باز کردن پنجره مرورگر روی دسکتاپ سرور برای حل کپچا"""
         self._pw_installed = importlib.util.find_spec("playwright") is not None
         ok = await self.ensure_real_browser_open()
         if ok and self._browser_context:
@@ -132,19 +133,18 @@ class SiteMonitorService:
                 except Exception:
                     pass
             return (
-                "✅ پنجره مرورگر روی دسکتاپ ویندوز سرور باز شد و هر ۳ تب (**Pahe.ink**، **PSA.wf** و **YTS.gg**) بارگذاری شدند.\n\n"
-                "🔓 اکنون می‌توانید روی سرور کپچای آن‌ها را حل کنید؛ کوکی‌های حل کپچا به صورت خودکار در پروفایل ربات ذخیره می‌شوند."
+                "✅ پنجره مرورگر روی دسکتاپ ویندوز سرور باز شد و تب‌های هر ۵ سایت بارگذاری شدند.\n\n"
+                "🔓 اکنون می‌توانید روی سرور کپچای آن‌ها را حل کنید؛ کوکی‌های حل کپچا ذخیره می‌شوند."
             )
 
-        # اگر playwright نصب نبود، فقط وقتی ادمین این دکمه را زد در مرورگر پیش‌فرض ویندوز باز کن
         for url in self.SITE_URLS.values():
             try:
                 webbrowser.open(url)
             except Exception:
                 pass
         return (
-            "🌐 صفحات هر ۳ سایت در مرورگر ویندوز سرور باز شدند.\n\n"
-            "💡 **نکته مهم:** برای اینکه ربات بتواند کوکیِ کپچای حل‌شده را مستقیماً از مرورگر بخواند، این ۲ دستور را در ترمینال سرور اجرا کنید:\n"
+            "🌐 صفحات سایت‌ها در مرورگر ویندوز سرور باز شدند.\n\n"
+            "💡 برای راه‌اندازی مرورگر خودکار پایتون، دستورات زیر را در ترمینال سرور اجرا کنید:\n"
             "`pip install playwright`\n"
             "`playwright install chromium`"
         )
@@ -161,7 +161,6 @@ class SiteMonitorService:
     async def _get_site_html(self, site_key: str, bot: Bot | None = None) -> str:
         url = self.SITE_URLS[site_key]
 
-        # ۱. استفاده از مرورگر واقعی در صورت نصب بودن Playwright
         if cfg.get("monitor", "use_real_browser", True) and self._pw_installed:
             ok = await self.ensure_real_browser_open()
             if ok and self._browser_context:
@@ -190,7 +189,6 @@ class SiteMonitorService:
 
                     return html
 
-        # ۲. فال‌بک به cloudscraper در پس‌زمینه (بدون باز کردن تب‌های مزاحم در مرورگر سیستم)
         def _sync_get():
             scraper = cloudscraper.create_scraper(
                 browser={"browser": "chrome", "platform": "windows", "desktop": True}
@@ -324,6 +322,102 @@ class SiteMonitorService:
             })
         return posts
 
+    @staticmethod
+    def _parse_digimovie_html(html: str) -> list[dict]:
+        base_url = "https://digimoviez53.top/"
+        soup = _make_soup(html)
+        posts = []
+        items = soup.select("div.holder_seactions div.item_def_loop")
+
+        for item in items[:12]:
+            title_el = item.select_one("div.title_h h2 a")
+            if not title_el:
+                continue
+            post_title = title_el.get_text(strip=True)
+            post_url = urljoin(base_url, title_el.get("href", "").strip())
+
+            img_el = item.select_one("div.cover img")
+            poster = urljoin(base_url, img_el.get("src") or img_el.get("data-src", "").strip()) if img_el else ""
+
+            # استخراج کیفیت یا آپدیت (مثل نسخه BluRay اضافه شد)
+            notif_el = item.select_one("div.notif_items div.item_notif")
+            notif_text = notif_el.get_text(strip=True) if notif_el else ""
+
+            plot_el = item.select_one("div.plot_text")
+            plot = plot_el.get_text(" ", strip=True) if plot_el else ""
+
+            unique_id = f"{post_url}|{notif_text}"
+            posts.append({
+                "id": unique_id,
+                "site": "Digimoviez",
+                "title": post_title,
+                "url": post_url,
+                "details": notif_text or "جدید",
+                "categories": "",
+                "poster": poster,
+                "summary": plot[:250]
+            })
+        return posts
+
+    @staticmethod
+    def _parse_avamovie_html(html: str) -> list[dict]:
+        base_url = "https://avasaraw.top/"
+        soup = _make_soup(html)
+        posts = []
+        # بررسی سریال‌های به‌روز‌شده و فیلم‌های جدید در آوامووی
+        series_items = soup.select("section.update-series div.item-series")
+        movie_items = soup.select("section.home-section.movie div.item-movie")
+
+        for item in series_items[:8]:
+            title_el = item.select_one("div.title")
+            link_el = item.select_one("a")
+            if not title_el or not link_el:
+                continue
+            post_title = title_el.get_text(strip=True)
+            post_url = urljoin(base_url, link_el.get("href", "").strip())
+
+            se_el = item.select_one("div.se")
+            update_txt = se_el.get_text(strip=True) if se_el else ""
+
+            plot_el = item.select_one("div.plot div.text")
+            plot = plot_el.get_text(" ", strip=True) if plot_el else ""
+
+            unique_id = f"{post_url}|{update_txt}"
+            posts.append({
+                "id": unique_id,
+                "site": "AvaMovie",
+                "title": f"سریال {post_title}",
+                "url": post_url,
+                "details": update_txt,
+                "categories": "سریال",
+                "poster": "",
+                "summary": plot[:250]
+            })
+
+        for item in movie_items[:6]:
+            title_el = item.select_one("div.bottom div.title_en")
+            link_el = item.select_one("a")
+            if not title_el or not link_el:
+                continue
+            post_title = title_el.get_text(strip=True)
+            post_url = urljoin(base_url, link_el.get("href", "").strip())
+
+            genre_el = item.select_one("div.hover div.genre")
+            genres = genre_el.get_text(strip=True) if genre_el else ""
+
+            unique_id = f"{post_url}|movie"
+            posts.append({
+                "id": unique_id,
+                "site": "AvaMovie",
+                "title": f"فیلم {post_title}",
+                "url": post_url,
+                "details": genres,
+                "categories": "فیلم",
+                "poster": "",
+                "summary": ""
+            })
+        return posts
+
     async def fetch_site_posts(self, site_key: str, bot: Bot | None = None) -> list[dict]:
         html = await self._get_site_html(site_key, bot=bot)
         if site_key == "pahe":
@@ -332,6 +426,10 @@ class SiteMonitorService:
             return self._parse_psa_html(html)
         elif site_key == "yts":
             return self._parse_yts_html(html)
+        elif site_key == "digimovie":
+            return self._parse_digimovie_html(html)
+        elif site_key == "avamovie":
+            return self._parse_avamovie_html(html)
         return []
 
     @staticmethod
@@ -391,9 +489,10 @@ class SiteMonitorService:
 
     async def check_all_sites_once(self, bot: Bot, notify_on_first_seed: bool = False) -> dict[str, int]:
         state = self._load_state()
-        new_counts = {"pahe": 0, "psa": 0, "yts": 0}
+        site_keys = ("pahe", "psa", "yts", "digimovie", "avamovie")
+        new_counts = {k: 0 for k in site_keys}
 
-        for site_key in ("pahe", "psa", "yts"):
+        for site_key in site_keys:
             try:
                 posts = await self.fetch_site_posts(site_key, bot=bot)
                 if not posts:
@@ -431,7 +530,7 @@ class SiteMonitorService:
     def start(self, bot: Bot):
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._loop(bot))
-            logging.info("Site Monitor started (checking pahe.ink, psa.wf, yts.gg every 5 minutes).")
+            logging.info("Site Monitor started (checking 5 sites every 5 minutes).")
 
     def stop(self):
         self._running = False

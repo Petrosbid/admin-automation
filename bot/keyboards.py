@@ -12,10 +12,6 @@ from services.cuteftp_service import CuteFTPService
 
 
 def smart_middle_truncate(text: str, max_len: int = 40) -> str:
-    """
-    برش هوشمند نام‌های طولانی از وسط، به طوری که هم ابتدای نام فیلم و هم انتهای آن
-    (کیفیت 1080p/720p، شماره قسمت، SoftSub/HardSub و پسوند فایل) کاملاً مشخص باشد.
-    """
     text = str(text).strip()
     if len(text) <= max_len:
         return text
@@ -29,7 +25,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="📡 مانیتورینگ خودکار (Pahe / PSA / YTS)",
+            text="📡 مانیتورینگ خودکار (۵ سایت فیلم و سریال)",
             callback_data="menu:monitor"
         )
     )
@@ -119,24 +115,19 @@ def monitor_menu_kb(is_enabled: bool) -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="🔄 بررسی فوری سایت‌ها",
+            text="🔄 بررسی فوری ۵ سایت",
             callback_data="mon:check_now"
         )
     )
 
     builder.row(
-        InlineKeyboardButton(
-            text="🎬 آخرین‌های Pahe",
-            callback_data="mon:latest:pahe"
-        ),
-        InlineKeyboardButton(
-            text="📺 آخرین‌های PSA",
-            callback_data="mon:latest:psa"
-        ),
-        InlineKeyboardButton(
-            text="🍿 آخرین‌های YTS",
-            callback_data="mon:latest:yts"
-        )
+        InlineKeyboardButton(text="Pahe", callback_data="mon:latest:pahe"),
+        InlineKeyboardButton(text="PSA", callback_data="mon:latest:psa"),
+        InlineKeyboardButton(text="YTS", callback_data="mon:latest:yts"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="Digimoviez", callback_data="mon:latest:digimovie"),
+        InlineKeyboardButton(text="AvaMovie", callback_data="mon:latest:avamovie"),
     )
 
     builder.row(
@@ -240,7 +231,7 @@ def cuteftp_destination_kb(active_gui_path: str = "/") -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text=f"📍 آپلود در مسیر فعلی باز در CuteFTP ({smart_middle_truncate(active_gui_path, 22)})",
+            text=f"📍 مسیر فعلی CuteFTP ({smart_middle_truncate(active_gui_path, 22)})",
             callback_data="cftp_dest:current"
         )
     )
@@ -256,13 +247,13 @@ def cuteftp_destination_kb(active_gui_path: str = "/") -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="✏️ تایپ دستی مسیر مقصد در هاست (مثلاً Series/Severance/S02)",
+            text="✏️ تایپ دستی مسیر مقصد در هاست (مثلاً /English/Series/Severance)",
             callback_data="cftp_dest:custom"
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="➕ افزودن مسیر جدید به لیست دکمه‌های ثابت",
+            text="➕ افزودن مسیر جدید به لیست ثابت",
             callback_data="cftp_dest:add_fav"
         )
     )
@@ -457,7 +448,6 @@ def subtitle_folder_browser_kb(
     selected_paths: set[str],
     is_root: bool
 ) -> InlineKeyboardMarkup:
-    """نمایش پوشه‌به‌پوشه برای انتخاب فایل‌های ویدئویی در بخش زیرنویس"""
     builder = InlineKeyboardBuilder()
 
     for idx, folder in enumerate(folders[:20]):
