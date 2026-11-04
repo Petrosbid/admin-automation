@@ -10,7 +10,7 @@ proxy:
 concurrency:
   handbrake_workers: 2
   mkvtoolnix_workers: 1
-  download_workers: 3
+  download_workers: 5
   upload_workers: 1
 
 monitor:

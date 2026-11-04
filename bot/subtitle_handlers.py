@@ -1,7 +1,7 @@
 import re
 from pathlib import Path
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, FSInputFile
+from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -15,8 +15,8 @@ from services.handbrake_service import HandBrakeService
 from bot.keyboards import (
     main_menu_kb, subtitle_folder_browser_kb, subtitle_source_kb,
     subtitle_file_found_kb, sync_options_kb, subtitle_mode_kb,
-    skip_or_cancel_kb, presets_kb, hardsub_destination_choice_kb,
-    hardsub_custom_folders_kb
+    skip_or_cancel_kb, presets_kb, output_destination_choice_kb,
+    output_dest_tree_browser_kb
 )
 
 router = Router()
@@ -31,8 +31,38 @@ class SubtitleStates(StatesGroup):
     waiting_custom_output_name = State()
     waiting_operation_mode = State()
     waiting_preset_choice = State()
-    waiting_hardsub_dest_choice = State()
-    waiting_hardsub_custom_folder_name = State()
+    waiting_output_dest_choice = State()
+    browsing_output_dest_dir = State()
+    waiting_new_dest_subfolder_name = State()
+
+
+def _natural_sort_key(path_str: str) -> list:
+    name = Path(path_str).name.lower()
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
+
+def _build_numbered_stem(pattern: str, orig_vid: Path, index_1based: int, total_count: int) -> str:
+    """
+    محاسبه نام فایل خروجی:
+    - اگر کاربر '1' بفرستد -> همان نام اصلی فیلم
+    - اگر چند فایل باشد و کاربر '*' بگذارد -> جایگزینی '*' با 01, 02, ...
+    - اگر چند فایل باشد و '*' نگذارد -> افزودن 01, 02, ... به انتهای نام قبل از پسوند
+    """
+    if pattern == "1" or not pattern:
+        return orig_vid.stem
+
+    clean_pat = re.sub(r'[<>:"/\\|?]', "", pattern).strip()
+    for ext in DownloaderService.VIDEO_EXTENSIONS:
+        if clean_pat.lower().endswith(ext):
+            clean_pat = clean_pat[:-len(ext)]
+            break
+
+    num_str = f"{index_1based:02d}"
+    if "*" in clean_pat:
+        return clean_pat.replace("*", num_str)
+    elif total_count > 1:
+        return f"{clean_pat}{num_str}"
+    return clean_pat
 
 
 def _resolve_media_dirs(video_path: Path, custom_base_stem: str) -> dict[str, Path]:
@@ -60,10 +90,6 @@ def _resolve_media_dirs(video_path: Path, custom_base_stem: str) -> dict[str, Pa
 
 
 def _get_sub_upload_dir_without_creating_3_folders(video_path: Path) -> Path:
-    """
-    پیدا کردن محل ذخیره موقت زیرنویس آپلود شده بدون اینکه قبل از انتخاب کاربر،
-    ۳ پوشه softsub/hardsub/sub را به اجبار بسازد.
-    """
     vid_parent = video_path.resolve().parent
     if (vid_parent / "sub").is_dir():
         return vid_parent / "sub"
@@ -106,28 +132,35 @@ def _format_current_filenames_prompt(data: dict) -> str:
             f"🔹 نام بدون پسوند:\n"
             f"`{v_file.stem}`\n\n"
         )
+        rule_hint = "✏️ **نام جدید فایل خروجی** را ارسال کنید (یا عدد `1` را بفرستید تا با همان نام فعلی ذخیره شود):"
     else:
-        joined = "\n".join([f"• `{v.name}`" for v in target_videos[:10]])
-        mono_info = f"📄 **نام فعلی فایل‌های انتخاب شده:**\n{joined}\n\n"
+        joined = "\n".join([f"`{i+1:02d}.` `{v.name}`" for i, v in enumerate(target_videos[:15])])
+        mono_info = f"📄 **نام فعلی فایل‌های انتخاب شده ({len(target_videos)} فایل):**\n{joined}\n\n"
+        rule_hint = (
+            "✏️ **الگوی نام جدید** را ارسال کنید (یا عدد `1` برای حفظ نام‌های فعلی):\n"
+            "• اگر در نام علامت `*` بگذارید (مثلاً `Series.S01E*.1080p`)، از `01` شماره‌گذاری می‌شود.\n"
+            "• اگر `*` نگذارید، شماره‌های `01`، `02` و... در انتهای نام قبل از فرمت فایل اضافه می‌شوند:"
+        )
 
-    return (
-        f"{mono_info}"
-        "✏️ **نام جدید فایل خروجی** را ارسال کنید (یا عدد `1` را بفرستید تا با همان نام فعلی فایل اصلی به همراه تگ سایت ذخیره شود):"
-    )
+    return f"{mono_info}{rule_hint}"
 
 
 async def _prompt_fa_subtitle_step(msg_or_call: Message | CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    first_video = Path(data["target_videos"][0])
+    sorted_targets = sorted(data["target_videos"], key=_natural_sort_key)
+    await state.update_data(target_videos=sorted_targets, custom_output_dir=None)
+
+    first_video = Path(sorted_targets[0])
     local_subs = _find_local_subtitles_for_video(first_video)
-    await state.update_data(local_sub_candidates=[str(p) for p in local_subs], custom_hardsub_dir=None)
+    await state.update_data(local_sub_candidates=[str(p) for p in local_subs])
     await state.set_state(SubtitleStates.waiting_fa_subtitle)
 
     text = (
-        f"🎬 **فیلم هدف:**\n`{first_video.name}`\n"
-        f"📂 تعداد زیرنویس‌های موجود در پوشه فیلم / `sub`: **`{len(local_subs)}` فایل**\n\n"
+        f"🎬 **تعداد فیلم‌های انتخاب شده:** `{len(sorted_targets)}` فایل\n"
+        f"📄 اولین فایل: `{first_video.name}`\n"
+        f"📂 زیرنویس‌های موجود در پوشه فیلم / `sub`: **`{len(local_subs)}` فایل**\n\n"
         "🇮🇷 **مرحله ۱: زیرنویس فارسی**\n"
-        "می‌توانید زیرنویس فارسی را از داخل پوشه انتخاب کنید، یا فایل جدیدی آپلود نمایید (یا اگر زیرنویس فارسی ندارید رد کنید):"
+        "می‌توانید زیرنویس فارسی را از داخل پوشه انتخاب کنید، یا فایل جدیدی آپلود نمایید (یا رد کنید):"
     )
     kb = subtitle_source_kb("fa", len(local_subs))
     if isinstance(msg_or_call, CallbackQuery):
@@ -156,7 +189,7 @@ async def _prompt_en_subtitle_step(msg_or_call: Message | CallbackQuery, state: 
         await msg_or_call.answer(text, reply_markup=kb, parse_mode="Markdown")
 
 
-# ==================== مرورگر پوشه‌به‌پوشه با نمایش نام کامل فایل‌ها ====================
+# ==================== مرورگر پوشه‌به‌پوشه برای انتخاب فیلم‌ها ====================
 async def _render_sub_folder_browser(call: CallbackQuery, state: FSMContext, browse_dir: Path):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     browse_dir = browse_dir.resolve()
@@ -210,7 +243,7 @@ async def _render_sub_folder_browser(call: CallbackQuery, state: FSMContext, bro
 async def cb_sub_to_files_start(call: CallbackQuery, state: FSMContext):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     await state.set_state(SubtitleStates.selecting_target_videos)
-    await state.update_data(selected_video_paths=[], operation_mode=None, custom_hardsub_dir=None)
+    await state.update_data(selected_video_paths=[], operation_mode=None, custom_output_dir=None)
     await _render_sub_folder_browser(call, state, workspace)
 
 
@@ -273,7 +306,7 @@ async def cb_subnav_select_all_in_folder(call: CallbackQuery, state: FSMContext)
 @router.callback_query(SubtitleStates.selecting_target_videos, F.data == "mvact:proceed")
 async def cb_proceed_to_subs(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    sel = sorted(data.get("selected_video_paths", []))
+    sel = sorted(data.get("selected_video_paths", []), key=_natural_sort_key)
     if not sel:
         return await call.answer("⚠️ حداقل یک فایل ویدئویی را از داخل پوشه‌ها تیک بزنید!", show_alert=True)
 
@@ -473,6 +506,22 @@ async def handle_manual_sync_ms(message: Message, state: FSMContext):
     )
 
 
+async def _ask_output_destination_choice(msg_or_call: Message | CallbackQuery, state: FSMContext):
+    """پرسیدن نحوه انتخاب پوشه مقصد برای سافت‌ساب و هاردساب"""
+    await state.set_state(SubtitleStates.waiting_output_dest_choice)
+    text = (
+        "📂 **انتخاب پوشه مقصد برای ذخیره خروجی:**\n\n"
+        "• **حالت پیش‌فرض:** ساخت خودکار پوشه‌های `softsub` و `hardsub`.\n"
+        "• **کنار خود فیلم:** ذخیره مستقیم در همان پوشه فعلی فیلم (بدون ساخت ۳ پوشه).\n"
+        "• **انتخاب پوشه مقصد دلخواه:** مرور تمام پوشه‌ها و زیرپوشه‌ها یا ساخت پوشه جدید در هر مسیر دلخواه (بدون ساخت ۳ پوشه):"
+    )
+    kb = output_destination_choice_kb()
+    if isinstance(msg_or_call, CallbackQuery):
+        await msg_or_call.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    else:
+        await msg_or_call.answer(text, reply_markup=kb, parse_mode="Markdown")
+
+
 @router.message(SubtitleStates.waiting_custom_output_name)
 async def handle_custom_output_name(message: Message, state: FSMContext):
     await state.update_data(custom_output_name=message.text.strip())
@@ -488,7 +537,8 @@ async def handle_custom_output_name(message: Message, state: FSMContext):
                 parse_mode="Markdown"
             )
         else:
-            return await _schedule_subtitle_jobs_from_msg(message, state, chosen_preset=None)
+            await state.update_data(chosen_preset=None)
+            return await _ask_output_destination_choice(message, state)
 
     await state.set_state(SubtitleStates.waiting_operation_mode)
     brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
@@ -513,102 +563,137 @@ async def cb_select_operation_mode(call: CallbackQuery, state: FSMContext):
             parse_mode="Markdown"
         )
 
-    await _schedule_subtitle_jobs(call, state, chosen_preset=None)
+    await state.update_data(chosen_preset=None)
+    await _ask_output_destination_choice(call, state)
 
 
-# ==================== انتخاب مقصد ذخیره هاردساب (پیش‌فرض با ۳ پوشه یا مقصد دلخواه بدون ۳ پوشه) ====================
 @router.callback_query(SubtitleStates.waiting_preset_choice, F.data.startswith("preset:"))
 async def cb_select_preset_for_jobs(call: CallbackQuery, state: FSMContext):
     idx = int(call.data.split(":")[1])
     presets = HandBrakeService.list_available_presets()
     chosen_preset = presets[idx]
     await state.update_data(chosen_preset=chosen_preset)
+    await _ask_output_destination_choice(call, state)
 
+
+# ==================== مرورگر درختی پوشه‌ها و زیرپوشه‌ها + ساخت پوشه جدید برای مقصد خروجی ====================
+async def _render_output_dest_browser(call_or_msg: CallbackQuery | Message, state: FSMContext, current_dir: Path):
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    current_dir = current_dir.resolve()
+    current_dir.mkdir(parents=True, exist_ok=True)
+
+    subfolders = sorted(
+        [p for p in current_dir.iterdir() if p.is_dir() and not p.name.startswith("_") and p.name != "browser_profile"],
+        key=lambda x: x.name.lower()
+    )
+    await state.set_state(SubtitleStates.browsing_output_dest_dir)
+    await state.update_data(
+        dest_browser_curr_dir=str(current_dir),
+        dest_browser_subfolders=[str(f.resolve()) for f in subfolders]
+    )
+
+    is_root = (current_dir == workspace)
+    folder_lines = [f"`[{i+1}]` 📁 `{f.name}`" for i, f in enumerate(subfolders[:22])]
+    folders_block = "\n".join(folder_lines) if folder_lines else "_(زیرپوشه‌ای در این مسیر وجود ندارد)_"
+
+    text = (
+        "📁 **انتخاب پوشه مقصد خروجی (مرورگر پوشه و زیرپوشه)**\n\n"
+        f"📍 **مسیر فعلی باز شده:**\n`{current_dir}`\n\n"
+        f"📂 **زیرپوشه‌های موجود در این مسیر:**\n{folders_block}\n\n"
+        "• برای ذخیره در همین مسیر فعلی، دکمه **«✅ ذخیره در همین پوشه»** را بزنید.\n"
+        "• برای رفتن به زیرپوشه‌های بعدی، روی نام زیرپوشه کلیک کنید و یا در همینجا پوشه جدید بسازید:"
+    )
+    kb = output_dest_tree_browser_kb(subfolders, current_dir, is_root)
+
+    if isinstance(call_or_msg, CallbackQuery):
+        await call_or_msg.message.edit_text(text[:4000], reply_markup=kb, parse_mode="Markdown")
+    else:
+        await call_or_msg.answer(text[:4000], reply_markup=kb, parse_mode="Markdown")
+
+
+@router.callback_query(SubtitleStates.waiting_output_dest_choice, F.data == "outdest:default")
+async def cb_outdest_default(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    if data.get("operation_mode") == "hardsub":
-        await state.set_state(SubtitleStates.waiting_hardsub_dest_choice)
-        return await call.message.edit_text(
-            f"⚙️ پریست `{chosen_preset['name']}` انتخاب شد.\n\n"
-            "📂 **فایل خروجی هاردساب در چه مقصدی ذخیره شود؟**\n"
-            "• اگر **حالت پیش‌فرض** را بزنید، ۳ پوشه (`softsub`, `hardsub`, `sub`) ساخته شده و فایل در `hardsub` قرار می‌گیرد.\n"
-            "• اگر **مقصد دلخواه** یا **کنار خود فیلم** را انتخاب کنید، ۳ پوشه ساخته نمی‌شود و فایل مستقیماً در همان مقصد ذخیره می‌گردد:",
-            reply_markup=hardsub_destination_choice_kb(),
-            parse_mode="Markdown"
-        )
-
-    # در حالت پکیج کامل (both)، به صورت استاندارد در ۳ پوشه ذخیره کن
-    await _schedule_subtitle_jobs(call, state, chosen_preset=chosen_preset)
+    await state.update_data(custom_output_dir=None)
+    await _schedule_subtitle_jobs(call, state, chosen_preset=data.get("chosen_preset"))
 
 
-@router.callback_query(SubtitleStates.waiting_hardsub_dest_choice, F.data == "hbdest:default")
-async def cb_hbdest_default(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    await state.update_data(custom_hardsub_dir=None)
-    await _schedule_subtitle_jobs(call, state, chosen_preset=data["chosen_preset"])
-
-
-@router.callback_query(SubtitleStates.waiting_hardsub_dest_choice, F.data == "hbdest:same_dir")
-async def cb_hbdest_same_dir(call: CallbackQuery, state: FSMContext):
+@router.callback_query(SubtitleStates.waiting_output_dest_choice, F.data == "outdest:same_dir")
+async def cb_outdest_same_dir(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     first_vid = Path(data["target_videos"][0]).resolve()
-    await state.update_data(custom_hardsub_dir=str(first_vid.parent))
-    await _schedule_subtitle_jobs(call, state, chosen_preset=data["chosen_preset"])
+    await state.update_data(custom_output_dir=str(first_vid.parent))
+    await _schedule_subtitle_jobs(call, state, chosen_preset=data.get("chosen_preset"))
 
 
-@router.callback_query(SubtitleStates.waiting_hardsub_dest_choice, F.data == "hbdest:custom_pick")
-async def cb_hbdest_custom_pick(call: CallbackQuery, state: FSMContext):
-    folders = DownloaderService.list_workspace_folders()
-    await state.update_data(hb_dest_folders=[str(f.resolve()) for f in folders])
-    folder_lines = [f"`[{i+1}]` 📁 `{f.name}`" for i, f in enumerate(folders[:20])]
-    list_text = "\n".join(folder_lines) if folder_lines else "_(پوشه‌ای در Workspace نیست)_"
+@router.callback_query(SubtitleStates.waiting_output_dest_choice, F.data == "outdest:browse")
+async def cb_outdest_start_browse(call: CallbackQuery, state: FSMContext):
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    await _render_output_dest_browser(call, state, workspace)
 
+
+@router.callback_query(SubtitleStates.browsing_output_dest_dir, F.data.startswith("destnav:open:"))
+async def cb_destnav_open_subfolder(call: CallbackQuery, state: FSMContext):
+    idx = int(call.data.split(":")[2])
+    data = await state.get_data()
+    subfolders = data.get("dest_browser_subfolders", [])
+    if idx < len(subfolders):
+        await _render_output_dest_browser(call, state, Path(subfolders[idx]))
+
+
+@router.callback_query(SubtitleStates.browsing_output_dest_dir, F.data == "destnav:up")
+async def cb_destnav_up(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    curr = Path(data.get("dest_browser_curr_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    parent = curr.parent if curr != workspace else workspace
+    await _render_output_dest_browser(call, state, parent)
+
+
+@router.callback_query(SubtitleStates.browsing_output_dest_dir, F.data == "destnav:select_here")
+async def cb_destnav_select_here(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    curr_dir = data.get("dest_browser_curr_dir", cfg.get("paths", "workspace_dir"))
+    await state.update_data(custom_output_dir=curr_dir)
+    await _schedule_subtitle_jobs(call, state, chosen_preset=data.get("chosen_preset"))
+
+
+@router.callback_query(SubtitleStates.browsing_output_dest_dir, F.data == "destnav:mkdir_here")
+async def cb_destnav_mkdir_here(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    curr_dir = data.get("dest_browser_curr_dir", cfg.get("paths", "workspace_dir"))
+    await state.set_state(SubtitleStates.waiting_new_dest_subfolder_name)
+
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔙 بازگشت به مرورگر پوشه", callback_data="outdest:browse_resume"))
     await call.message.edit_text(
-        "📁 **انتخاب پوشه مقصد برای ذخیره مستقیم هاردساب (بدون ساخت ۳ پوشه):**\n\n"
-        f"{list_text}\n\n"
-        "یکی از پوشه‌های زیر را انتخاب کنید یا دکمه تایپ نام پوشه را بزنید:",
-        reply_markup=hardsub_custom_folders_kb(folders),
+        f"➕ **ساخت پوشه جدید در مسیر:**\n`{curr_dir}`\n\n"
+        "✏️ لطفاً **نام پوشه جدید** را ارسال کنید (این پوشه بدون ۳ پوشه اضافی ساخته می‌شود و مستقیماً وارد آن می‌شوید):",
+        reply_markup=kb.as_markup(),
         parse_mode="Markdown"
     )
 
 
-@router.callback_query(SubtitleStates.waiting_hardsub_dest_choice, F.data.startswith("hbdest_dir:"))
-async def cb_hbdest_dir_selected(call: CallbackQuery, state: FSMContext):
-    idx = int(call.data.split(":")[1])
+@router.callback_query(F.data == "outdest:browse_resume")
+async def cb_outdest_browse_resume(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    folders = data.get("hb_dest_folders", [])
-    chosen_dir = folders[idx]
-    await state.update_data(custom_hardsub_dir=chosen_dir)
-    await _schedule_subtitle_jobs(call, state, chosen_preset=data["chosen_preset"])
+    curr_dir = Path(data.get("dest_browser_curr_dir", cfg.get("paths", "workspace_dir")))
+    await _render_output_dest_browser(call, state, curr_dir)
 
 
-@router.callback_query(SubtitleStates.waiting_hardsub_dest_choice, F.data == "hbdest:custom_type")
-async def cb_hbdest_custom_type(call: CallbackQuery, state: FSMContext):
-    await state.set_state(SubtitleStates.waiting_hardsub_custom_folder_name)
-    await call.message.edit_text(
-        "✏️ **نام پوشه در Workspace** (مثلاً `MyOutput`) یا **مسیر کامل پوشه در سرور** (مثلاً `C:\\MediaBot\\workspace\\Series\\S01`) را ارسال کنید\n"
-        "*(فایل هاردساب بدون ساخت ۳ پوشه مستقیماً داخل این مسیر ذخیره می‌شود)*:",
-        parse_mode="Markdown"
-    )
+@router.message(SubtitleStates.waiting_new_dest_subfolder_name)
+async def handle_new_dest_subfolder_name(message: Message, state: FSMContext):
+    raw_name = re.sub(r'[<>:"/\\|?*]', "", (message.text or "").strip()).strip()
+    if not raw_name:
+        return await message.answer("⚠️ نام پوشه معتبر نیست. لطفاً دوباره ارسال کنید:")
 
-
-@router.message(SubtitleStates.waiting_hardsub_custom_folder_name)
-async def handle_hbdest_custom_folder_name(message: Message, state: FSMContext):
-    raw_input = (message.text or "").strip()
-    if not raw_input:
-        return await message.answer("⚠️ لطفاً یک نام یا مسیر معتبر وارد کنید:")
-
-    p = Path(raw_input)
-    if not p.is_absolute():
-        workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-        safe_rel = re.sub(r'[<>:"|?*]', "", raw_input).strip()
-        target_dir = workspace / safe_rel
-    else:
-        target_dir = p
-
-    target_dir.mkdir(parents=True, exist_ok=True)
     data = await state.get_data()
-    await state.update_data(custom_hardsub_dir=str(target_dir.resolve()))
-    await _schedule_subtitle_jobs_from_msg(message, state, chosen_preset=data["chosen_preset"])
+    curr_dir = Path(data.get("dest_browser_curr_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    new_dir = curr_dir / raw_name
+    new_dir.mkdir(parents=True, exist_ok=True)
+
+    await message.answer(f"✅ پوشه `{new_dir.name}` ساخته شد و وارد آن شدید!", parse_mode="Markdown")
+    await _render_output_dest_browser(message, state, new_dir)
 
 
 async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> list[str]:
@@ -619,22 +704,22 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
     mode = data.get("operation_mode", "softsub")
     sync_mode = data.get("sync_mode", "none")
     sync_offset_ms = int(data.get("sync_offset_ms", 0))
-    custom_hardsub_dir = data.get("custom_hardsub_dir")
+    custom_output_dir = data.get("custom_output_dir")
     site_tag = cfg.get("branding", "site_tag", "EmpireBestTv")
     brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
 
     scheduled_ids = []
+    total_vids = len(target_videos)
 
-    for idx, vid in enumerate(target_videos):
-        base_stem = vid.stem if custom_name == "1" else (
-            f"{Path(custom_name).stem}_{idx+1}" if len(target_videos) > 1 else Path(custom_name).stem
-        )
+    for idx, vid in enumerate(target_videos, start=1):
+        base_stem = _build_numbered_stem(custom_name, vid, idx, total_vids)
 
-        # اگر کاربر برای هاردساب مقصد دلخواه تعیین کرده، ۳ پوشه را نساز!
-        if mode == "hardsub" and custom_hardsub_dir:
-            hard_dir = Path(custom_hardsub_dir)
-            hard_dir.mkdir(parents=True, exist_ok=True)
-            soft_dir = vid.parent
+        # اگر کاربر پوشه مقصد مشخص کرده باشد، دیگر ۳ پوشه (softsub/hardsub/sub) ساخته نمی‌شود
+        if custom_output_dir:
+            out_dir = Path(custom_output_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            soft_dir = out_dir
+            hard_dir = out_dir
         else:
             dirs = _resolve_media_dirs(vid, base_stem)
             soft_dir = dirs["softsub"]
@@ -655,7 +740,7 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
                 sync_mode,
                 sync_offset_ms
             )
-            scheduled_ids.append(f"📎 SoftSub (`{soft_dir.name}/`): `{t_soft.task_id}`")
+            scheduled_ids.append(f"📎 SoftSub (`{soft_out.name}` در `{soft_dir.name}/`): `{t_soft.task_id}`")
 
         if mode in ("hardsub", "both") and chosen_preset:
             hard_out = hard_dir / f"{base_stem}.HardSub.{site_tag}.mp4"
@@ -674,7 +759,7 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
                 sync_mode,
                 sync_offset_ms
             )
-            scheduled_ids.append(f"🔥 HardSub (`{hard_dir}`): `{t_hard.task_id}`")
+            scheduled_ids.append(f"🔥 HardSub (`{hard_out.name}` در `{hard_dir.name}/`): `{t_hard.task_id}`")
 
     return scheduled_ids
 
@@ -709,7 +794,8 @@ async def _schedule_subtitle_jobs_from_msg(message: Message, state: FSMContext, 
 @router.callback_query(F.data == "vact:extract_sub")
 async def cb_extract_sub_list(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    video_path = Path(data["selected_video"])
+    sel_files = data.get("fm_selected_files", [])
+    video_path = Path(sel_files[0]) if sel_files else Path(data["selected_video"])
     tracks = await MKVService.list_subtitle_tracks(video_path)
     if not tracks:
         return await call.answer("❌ هیچ زیرنویسی داخل این فایل پیدا نشد!", show_alert=True)
@@ -728,7 +814,8 @@ async def cb_extract_sub_list(call: CallbackQuery, state: FSMContext):
 async def cb_extract_sub_run(call: CallbackQuery, state: FSMContext):
     track_id = int(call.data.split(":")[1])
     data = await state.get_data()
-    video_path = Path(data["selected_video"])
+    sel_files = data.get("fm_selected_files", [])
+    video_path = Path(sel_files[0]) if sel_files else Path(data["selected_video"])
     out_srt = video_path.with_name(f"{video_path.stem}_track{track_id}.srt")
 
     await call.message.edit_text("⏳ در حال استخراج زیرنویس با `mkvextract`...", parse_mode="Markdown")
@@ -740,20 +827,28 @@ async def cb_extract_sub_run(call: CallbackQuery, state: FSMContext):
     )
 
 
-@router.callback_query(F.data.in_({"vact:softsub", "vact:hardsub", "vact:full_auto"}))
-async def cb_single_video_sub_flow(call: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.in_({"vact:softsub", "vact:hardsub", "vact:full_auto", "fact:batch_sub"}))
+async def cb_single_or_batch_video_sub_flow(call: CallbackQuery, state: FSMContext):
     mode_map = {
         "vact:softsub": "softsub",
         "vact:hardsub": "hardsub",
-        "vact:full_auto": "both"
+        "vact:full_auto": "both",
+        "fact:batch_sub": None,
     }
     data = await state.get_data()
-    vid = data["selected_video"]
+    if call.data == "fact:batch_sub":
+        sel_files = sorted(data.get("fm_selected_files", []), key=_natural_sort_key)
+        videos = [p for p in sel_files if Path(p).suffix.lower() in DownloaderService.VIDEO_EXTENSIONS]
+        if not videos:
+            return await call.answer("⚠️ هیچ فایل ویدئویی در بین فایل‌های انتخاب‌شده وجود ندارد!", show_alert=True)
+    else:
+        videos = [data["selected_video"]]
+
     await state.update_data(
-        target_videos=[vid],
+        target_videos=videos,
         operation_mode=mode_map[call.data],
         fa_sub_path=None,
         en_sub_path=None,
-        custom_hardsub_dir=None
+        custom_output_dir=None
     )
     await _prompt_fa_subtitle_step(call, state)

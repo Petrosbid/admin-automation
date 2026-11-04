@@ -16,8 +16,7 @@ from services.cuteftp_service import CuteFTPService
 from services.monitor_service import monitor_service
 from bot.keyboards import (
     main_menu_kb, monitor_menu_kb, folder_structure_choice_kb,
-    target_folders_kb, file_browser_kb, video_actions_kb,
-    cuteftp_destination_kb
+    target_folders_kb, file_browser_kb, cuteftp_destination_kb
 )
 
 router = Router()
@@ -41,13 +40,45 @@ class MainStates(StatesGroup):
     waiting_target_folder_sub_file = State()
     waiting_custom_cuteftp_path = State()
     waiting_new_fav_cuteftp_path = State()
-    waiting_rename_file = State()
+    waiting_batch_rename_pattern = State()
     waiting_rename_dir = State()
     waiting_new_config_value = State()
 
 
 def is_admin(user_id: int) -> bool:
     return user_id in cfg.get("telegram", "admin_ids", [])
+
+
+def _natural_sort_key(path_str: str) -> list:
+    name = Path(path_str).name.lower()
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
+
+def _build_renamed_filename(pattern: str, orig_path: Path, index_1based: int, total_count: int) -> str:
+    """
+    قانون تغییر نام تکی و گروهی فایل‌ها:
+    - اگر کاربر در الگو علامت '*' گذاشته باشد -> جایگزینی '*' با 01, 02, 03, ...
+    - اگر چند فایل باشد و کاربر '*' نگذارد -> قرار دادن 01, 02, 03 در انتهای نام دقیقاً قبل از پسوند فایل
+    - حفظ خودکار پسوند اصلی فایل
+    """
+    orig_ext = orig_path.suffix  # مثلاً .mkv یا .srt
+    clean_pat = re.sub(r'[<>:"/\\|?]', "", pattern).strip()  # حفظ کاراکتر '*'
+
+    if orig_ext and clean_pat.lower().endswith(orig_ext.lower()):
+        stem_pat = clean_pat[:-len(orig_ext)]
+    else:
+        stem_pat = clean_pat
+
+    num_str = f"{index_1based:02d}"
+
+    if "*" in stem_pat:
+        final_stem = stem_pat.replace("*", num_str)
+    elif total_count > 1:
+        final_stem = f"{stem_pat}{num_str}"
+    else:
+        final_stem = stem_pat
+
+    return f"{final_stem}{orig_ext}"
 
 
 @router.message(CommandStart())
@@ -481,7 +512,7 @@ async def handle_target_folder_sub_file(message: Message, state: FSMContext):
     )
 
 
-# ==================== ۵. فایل‌منیجر سرور + حذف و تغییر نام فایل و پوشه ====================
+# ==================== ۵. فایل‌منیجر سرور با قابلیت انتخاب چندفایلی و تغییر نام گروهی ====================
 async def render_directory(call_or_msg: CallbackQuery | Message, state: FSMContext, current_dir: Path):
     root_dir = Path(cfg.get("paths", "workspace_dir")).resolve()
     current_dir = current_dir.resolve()
@@ -490,9 +521,15 @@ async def render_directory(call_or_msg: CallbackQuery | Message, state: FSMConte
         [p for p in current_dir.iterdir() if p.name != "browser_profile" and not p.name.startswith("_")],
         key=lambda p: (not p.is_dir(), p.name.lower())
     )
+
+    data = await state.get_data()
+    # حذف فایل‌هایی که دیگر وجود ندارند از لیست انتخاب‌شده‌ها
+    selected_files = {p for p in data.get("fm_selected_files", []) if Path(p).exists()}
+
     await state.update_data(
         current_dir=str(current_dir),
-        dir_items=[str(p) for p in items]
+        dir_items=[str(p.resolve()) for p in items],
+        fm_selected_files=list(selected_files)
     )
     is_root = (current_dir == root_dir)
 
@@ -501,21 +538,27 @@ async def render_directory(call_or_msg: CallbackQuery | Message, state: FSMConte
         if p.is_dir():
             item_lines.append(f"`[{idx+1}]` 📁 `{p.name}`")
         else:
+            is_sel = str(p.resolve()) in selected_files
+            mark = "✅ " if is_sel else ""
             size_mb = p.stat().st_size / (1024 * 1024)
             icon = "🎬" if p.suffix.lower() in [".mkv", ".mp4", ".avi", ".ts"] else "📄"
-            item_lines.append(f"`[{idx+1}]` {icon} `{p.name}` _({size_mb:.1f} MB)_")
+            item_lines.append(f"{mark}`[{idx+1}]` {icon} `{p.name}` _({size_mb:.1f} MB)_")
 
     listing_block = "\n".join(item_lines) if item_lines else "_(این پوشه خالی است)_"
 
     msg_text = (
-        f"📂 **مسیر فعلی:**\n`{current_dir}`\n\n"
-        f"📋 **لیست کامل محتویات این پوشه:**\n{listing_block}\n\n"
-        "روی شماره آیتم مورد نظر در دکمه‌های زیر کلیک کنید:"
+        f"📂 **مسیر فعلی:**\n`{current_dir}`\n"
+        f"✅ **فایل‌های انتخاب‌شده:** `{len(selected_files)}` فایل\n\n"
+        f"📋 **لیست کامل محتویات (برای کپی نام لمس کنید):**\n{listing_block}\n\n"
+        "💡 _روی پوشه‌ها کلیک کنید تا باز شوند؛ روی فایل‌ها کلیک کنید تا تیک (`✅`) بخورند:_"
     )
 
-    kb = file_browser_kb(items, is_root)
+    kb = file_browser_kb(items, is_root, selected_files)
     if isinstance(call_or_msg, CallbackQuery):
-        await call_or_msg.message.edit_text(msg_text[:4000], reply_markup=kb, parse_mode="Markdown")
+        try:
+            await call_or_msg.message.edit_text(msg_text[:4000], reply_markup=kb, parse_mode="Markdown")
+        except Exception:
+            await call_or_msg.answer()
     else:
         await call_or_msg.answer(msg_text[:4000], reply_markup=kb, parse_mode="Markdown")
 
@@ -532,29 +575,201 @@ async def cb_file_mgr(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "fnav:up")
 async def cb_file_up(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
-    await render_directory(call, state, curr.parent)
+    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    root_dir = Path(cfg.get("paths", "workspace_dir")).resolve()
+    parent = curr.parent if curr != root_dir else root_dir
+    await render_directory(call, state, parent)
 
 
 @router.callback_query(F.data.startswith("fitem:"))
 async def cb_file_item(call: CallbackQuery, state: FSMContext):
     idx = int(call.data.split(":")[1])
     data = await state.get_data()
-    selected_path = Path(data["dir_items"][idx])
+    dir_items = data.get("dir_items", [])
+    if idx >= len(dir_items):
+        return await call.answer("⚠️ آیتم یافت نشد.")
 
+    selected_path = Path(dir_items[idx]).resolve()
+
+    # اگر پوشه است، وارد پوشه شو
     if selected_path.is_dir():
         return await render_directory(call, state, selected_path)
 
-    await state.update_data(selected_video=str(selected_path), target_videos=[str(selected_path)])
-    size_mb = selected_path.stat().st_size / (1024 * 1024)
-    is_vid = selected_path.suffix.lower() in DownloaderService.VIDEO_EXTENSIONS
-    await call.message.edit_text(
-        f"📄 **فایل انتخاب شده (نام کامل):**\n`{selected_path.name}`\n\n"
-        f"📂 پوشه:\n`{selected_path.parent}`\n"
-        f"📦 حجم: `{size_mb:.2f} MB`\n\nچه عملیاتی انجام شود؟",
-        reply_markup=video_actions_kb(is_video=is_vid),
+    # اگر فایل است، وضعیت تیک خوردن (انتخاب چندتایی) آن را تغییر بده
+    selected_files = set(data.get("fm_selected_files", []))
+    f_str = str(selected_path)
+    if f_str in selected_files:
+        selected_files.remove(f_str)
+    else:
+        selected_files.add(f_str)
+
+    await state.update_data(
+        fm_selected_files=list(selected_files),
+        selected_video=f_str,
+        target_videos=sorted(list(selected_files), key=_natural_sort_key)
+    )
+    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
+    await render_directory(call, state, curr)
+
+
+@router.callback_query(F.data == "fact:select_all_files")
+async def cb_select_all_files_in_dir(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    dir_items = [Path(p).resolve() for p in data.get("dir_items", [])]
+    files_in_dir = [str(p) for p in dir_items if p.is_file()]
+    selected_files = set(data.get("fm_selected_files", []))
+
+    if files_in_dir and all(f in selected_files for f in files_in_dir):
+        for f in files_in_dir:
+            selected_files.discard(f)
+    else:
+        for f in files_in_dir:
+            selected_files.add(f)
+
+    await state.update_data(fm_selected_files=list(selected_files))
+    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
+    await render_directory(call, state, curr)
+
+
+@router.callback_query(F.data == "fact:clear_selection")
+async def cb_clear_file_selection(call: CallbackQuery, state: FSMContext):
+    await state.update_data(fm_selected_files=[])
+    data = await state.get_data()
+    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
+    await render_directory(call, state, curr)
+
+
+# ==================== تغییر نام تکی و گروهی فایل‌ها (پشتیبانی از * و شماره‌گذاری 01) ====================
+@router.callback_query(F.data.in_({"fact:batch_rename", "vact:rename_file"}))
+async def cb_batch_rename_start(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    sel_files = sorted(data.get("fm_selected_files", []), key=_natural_sort_key)
+    if not sel_files and data.get("selected_video"):
+        sel_files = [data["selected_video"]]
+
+    if not sel_files:
+        return await call.answer("⚠️ هیچ فایلی انتخاب نشده است!", show_alert=True)
+
+    await state.update_data(rename_targets=sel_files)
+    await state.set_state(MainStates.waiting_batch_rename_pattern)
+
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔙 انصراف و بازگشت", callback_data="menu:file_mgr"))
+
+    if len(sel_files) == 1:
+        f_obj = Path(sel_files[0])
+        prompt_text = (
+            "✏️ **تغییر نام فایل**\n\n"
+            f"📄 نام فعلی کامل (برای کپی لمس کنید):\n`{f_obj.name}`\n"
+            f"🔹 نام بدون پسوند:\n`{f_obj.stem}`\n\n"
+            "لطفاً **نام جدید فایل** را ارسال کنید (پسوند فایل به صورت خودکار حفظ می‌شود):"
+        )
+    else:
+        file_list_str = "\n".join([f"`{i+1:02d}.` `{Path(p).name}`" for i, p in enumerate(sel_files[:15])])
+        first_stem = Path(sel_files[0]).stem
+        prompt_text = (
+            f"✏️ **تغییر نام گروهی (`{len(sel_files)}` فایل انتخاب شده)**\n\n"
+            f"📋 **ترتیب فایل‌ها برای شماره‌گذاری:**\n{file_list_str}\n\n"
+            f"🔹 نمونه نام اولین فایل:\n`{first_stem}`\n\n"
+            "💡 **راهنمای الگوی نام‌گذاری:**\n"
+            "1️⃣ **با علامت `*`:** هر کجای نام که علامت `*` بگذارید، به ترتیب با `01`، `02`، `03` و... جایگزین می‌شود.\n"
+            "   مثال: `Severance.S02E*.1080p` ⬅️ `Severance.S02E01.1080p.mkv`\n"
+            "2️⃣ **بدون علامت `*`:** اگر `*` نگذارید، شماره‌های `01`، `02` و... به صورت خودکار در انتهای نام (قبل از پسوند فایل) اضافه می‌شوند.\n\n"
+            "لطفاً نام یا الگوی جدید را ارسال کنید:"
+        )
+
+    await call.message.edit_text(prompt_text[:4000], reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@router.message(MainStates.waiting_batch_rename_pattern)
+async def handle_batch_rename_submit(message: Message, state: FSMContext):
+    pattern = (message.text or "").strip()
+    if not pattern:
+        return await message.answer("⚠️ لطفاً یک نام معتبر ارسال کنید:")
+
+    data = await state.get_data()
+    targets = [Path(p).resolve() for p in data.get("rename_targets", []) if Path(p).exists()]
+    if not targets:
+        await state.set_state(None)
+        return await message.answer("⚠️ فایل‌های انتخاب شده یافت نشدند.")
+
+    total = len(targets)
+    renamed_Preview = []
+    new_selected = []
+
+    # مرحله ۱: تغییر نام به نام موقت برای جلوگیری از تداخل احتمالی نام‌ها
+    temp_pairs: list[tuple[Path, Path]] = []
+    try:
+        for idx, old_p in enumerate(targets, start=1):
+            new_filename = _build_renamed_filename(pattern, old_p, idx, total)
+            final_p = old_p.with_name(new_filename)
+            temp_p = old_p.with_name(f"_ren_tmp_{idx}_{new_filename}")
+            old_p.rename(temp_p)
+            temp_pairs.append((temp_p, final_p))
+
+        for temp_p, final_p in temp_pairs:
+            temp_p.rename(final_p)
+            new_selected.append(str(final_p.resolve()))
+            renamed_Preview.append(f"✅ `{final_p.name}`")
+    except Exception as e:
+        return await message.answer(f"❌ خطا در تغییر نام:\n`{e}`", parse_mode="Markdown")
+
+    await state.set_state(None)
+    await state.update_data(fm_selected_files=new_selected)
+
+    preview_block = "\n".join(renamed_Preview[:15])
+    await message.answer(
+        f"🎉 **تغییر نام `{len(new_selected)}` فایل با موفقیت انجام شد!**\n\n{preview_block}",
         parse_mode="Markdown"
     )
+    curr_dir = Path(data.get("current_dir", targets[0].parent))
+    await render_directory(message, state, curr_dir)
+
+
+# ==================== حذف تکی و گروهی فایل‌ها در فایل‌منیجر ====================
+@router.callback_query(F.data.in_({"fact:batch_delete", "vact:delete_file"}))
+async def cb_batch_delete_ask(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    sel_files = sorted(data.get("fm_selected_files", []), key=_natural_sort_key)
+    if not sel_files and data.get("selected_video"):
+        sel_files = [data["selected_video"]]
+
+    if not sel_files:
+        return await call.answer("⚠️ هیچ فایلی انتخاب نشده است!", show_alert=True)
+
+    await state.update_data(delete_targets=sel_files)
+    file_lines = "\n".join([f"• `{Path(p).name}`" for p in sel_files[:15]])
+
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text=f"✅ بله، حذف شود ({len(sel_files)} فایل)", callback_data="fact:confirm_batch_del"),
+        InlineKeyboardButton(text="❌ انصراف", callback_data="menu:file_mgr"),
+    )
+    await call.message.edit_text(
+        f"⚠️ **آیا از حذف دائمی `{len(sel_files)}` فایل زیر اطمینان دارید؟**\n\n{file_lines}",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "fact:confirm_batch_del")
+async def cb_batch_delete_confirm(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    targets = [Path(p) for p in data.get("delete_targets", [])]
+    deleted_count = 0
+
+    for p in targets:
+        try:
+            if p.is_file():
+                p.unlink(missing_ok=True)
+                deleted_count += 1
+        except Exception:
+            pass
+
+    await state.update_data(fm_selected_files=[], delete_targets=[])
+    await call.answer(f"🗑 تعداد {deleted_count} فایل با موفقیت حذف شد!", show_alert=True)
+    curr_dir = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
+    await render_directory(call, state, curr_dir)
 
 
 # ==================== تغییر نام و حذف پوشه در فایل‌منیجر ====================
@@ -594,7 +809,7 @@ async def handle_rename_dir_submit(message: Message, state: FSMContext):
         return await message.answer(f"❌ خطا در تغییر نام پوشه:\n`{e}`", parse_mode="Markdown")
 
     await state.set_state(None)
-    await state.update_data(current_dir=str(new_dir))
+    await state.update_data(current_dir=str(new_dir), fm_selected_files=[])
     await message.answer(f"✅ نام پوشه با موفقیت به `{new_dir.name}` تغییر یافت!", parse_mode="Markdown")
     await render_directory(message, state, new_dir)
 
@@ -632,112 +847,36 @@ async def cb_delete_dir_confirm(call: CallbackQuery, state: FSMContext):
     except Exception as e:
         return await call.answer(f"❌ خطا در حذف پوشه: {e}", show_alert=True)
 
-    await state.update_data(current_dir=str(parent_dir))
+    await state.update_data(current_dir=str(parent_dir), fm_selected_files=[])
     await call.answer(f"🗑 پوشه {dir_name} به طور کامل حذف شد!", show_alert=True)
     await render_directory(call, state, parent_dir)
 
 
-# ==================== تغییر نام و حذف فایل در فایل‌منیجر ====================
-@router.callback_query(F.data == "vact:rename_file")
-async def cb_rename_file_start(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    file_path = Path(data["selected_video"]).resolve()
-
-    await state.set_state(MainStates.waiting_rename_file)
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="🔙 انصراف", callback_data="menu:file_mgr"))
-    await call.message.edit_text(
-        f"✏️ **تغییر نام فایل**\n\n"
-        f"📄 نام فعلی کامل (برای کپی لمس کنید):\n`{file_path.name}`\n"
-        f"🔹 نام بدون پسوند:\n`{file_path.stem}`\n\n"
-        "لطفاً **نام جدید فایل** را ارسال کنید (اگر پسوند را ننویسید، پسوند فعلی به صورت خودکار حفظ می‌شود):",
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown"
-    )
-
-
-@router.message(MainStates.waiting_rename_file)
-async def handle_rename_file_submit(message: Message, state: FSMContext):
-    raw_new = re.sub(r'[<>:"/\\|?*]', "", (message.text or "").strip()).strip()
-    if not raw_new:
-        return await message.answer("⚠️ نام وارد شده معتبر نیست. دوباره بفرستید:")
-
-    data = await state.get_data()
-    old_path = Path(data["selected_video"]).resolve()
-    orig_ext = old_path.suffix
-
-    if orig_ext and not raw_new.lower().endswith(orig_ext.lower()):
-        raw_new += orig_ext
-
-    new_path = old_path.with_name(raw_new)
-    try:
-        old_path.rename(new_path)
-    except Exception as e:
-        return await message.answer(f"❌ خطا در تغییر نام فایل:\n`{e}`", parse_mode="Markdown")
-
-    await state.set_state(None)
-    await state.update_data(selected_video=str(new_path), target_videos=[str(new_path)])
-    is_vid = new_path.suffix.lower() in DownloaderService.VIDEO_EXTENSIONS
-    size_mb = new_path.stat().st_size / (1024 * 1024)
-
-    await message.answer(
-        f"✅ نام فایل با موفقیت تغییر یافت!\n\n"
-        f"📄 نام جدید:\n`{new_path.name}`\n"
-        f"📦 حجم: `{size_mb:.2f} MB`",
-        reply_markup=video_actions_kb(is_video=is_vid),
-        parse_mode="Markdown"
-    )
-
-
-@router.callback_query(F.data == "vact:delete_file")
-async def cb_delete_file_ask(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    file_path = Path(data["selected_video"]).resolve()
-
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="✅ بله، فایل حذف شود", callback_data="vact:confirm_del_file"),
-        InlineKeyboardButton(text="❌ انصراف", callback_data="menu:file_mgr"),
-    )
-    await call.message.edit_text(
-        f"⚠️ **آیا از حذف دائمی این فایل اطمینان دارید؟**\n\n"
-        f"📄 `{file_path.name}`",
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown"
-    )
-
-
-@router.callback_query(F.data == "vact:confirm_del_file")
-async def cb_delete_file_confirm(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    file_path = Path(data["selected_video"]).resolve()
-    parent_dir = file_path.parent
-    fname = file_path.name
-
-    try:
-        file_path.unlink(missing_ok=True)
-    except Exception as e:
-        return await call.answer(f"❌ خطا در حذف فایل: {e}", show_alert=True)
-
-    await call.answer(f"🗑 فایل {fname[:30]} حذف شد!", show_alert=True)
-    await render_directory(call, state, parent_dir)
-
-
-# ==================== انتخاب مسیر مقصد در هاست دانلود برای CuteFTP 9 ====================
-@router.callback_query(F.data.in_({"fact:upload_current_dir", "vact:upload_file"}))
+# ==================== انتخاب مسیر مقصد در هاست دانلود برای CuteFTP 9 (تکی، چندفایلی و پوشه‌ای) ====================
+@router.callback_query(F.data.in_({"fact:upload_current_dir", "fact:upload_selected_files", "vact:upload_file"}))
 async def cb_cuteftp_choose_destination(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    if call.data == "vact:upload_file":
-        target = Path(data["selected_video"])
-    else:
-        target = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
 
-    await state.update_data(cuteftp_upload_target=str(target.resolve()))
+    if call.data == "fact:upload_selected_files":
+        sel_files = sorted(data.get("fm_selected_files", []), key=_natural_sort_key)
+        if not sel_files:
+            return await call.answer("⚠️ هیچ فایلی انتخاب نشده است!", show_alert=True)
+        await state.update_data(cuteftp_upload_targets=sel_files)
+        target_desc = f"{len(sel_files)} فایل انتخاب‌شده"
+    elif call.data == "vact:upload_file":
+        target = Path(data["selected_video"]).resolve()
+        await state.update_data(cuteftp_upload_targets=[str(target)])
+        target_desc = target.name
+    else:
+        target = Path(data.get("current_dir", cfg.get("paths", "workspace_dir"))).resolve()
+        await state.update_data(cuteftp_upload_targets=[str(target)])
+        target_desc = f"پوشه {target.name}"
+
     active_gui_path = await CuteFTPService.get_active_gui_remote_path()
 
     await call.message.edit_text(
         f"☁️ **آپلود به هاست دانلود (CuteFTP 9)**\n\n"
-        f"📦 آیتم انتخاب شده برای آپلود:\n`{target.name}`\n"
+        f"📦 آیتم انتخاب شده برای آپلود:\n`{target_desc}`\n"
         f"📍 مسیر فعلی باز در برنامه CuteFTP:\n`{active_gui_path}`\n\n"
         "در کدام پوشه از هاست دانلود آپلود شود؟",
         reply_markup=cuteftp_destination_kb(active_gui_path),
@@ -745,21 +884,31 @@ async def cb_cuteftp_choose_destination(call: CallbackQuery, state: FSMContext):
     )
 
 
+async def _enqueue_cuteftp_targets(data: dict, remote_dest: str) -> str:
+    targets = [Path(p) for p in data.get("cuteftp_upload_targets", [])]
+    if not targets and data.get("cuteftp_upload_target"):
+        targets = [Path(data["cuteftp_upload_target"])]
+
+    title_label = targets[0].name if len(targets) == 1 else f"{len(targets)} فایل انتخابی"
+    dest_title = "Current" if remote_dest == "__CURRENT__" else remote_dest
+    task = await queue_engine.add_task(
+        "upload",
+        f"CuteFTP [{dest_title}]: {title_label}",
+        CuteFTPService.upload_multiple_or_single,
+        targets,
+        remote_dest
+    )
+    return task.task_id
+
+
 @router.callback_query(F.data == "cftp_dest:current")
 async def cb_cuteftp_upload_to_current(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    target = Path(data["cuteftp_upload_target"])
-    task = await queue_engine.add_task(
-        "upload",
-        f"CuteFTP ({target.name})",
-        CuteFTPService.upload_path,
-        target,
-        "__CURRENT__"
-    )
+    task_id = await _enqueue_cuteftp_targets(data, "__CURRENT__")
     await state.clear()
     await call.message.edit_text(
-        f"☁️ ارسال `{target.name}` به **مسیر فعلی CuteFTP** در صف قرار گرفت!\n"
-        f"🆔 کد تسک: `{task.task_id}`",
+        f"☁️ آپلود به **مسیر فعلی CuteFTP** در صف قرار گرفت!\n"
+        f"🆔 کد تسک: `{task_id}`",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -772,18 +921,11 @@ async def cb_cuteftp_upload_to_preset(call: CallbackQuery, state: FSMContext):
     chosen_dest = destinations[idx]["path"]
 
     data = await state.get_data()
-    target = Path(data["cuteftp_upload_target"])
-    task = await queue_engine.add_task(
-        "upload",
-        f"CuteFTP [{chosen_dest}]: {target.name}",
-        CuteFTPService.upload_path,
-        target,
-        chosen_dest
-    )
+    task_id = await _enqueue_cuteftp_targets(data, chosen_dest)
     await state.clear()
     await call.message.edit_text(
-        f"☁️ ارسال `{target.name}` به مسیر `{chosen_dest}` آغاز شد!\n"
-        f"🆔 کد تسک: `{task.task_id}`",
+        f"☁️ آپلود به مسیر `{chosen_dest}` در صف قرار گرفت!\n"
+        f"🆔 کد تسک: `{task_id}`",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -806,18 +948,11 @@ async def handle_custom_cuteftp_path(message: Message, state: FSMContext):
         return await message.answer("⚠️ لطفاً یک مسیر معتبر وارد کنید:")
 
     data = await state.get_data()
-    target = Path(data["cuteftp_upload_target"])
-    task = await queue_engine.add_task(
-        "upload",
-        f"CuteFTP [{remote_path}]: {target.name}",
-        CuteFTPService.upload_path,
-        target,
-        remote_path
-    )
+    task_id = await _enqueue_cuteftp_targets(data, remote_path)
     await state.clear()
     await message.answer(
-        f"☁️ ارسال `{target.name}` به مسیر `{remote_path}` آغاز شد!\n"
-        f"🆔 کد تسک: `{task.task_id}`",
+        f"☁️ آپلود به مسیر `{remote_path}` آغاز شد!\n"
+        f"🆔 کد تسک: `{task_id}`",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )

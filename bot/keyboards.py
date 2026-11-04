@@ -71,7 +71,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="📂 ۵. فایل‌منیجر (حذف / تغییر نام / CuteFTP)",
+            text="📂 ۵. فایل‌منیجر (انتخاب چندتایی / تغییر نام / CuteFTP)",
             callback_data="menu:file_mgr"
         )
     )
@@ -351,24 +351,86 @@ def search_results_kb(
 
 def file_browser_kb(
     items: list[Path],
-    is_root: bool
+    is_root: bool,
+    selected_files: set[str] | None = None
 ) -> InlineKeyboardMarkup:
+    """
+    فایل‌منیجر مجهز به قابلیت انتخاب چند فایلی:
+    - کلیک روی پوشه‌ها (📁) وارد آن پوشه می‌شود.
+    - کلیک روی فایل‌ها (⬜ / ✅) آن فایل را به لیست انتخاب‌شده‌ها اضافه/حذف می‌کند.
+    """
+    selected_files = selected_files or set()
     builder = InlineKeyboardBuilder()
+
+    has_files_in_dir = False
 
     for idx, path in enumerate(items[:25]):
         if path.is_dir():
-            icon = "📁"
-        elif path.suffix.lower() in [
-            ".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"
-        ]:
-            icon = "🎬"
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"📁 [{idx+1}] {smart_middle_truncate(path.name, 38)}",
+                    callback_data=f"fitem:{idx}"
+                )
+            )
         else:
-            icon = "📄"
+            has_files_in_dir = True
+            is_sel = str(path.resolve()) in selected_files
+            mark = "✅" if is_sel else "⬜"
+            icon = "🎬" if path.suffix.lower() in [
+                ".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"
+            ] else "📄"
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"{mark} {icon} [{idx+1}] {smart_middle_truncate(path.name, 34)}",
+                    callback_data=f"fitem:{idx}"
+                )
+            )
 
+    if has_files_in_dir:
         builder.row(
             InlineKeyboardButton(
-                text=f"{icon} [{idx+1}] {smart_middle_truncate(path.name, 38)}",
-                callback_data=f"fitem:{idx}"
+                text="☑️ انتخاب / لغو انتخاب همه فایل‌های این پوشه",
+                callback_data="fact:select_all_files"
+            )
+        )
+
+    sel_count = len(selected_files)
+    if sel_count > 0:
+        builder.row(
+            InlineKeyboardButton(
+                text=f"✏️ تغییر نام ({sel_count} فایل)",
+                callback_data="fact:batch_rename"
+            ),
+            InlineKeyboardButton(
+                text=f"🗑 حذف ({sel_count} فایل)",
+                callback_data="fact:batch_delete"
+            )
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🎬 سافت‌ساب / هاردساب ({sel_count} فایل انتخابی)",
+                callback_data="fact:batch_sub"
+            )
+        )
+        if sel_count == 1:
+            only_file = Path(next(iter(selected_files)))
+            if only_file.suffix.lower() in [".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"]:
+                builder.row(
+                    InlineKeyboardButton(
+                        text="📤 استخراج زیرنویس از این فیلم",
+                        callback_data="vact:extract_sub"
+                    )
+                )
+        builder.row(
+            InlineKeyboardButton(
+                text=f"☁️ آپلود {sel_count} فایل انتخابی با CuteFTP",
+                callback_data="fact:upload_selected_files"
+            )
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text="✖️ پاک کردن انتخاب‌ها",
+                callback_data="fact:clear_selection"
             )
         )
 
@@ -385,7 +447,7 @@ def file_browser_kb(
                 callback_data="fact:rename_dir"
             ),
             InlineKeyboardButton(
-                text="🗑 حذف این پوشه",
+                text="🗑 حذف کل این پوشه",
                 callback_data="fact:delete_dir"
             )
         )
@@ -664,21 +726,21 @@ def subtitle_mode_kb() -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="📎 فقط SoftSub (در پوشه softsub)",
+            text="📎 فقط SoftSub",
             callback_data="submode:softsub"
         )
     )
 
     builder.row(
         InlineKeyboardButton(
-            text="🔥 فقط HardSub (انتخاب مقصد یا پیش‌فرض)",
+            text="🔥 فقط HardSub",
             callback_data="submode:hardsub"
         )
     )
 
     builder.row(
         InlineKeyboardButton(
-            text="🚀 هر دو عملیات (پکیج کامل)",
+            text="🚀 هر دو عملیات (SoftSub + HardSub)",
             callback_data="submode:both"
         )
     )
@@ -693,30 +755,30 @@ def subtitle_mode_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def hardsub_destination_choice_kb() -> InlineKeyboardMarkup:
+def output_destination_choice_kb() -> InlineKeyboardMarkup:
     """
-    انتخاب مقصد ذخیره فایل هاردساب:
-    - پیش‌فرض (ساخت ۳ پوشه و ذخیره در پوشه hardsub)
+    انتخاب نحوه ذخیره فایل خروجی (برای سافت‌ساب و هاردساب):
+    - حالت پیش‌فرض (پوشه خودکار softsub / hardsub)
     - کنار خودِ فایل فیلم (بدون ساخت ۳ پوشه)
-    - انتخاب یا تایپ پوشه دلخواه در Workspace (بدون ساخت ۳ پوشه)
+    - مرور پوشه‌ها و زیرپوشه‌ها + امکان ساخت پوشه جدید در هر مسیر
     """
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text="📂 حالت پیش‌فرض (ساخت ۳ پوشه و ذخیره در hardsub)",
-            callback_data="hbdest:default"
+            text="📂 حالت پیش‌فرض (ساخت ۳ پوشه و ذخیره در softsub/hardsub)",
+            callback_data="outdest:default"
         )
     )
     builder.row(
         InlineKeyboardButton(
             text="📍 ذخیره مستقیم کنار خود فایل فیلم (بدون ساخت ۳ پوشه)",
-            callback_data="hbdest:same_dir"
+            callback_data="outdest:same_dir"
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="📁 انتخاب پوشه مقصد دلخواه (بدون ساخت ۳ پوشه)",
-            callback_data="hbdest:custom_pick"
+            text="📁 انتخاب پوشه مقصد دلخواه (مرور زیرپوشه‌ها / ساخت پوشه)",
+            callback_data="outdest:browse"
         )
     )
     builder.row(
@@ -728,24 +790,59 @@ def hardsub_destination_choice_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def hardsub_custom_folders_kb(folders: list[Path]) -> InlineKeyboardMarkup:
+# حفظ نام قبلی برای سازگاری کامل
+hardsub_destination_choice_kb = output_destination_choice_kb
+
+
+def output_dest_tree_browser_kb(
+    subfolders: list[Path],
+    current_dir: Path,
+    is_root: bool
+) -> InlineKeyboardMarkup:
+    """
+    مرورگر درختی پوشه‌ها و زیرپوشه‌ها برای انتخاب مقصد سافت‌ساب و هاردساب:
+    - امکان ورود به زیرپوشه‌های تودرتو
+    - امکان ساخت پوشه جدید در همان مسیر فعلی
+    - امکان تایید پوشه فعلی به عنوان مقصد نهایی (بدون ساخت ۳ پوشه)
+    """
     builder = InlineKeyboardBuilder()
-    for idx, folder in enumerate(folders[:20]):
-        builder.row(
-            InlineKeyboardButton(
-                text=f"📁 [{idx+1}] {smart_middle_truncate(folder.name, 38)}",
-                callback_data=f"hbdest_dir:{idx}"
-            )
-        )
+
+    # دکمه تایید پوشه فعلی که کاربر داخل آن قرار دارد
     builder.row(
         InlineKeyboardButton(
-            text="✏️ تایپ نام یا مسیر پوشه مقصد دلخواه",
-            callback_data="hbdest:custom_type"
+            text=f"✅ ذخیره در همین پوشه ({smart_middle_truncate(current_dir.name, 26)})",
+            callback_data="destnav:select_here"
         )
     )
+
+    # لیست زیرپوشه‌های داخل این پوشه برای ورود به آن‌ها
+    for idx, folder in enumerate(subfolders[:22]):
+        builder.row(
+            InlineKeyboardButton(
+                text=f"📁 [{idx+1}] باز کردن: {smart_middle_truncate(folder.name, 34)}",
+                callback_data=f"destnav:open:{idx}"
+            )
+        )
+
+    # دکمه ساخت پوشه جدید در همین دایرکتوری و بازگشت به پوشه بالاتر
     builder.row(
         InlineKeyboardButton(
-            text="🔙 انصراف",
+            text="➕ ساخت پوشه جدید در همین مسیر",
+            callback_data="destnav:mkdir_here"
+        )
+    )
+
+    if not is_root:
+        builder.row(
+            InlineKeyboardButton(
+                text="⬆️ بازگشت به پوشه قبلی (Up)",
+                callback_data="destnav:up"
+            )
+        )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 انصراف و منوی اصلی",
             callback_data="menu:home"
         )
     )

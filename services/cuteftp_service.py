@@ -62,3 +62,25 @@ class CuteFTPService:
         if progress_callback:
             progress_callback("آپلود با موفقیت تکمیل شد ✅")
         return urls
+
+    @classmethod
+    async def upload_multiple_or_single(
+        cls,
+        local_targets: list[Path] | Path,
+        remote_subpath: str = "__CURRENT__",
+        progress_callback: Callable[[str], None] = None
+    ) -> list[str]:
+        """آپلود یک یا چند فایل/پوشه انتخاب شده به مسیر مقصد و تجمیع لینک‌های دانلود"""
+        if isinstance(local_targets, Path):
+            local_targets = [local_targets]
+
+        all_urls: list[str] = []
+        total = len(local_targets)
+        for idx, target in enumerate(local_targets, start=1):
+            def _sub_cb(msg: str, i=idx):
+                if progress_callback:
+                    progress_callback(f"[{i}/{total}] {msg}")
+
+            urls = await cls.upload_path(target, remote_subpath, progress_callback=_sub_cb)
+            all_urls.extend(urls)
+        return all_urls
