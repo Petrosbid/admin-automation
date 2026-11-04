@@ -1,10 +1,11 @@
 import uuid
 from pathlib import Path
 from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery, FSInputFile
+from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardButton
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.config_loader import cfg
 from core.queue_manager import queue_engine
@@ -13,7 +14,8 @@ from services.downloader_service import DownloaderService
 from services.mkv_service import MKVService
 from bot.keyboards import (
     main_menu_kb, search_categories_kb, search_sites_kb,
-    search_results_kb, download_target_folders_kb
+    search_results_kb, download_target_folders_kb,
+    extract_sub_entry_kb, local_extract_browser_kb
 )
 
 router = Router()
@@ -25,6 +27,7 @@ class DownloadStates(StatesGroup):
     choosing_download_folder = State()
     waiting_direct_folder_name = State()
     waiting_link_for_sub_extract = State()
+    browsing_local_for_sub_extract = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -32,21 +35,24 @@ def is_admin(user_id: int) -> bool:
 
 
 async def _show_download_targets(target_msg_or_call: Message | CallbackQuery, state: FSMContext):
-    """نمایش لیست پوشه‌های موجود در Workspace یا گزینه ساخت پوشه جدید برای دانلود"""
     folders = DownloaderService.list_workspace_folders()
     await state.update_data(dl_available_folders=[str(f.resolve()) for f in folders])
     await state.set_state(DownloadStates.choosing_download_folder)
 
+    folder_lines = "\n".join([f"`[{i+1}]` 📂 `{f.name}`" for i, f in enumerate(folders[:25])])
+    list_block = f"\n📋 **لیست پوشه‌ها:**\n{folder_lines}\n" if folder_lines else ""
+
     text = (
-        "📂 **انتخاب پوشه مقصد دانلود:**\n\n"
+        "📂 **انتخاب پوشه مقصد دانلود:**\n"
+        f"{list_block}\n"
         "یکی از پوشه‌های موجود زیر را انتخاب کنید و یا دکمه **«➕ ساخت پوشه جدید»** را بزنید:"
     )
     kb = download_target_folders_kb(folders)
 
     if isinstance(target_msg_or_call, CallbackQuery):
-        await target_msg_or_call.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+        await target_msg_or_call.message.edit_text(text[:4000], reply_markup=kb, parse_mode="Markdown")
     else:
-        await target_msg_or_call.answer(text, reply_markup=kb, parse_mode="Markdown")
+        await target_msg_or_call.answer(text[:4000], reply_markup=kb, parse_mode="Markdown")
 
 
 # ==================== ۱. جستجو و دانلود از ۹ سایت ====================
@@ -81,8 +87,9 @@ async def handle_search_query(message: Message, state: FSMContext):
             return await wait_msg.edit_text("❌ نتیجه‌ای یافت نشد.", reply_markup=main_menu_kb())
 
         await state.update_data(search_results=results)
+        res_lines = "\n".join([f"`[{i+1}]` `{r['title']}`" for i, r in enumerate(results[:15])])
         await wait_msg.edit_text(
-            f"✅ نتایج یافت شده برای `{message.text}`:\nروی گزینه دلخواه کلیک کنید تا دانلود شود:",
+            f"✅ نتایج یافت شده برای `{message.text}`:\n\n{res_lines}\n\nروی گزینه دلخواه کلیک کنید تا دانلود شود:",
             reply_markup=search_results_kb(results),
             parse_mode="Markdown"
         )
@@ -220,7 +227,200 @@ async def handle_direct_folder_name(message: Message, state: FSMContext):
     )
 
 
-# ==================== ۳. ارسال لینک دانلود فیلم و استخراج خودکار زیرنویس آن ====================
+# ==================== ۳. استخراج زیرنویس (هم از فایل موجود در دایرکتوری و هم از لینک دانلود) ====================
+@router.callback_query(F.data == "menu:link_extract_sub")
+async def cb_link_extract_sub_menu(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text(
+        "📤 **بخش استخراج زیرنویس از فیلم**\n\n"
+        "لطفاً روش مورد نظر خود را انتخاب کنید:\n"
+        "1️⃣ **از فایل موجود در دایرکتوری:** انتخاب فیلم از داخل پوشه‌های سرور و دریافت زیرنویس‌های داخل آن.\n"
+        "2️⃣ **از طریق لینک دانلود:** ارسال لینک یا فایل تورنت تا فیلم دانلود شده و زیرنویس‌هایش در چت ارسال شود.",
+        reply_markup=extract_sub_entry_kb(),
+        parse_mode="Markdown"
+    )
+
+
+# --- الف) استخراج زیرنویس از فایل موجود در دایرکتوری (مرورگر پوشه و فایل) ---
+async def _render_local_extract_browser(call: CallbackQuery, state: FSMContext, browse_dir: Path):
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    browse_dir = browse_dir.resolve()
+    browse_dir.mkdir(parents=True, exist_ok=True)
+
+    folders = sorted(
+        [p for p in browse_dir.iterdir() if p.is_dir() and not p.name.startswith("_") and p.name != "browser_profile"],
+        key=lambda x: x.name.lower()
+    )
+    videos = DownloaderService.find_video_files(browse_dir, recursive=False)
+
+    await state.set_state(DownloadStates.browsing_local_for_sub_extract)
+    await state.update_data(
+        ext_browse_dir=str(browse_dir),
+        ext_dir_folders=[str(f.resolve()) for f in folders],
+        ext_dir_videos=[str(v.resolve()) for v in videos]
+    )
+
+    is_root = (browse_dir == workspace)
+
+    full_lines = []
+    for idx, folder in enumerate(folders[:20]):
+        full_lines.append(f"`[{idx+1}]` 📁 `{folder.name}`")
+    for idx, vid in enumerate(videos[:25]):
+        size_mb = vid.stat().st_size / (1024 * 1024)
+        full_lines.append(f"`[F{idx+1}]` 🎬 `{vid.name}` _({size_mb:.1f} MB)_")
+
+    details_block = "\n".join(full_lines) if full_lines else "_(در این مسیر پوشه یا فایل ویدئویی وجود ندارد)_"
+
+    msg_text = (
+        f"📂 **استخراج زیرنویس از فایل موجود در دایرکتوری**\n"
+        f"📍 مسیر فعلی:\n`{browse_dir}`\n\n"
+        f"📋 **لیست کامل پوشه‌ها و فیلم‌ها:**\n{details_block}\n\n"
+        "روی پوشه کلیک کنید تا باز شود، یا روی فیلم (`🎬`) کلیک کنید تا ترک‌های زیرنویس آن نمایش داده شود:"
+    )
+
+    await call.message.edit_text(
+        msg_text[:4000],
+        reply_markup=local_extract_browser_kb(folders, videos, is_root),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "extmode:local")
+async def cb_extmode_local_start(call: CallbackQuery, state: FSMContext):
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    await _render_local_extract_browser(call, state, workspace)
+
+
+@router.callback_query(DownloadStates.browsing_local_for_sub_extract, F.data.startswith("extnav:dir:"))
+async def cb_extnav_open_dir(call: CallbackQuery, state: FSMContext):
+    idx = int(call.data.split(":")[2])
+    data = await state.get_data()
+    folders = data.get("ext_dir_folders", [])
+    if idx < len(folders):
+        await _render_local_extract_browser(call, state, Path(folders[idx]))
+
+
+@router.callback_query(DownloadStates.browsing_local_for_sub_extract, F.data == "extnav:up")
+async def cb_extnav_up(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    curr = Path(data.get("ext_browse_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    parent = curr.parent if curr != workspace else workspace
+    await _render_local_extract_browser(call, state, parent)
+
+
+@router.callback_query(DownloadStates.browsing_local_for_sub_extract, F.data.startswith("extnav:vid:"))
+async def cb_extnav_select_video(call: CallbackQuery, state: FSMContext):
+    idx = int(call.data.split(":")[2])
+    data = await state.get_data()
+    videos = data.get("ext_dir_videos", [])
+    if idx >= len(videos):
+        return await call.answer("⚠️ فایل یافت نشد.", show_alert=True)
+
+    video_path = Path(videos[idx]).resolve()
+    tracks = await MKVService.list_subtitle_tracks(video_path)
+    if not tracks:
+        return await call.answer("❌ هیچ ترک زیرنویسی داخل این فایل ویدئویی وجود ندارد!", show_alert=True)
+
+    await state.update_data(selected_video=str(video_path))
+
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text=f"📥 استخراج یکجای تمام زیرنویس‌ها ({len(tracks)} ترک)",
+            callback_data="extall_local"
+        )
+    )
+    for t in tracks:
+        kb.row(
+            InlineKeyboardButton(
+                text=f"📤 Track #{t['id']} | {t['language']} | {t['track_name']} ({t['codec']})",
+                callback_data=f"exttrack_local:{t['id']}:{t['codec']}"
+            )
+        )
+    kb.row(
+        InlineKeyboardButton(
+            text="🔙 بازگشت به پوشه",
+            callback_data="extnav:back_to_dir"
+        )
+    )
+
+    await call.message.edit_text(
+        f"🎬 **فایل انتخاب شده:**\n`{video_path.name}`\n\n"
+        f"✅ تعداد **`{len(tracks)}` ترک زیرنویس** در این فیلم پیدا شد.\n"
+        "می‌توانید همه را یکجا استخراج کنید و یا ترک مورد نظر را انتخاب نمایید:",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "extnav:back_to_dir")
+async def cb_extnav_back_to_dir(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    curr = Path(data.get("ext_browse_dir", cfg.get("paths", "workspace_dir")))
+    await _render_local_extract_browser(call, state, curr)
+
+
+@router.callback_query(F.data.startswith("exttrack_local:"))
+async def cb_extract_single_local_track(call: CallbackQuery, state: FSMContext):
+    parts = call.data.split(":")
+    track_id = int(parts[1])
+    codec_lower = parts[2].lower() if len(parts) > 2 else "srt"
+
+    data = await state.get_data()
+    video_path = Path(data["selected_video"]).resolve()
+
+    # ذخیره در پوشه sub فیلم (در صورت وجود) یا کنار خود فیلم
+    sub_dir = (video_path.parent / "sub") if (video_path.parent / "sub").is_dir() else video_path.parent
+    ext = ".ass" if ("ass" in codec_lower or "ssa" in codec_lower) else (".sup" if "pgs" in codec_lower else ".srt")
+    out_sub = sub_dir / f"{video_path.stem}_Track{track_id}{ext}"
+
+    await call.message.edit_text(
+        f"⏳ در حال استخراج زیرنویس `Track #{track_id}` از:\n`{video_path.name}`...",
+        parse_mode="Markdown"
+    )
+    await MKVService.extract_subtitle_track(video_path, track_id, out_sub)
+
+    await call.message.answer_document(
+        FSInputFile(out_sub),
+        caption=(
+            f"✅ زیرنویس استخراج شد!\n"
+            f"🎬 فیلم: `{video_path.name}`\n"
+            f"📄 فایل ذخیره شده در سرور:\n`{out_sub}`"
+        ),
+        parse_mode="Markdown"
+    )
+    curr = Path(data.get("ext_browse_dir", video_path.parent))
+    await _render_local_extract_browser(call, state, curr)
+
+
+@router.callback_query(F.data == "extall_local")
+async def cb_extract_all_local_tracks(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    video_path = Path(data["selected_video"]).resolve()
+    sub_dir = (video_path.parent / "sub") if (video_path.parent / "sub").is_dir() else video_path.parent
+
+    await call.message.edit_text(
+        f"⏳ در حال استخراج تمامی زیرنویس‌های:\n`{video_path.name}`...",
+        parse_mode="Markdown"
+    )
+    extracted_files = await MKVService.extract_all_subtitles(video_path, sub_dir)
+
+    if not extracted_files:
+        return await call.answer("❌ هیچ زیرنویسی استخراج نشد.", show_alert=True)
+
+    for sub_p in extracted_files:
+        await call.message.answer_document(
+            FSInputFile(sub_p),
+            caption=f"📤 زیرنویس استخراج شده:\n`{sub_p.name}`\n📂 مسیر در سرور: `{sub_p.parent}`",
+            parse_mode="Markdown"
+        )
+
+    curr = Path(data.get("ext_browse_dir", video_path.parent))
+    await _render_local_extract_browser(call, state, curr)
+
+
+# --- ب) استخراج زیرنویس با دانلود از لینک ---
 async def _download_and_extract_subs_job(
     bot: Bot,
     chat_id: int,
@@ -254,14 +454,16 @@ async def _download_and_extract_subs_job(
     return [str(p) for p in extracted]
 
 
-@router.callback_query(F.data == "menu:link_extract_sub")
-async def cb_link_extract_sub(call: CallbackQuery, state: FSMContext):
-    await state.clear()
+@router.callback_query(F.data == "extmode:link")
+async def cb_extmode_link_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(DownloadStates.waiting_link_for_sub_extract)
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔙 بازگشت", callback_data="menu:link_extract_sub"))
     await call.message.edit_text(
         "📤 **دانلود فیلم و استخراج خودکار زیرنویس**\n\n"
         "لینک مستقیم فیلم، لینک Magnet/تورنت، یا لینک Mega/GDrive را ارسال کنید (یا فایل `.torrent` بفرستید).\n"
         "ربات فیلم را دانلود کرده و تمام زیرنویس‌های داخل آن را استخراج و در همین چت برایتان ارسال می‌کند:",
+        reply_markup=kb.as_markup(),
         parse_mode="Markdown"
     )
 

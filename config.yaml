@@ -66,4 +66,4 @@ cuteftp:
   username: "ftpuser"
   password: "ftppassword"
   remote_base_dir: "English"
-  base_download_url: "https://dl15.cdnzed.sbs/English"
+  base_download_url: "https://dl15.cdnzed.sbs/"

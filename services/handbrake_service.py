@@ -44,14 +44,15 @@ class HandBrakeService:
         progress_callback: Callable[[str], None] = None
     ) -> Path:
         """
-        منطق جدید هاردساب با HandBrakeCLI طبق خواسته شما:
-        ۱. اگر زیرنویس اصلی از نوع .ass یا .ssa باشد:
-           بدون هیچ تغییر رنگ زرد یا بولد کردن، دقیقاً با استایل اصلی خودش هاردساب (Burn-in) می‌شود.
-        ۲. اگر زیرنویس اصلی از نوع .srt باشد:
-           به صورت SRT بولد و زرد (#fbff00) با سایز فونت پیش‌فرض و بزرگ هاردساب می‌شود.
-        ۳. وضعیت زیرنویس انگلیسی (ارسالی یا موجود در خود فایل فیلم):
-           اگر زیرنویس انگلیسی آپلود شده باشد و یا از قبل داخل خود فایل فیلم وجود داشته باشد،
-           بدون هاردساب شدن (بدون تیک Burn-in) و بدون بولد و زرد شدن، به عنوان ترک زیرنویس سافت‌ساب به فایل خروجی اضافه می‌شود.
+        منطق دقیق هاردساب طبق دستور جدید شما:
+        ۱. اگر زیرنویس فارسی داده شده از نوع .srt باشد:
+           - به صورت بولد و زرد (#fbff00) هاردساب (Burn-in) می‌شود.
+           - دیگر هیچ زیرنویس انگلیسی‌ای (نه از فایل ارسالی و نه از داخل خود فیلم) به خروجی اضافه نمی‌شود!
+        ۲. فقط اگر زیرنویس فارسی داده شده از نوع .ass یا .ssa باشد:
+           - بدون تغییر رنگ و بولد شدن، با استایل اصلی خودش هاردساب (Burn-in) می‌شود.
+           - زیرنویس انگلیسی (ارسالی یا موجود در خود فایل فیلم) به صورت سافت‌ساب (بدون Burn-in) به فایل اضافه می‌شود.
+        ۳. اگر هیچ زیرنویس فارسی‌ای داده نشده باشد:
+           - فیلم بدون هاردساب کردن هیچ زیرنویسی انکود می‌شود (و تمام زیرنویس‌های داخلی قبلی نیز حذف می‌شوند).
         """
         output_media_path.parent.mkdir(parents=True, exist_ok=True)
         unique_tag = str(uuid.uuid4())[:6]
@@ -66,10 +67,13 @@ class HandBrakeService:
             has_secondary_en = bool(secondary_en_srt_path and Path(secondary_en_srt_path).exists())
 
             burn_in_sub_path: Path | None = None
+            is_ass_format = False
 
             if has_primary_sub:
                 primary_srt_path = Path(primary_srt_path)
                 ext_lower = primary_srt_path.suffix.lower()
+                is_ass_format = ext_lower in (".ass", ".ssa")
+
                 working_sub = output_media_path.with_name(f"_temp_sync_{unique_tag}{ext_lower}")
                 working_sub.write_text(SubtitleService.read_subtitle_safe(primary_srt_path), encoding="utf-8-sig")
 
@@ -84,37 +88,33 @@ class HandBrakeService:
                 elif sync_mode == "manual" and sync_offset_ms != 0 and ext_lower == ".srt":
                     SubtitleService.shift_srt_time(working_sub, working_sub, sync_offset_ms)
 
-                # شرط مهم ۲: اگر فایل زیرنویس .ass یا .ssa بود، بدون تغییر رنگ و بدون بولد کردن همان را هاردساب کن
-                if ext_lower in (".ass", ".ssa"):
+                if is_ass_format:
                     if progress_callback:
-                        progress_callback("فایل ASS تشخیص داده شد؛ هاردساب با استایل اصلی بدون تغییر رنگ...")
+                        progress_callback("فایل ASS تشخیص داده شد؛ هاردساب با استایل اصلی + حفظ سافت‌ساب انگلیسی...")
                     burn_in_sub_path = working_sub
                 else:
-                    # اگر فایل .srt بود، بولد و زرد (#fbff00) کن
                     if progress_callback:
-                        progress_callback("آماده‌سازی SRT بولد و زرد (#fbff00) برای هاردساب...")
+                        progress_callback("آماده‌سازی SRT بولد و زرد (#fbff00) برای هاردساب (حذف کامل سایر زیرنویس‌ها)...")
                     SubtitleService.style_srt_bold_yellow(working_sub, temp_styled_srt)
                     burn_in_sub_path = temp_styled_srt
 
-            # ساخت فایل موقت MKV با keep_old_subs=True:
-            # متد merge_softsub به صورت هوشمند:
-            # - اگر secondary_en_srt_path داده شده باشد آن را بدون تغییر رنگ اضافه می‌کند
-            # - اگر secondary_en_srt_path نداده باشید اما داخل خود فیلم زیرنویس انگلیسی وجود داشته باشد،
-            #   اولین زیرنویس انگلیسیِ خودِ فیلم را نگه می‌دارد!
             if progress_callback:
-                progress_callback("آماده‌سازی ترک‌های زیرنویس در کانتینر موقت...")
+                progress_callback("آماده‌سازی استریم موقت برای HandBrake...")
+
+            # تعیین اینکه آیا زیرنویس انگلیسی به صورت سافت‌ساب اجازه ورود دارد یا خیر:
+            # فقط و فقط اگر زیرنویس فارسی فرمت .ass / .ssa داشته باشد!
+            allow_english_softsub = is_ass_format
 
             await MKVService.merge_softsub(
                 video_path=video_path,
                 output_path=temp_mkv,
                 fa_sub_path=burn_in_sub_path,
-                en_sub_path=secondary_en_srt_path if has_secondary_en else None,
-                keep_old_subs=True,  # نگه داشتن زیرنویس انگلیسی داخل فیلم در صورت عدم آپلود زیرنویس انگلیسی
+                en_sub_path=(secondary_en_srt_path if (allow_english_softsub and has_secondary_en) else None),
+                keep_old_subs=allow_english_softsub,  # اگر SRT باشد False می‌شود تا زیرنویس انگلیسی خود فیلم هم حذف شود
                 custom_brand=brand,
                 sync_mode="none"
             )
 
-            # بررسی ترک‌های زیرنویس موجود در فایل موقت temp_mkv
             temp_sub_tracks = await MKVService.list_subtitle_tracks(temp_mkv)
             num_subs = len(temp_sub_tracks)
 
@@ -127,31 +127,22 @@ class HandBrakeService:
             ]
 
             if burn_in_sub_path is not None:
-                if num_subs >= 2:
-                    # ترک ۱ (فارسی) هاردساب (Burn-in) شود + ترک ۲ (انگلیسی) بدون Burn-in و بدون زرد شدن به فایل اضافه شود
+                if allow_english_softsub and num_subs >= 2:
+                    # حالت ASS: ترک ۱ (فارسی ASS) هاردساب (Burn-in) شود + ترک ۲ (انگلیسی) به صورت سافت‌ساب اضافه شود
                     cmd.extend([
                         "--subtitle", "1,2",
                         "--subtitle-burned=1",
                         "--subtitle-default=none",
                     ])
                 else:
-                    # فقط ترک ۱ (فارسی) وجود دارد -> هاردساب شود
+                    # حالت SRT (یا ASS بدون انگلیسی): فقط ترک ۱ هاردساب شود و هیچ زیرنویس دیگری نباشد
                     cmd.extend([
                         "--subtitle", "1",
                         "--subtitle-burned=1",
                     ])
             else:
-                # کاربر هیچ زیرنویسی برای هاردساب نداده است:
-                if num_subs >= 1:
-                    # اگر داخل خود فیلم زیرنویس انگلیسی بوده (یا فقط انگلیسی آپلود شده)، بدون Burn-in به فایل اضافه شود
-                    cmd.extend([
-                        "--subtitle", "1",
-                        "--subtitle-burned=none",
-                        "--subtitle-default=none",
-                    ])
-                else:
-                    # هیچ زیرنویسی وجود ندارد -> انکود کاملاً بدون زیرنویس
-                    cmd.extend(["--subtitle", "none"])
+                # هیچ زیرنویسی داده نشده است -> انکود بدون هیچ زیرنویسی
+                cmd.extend(["--subtitle", "none"])
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -181,7 +172,7 @@ class HandBrakeService:
                 await MKVService.merge_softsub(
                     video_path=output_media_path,
                     output_path=tagged_mkv,
-                    keep_old_subs=True,
+                    keep_old_subs=allow_english_softsub,
                     custom_brand=brand
                 )
                 output_media_path.unlink(missing_ok=True)

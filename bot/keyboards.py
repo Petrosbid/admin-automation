@@ -36,7 +36,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             callback_data="menu:create_folder"
         ),
         InlineKeyboardButton(
-            text="📥 آپلود زیرنویس",
+            text="📥 آپلود زیرنویس (SRT / ASS / ZIP)",
             callback_data="menu:upload_sub_target"
         )
     )
@@ -57,7 +57,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="📤 ۳. دانلود فیلم و استخراج زیرنویس",
+            text="📤 ۳. استخراج زیرنویس (از فایل موجود در پوشه / از لینک)",
             callback_data="menu:link_extract_sub"
         )
     )
@@ -71,7 +71,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="📂 ۵. فایل‌منیجر (انتخاب چندتایی / تغییر نام / CuteFTP)",
+            text="📂 ۵. فایل‌منیجر (انتخاب چندتایی / اکسترکت ZIP / CuteFTP)",
             callback_data="menu:file_mgr"
         )
     )
@@ -87,6 +87,71 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         )
     )
 
+    return builder.as_markup()
+
+
+def extract_sub_entry_kb() -> InlineKeyboardMarkup:
+    """منوی انتخاب روش استخراج زیرنویس: از فایل موجود در دایرکتوری یا دانلود از لینک"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="📂 ۱. استخراج زیرنویس از فایل موجود در دایرکتوری (Workspace)",
+            callback_data="extmode:local"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔗 ۲. ارسال لینک دانلود فیلم و استخراج خودکار زیرنویس",
+            callback_data="extmode:link"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 بازگشت به منوی اصلی",
+            callback_data="menu:home"
+        )
+    )
+    return builder.as_markup()
+
+
+def local_extract_browser_kb(
+    folders: list[Path],
+    videos: list[Path],
+    is_root: bool
+) -> InlineKeyboardMarkup:
+    """مرورگر پوشه‌به‌پوشه برای انتخاب فایل ویدئویی موجود در دایرکتوری جهت استخراج زیرنویس"""
+    builder = InlineKeyboardBuilder()
+
+    for idx, folder in enumerate(folders[:20]):
+        builder.row(
+            InlineKeyboardButton(
+                text=f"📁 [{idx+1}] {smart_middle_truncate(folder.name, 38)}",
+                callback_data=f"extnav:dir:{idx}"
+            )
+        )
+
+    for idx, vid in enumerate(videos[:25]):
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🎬 [F{idx+1}] {smart_middle_truncate(vid.name, 36)}",
+                callback_data=f"extnav:vid:{idx}"
+            )
+        )
+
+    if not is_root:
+        builder.row(
+            InlineKeyboardButton(
+                text="⬆️ بازگشت به پوشه قبلی (Up)",
+                callback_data="extnav:up"
+            )
+        )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 بازگشت",
+            callback_data="menu:link_extract_sub"
+        )
+    )
     return builder.as_markup()
 
 
@@ -354,11 +419,6 @@ def file_browser_kb(
     is_root: bool,
     selected_files: set[str] | None = None
 ) -> InlineKeyboardMarkup:
-    """
-    فایل‌منیجر مجهز به قابلیت انتخاب چند فایلی:
-    - کلیک روی پوشه‌ها (📁) وارد آن پوشه می‌شود.
-    - کلیک روی فایل‌ها (⬜ / ✅) آن فایل را به لیست انتخاب‌شده‌ها اضافه/حذف می‌کند.
-    """
     selected_files = selected_files or set()
     builder = InlineKeyboardBuilder()
 
@@ -376,9 +436,14 @@ def file_browser_kb(
             has_files_in_dir = True
             is_sel = str(path.resolve()) in selected_files
             mark = "✅" if is_sel else "⬜"
-            icon = "🎬" if path.suffix.lower() in [
-                ".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"
-            ] else "📄"
+            ext_low = path.suffix.lower()
+            if ext_low in [".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"]:
+                icon = "🎬"
+            elif ext_low == ".zip":
+                icon = "📦"
+            else:
+                icon = "📄"
+
             builder.row(
                 InlineKeyboardButton(
                     text=f"{mark} {icon} [{idx+1}] {smart_middle_truncate(path.name, 34)}",
@@ -396,6 +461,15 @@ def file_browser_kb(
 
     sel_count = len(selected_files)
     if sel_count > 0:
+        zip_selected_count = sum(1 for p in selected_files if Path(p).suffix.lower() == ".zip")
+        if zip_selected_count > 0:
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"📦 اکسترکت {zip_selected_count} فایل ZIP در همین پوشه",
+                    callback_data="fact:extract_zip"
+                )
+            )
+
         builder.row(
             InlineKeyboardButton(
                 text=f"✏️ تغییر نام ({sel_count} فایل)",
@@ -412,15 +486,17 @@ def file_browser_kb(
                 callback_data="fact:batch_sub"
             )
         )
-        if sel_count == 1:
-            only_file = Path(next(iter(selected_files)))
-            if only_file.suffix.lower() in [".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"]:
-                builder.row(
-                    InlineKeyboardButton(
-                        text="📤 استخراج زیرنویس از این فیلم",
-                        callback_data="vact:extract_sub"
-                    )
+        video_selected_count = sum(
+            1 for p in selected_files
+            if Path(p).suffix.lower() in [".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"]
+        )
+        if video_selected_count == 1:
+            builder.row(
+                InlineKeyboardButton(
+                    text="📤 استخراج زیرنویس از این فیلم",
+                    callback_data="vact:extract_sub"
                 )
+            )
         builder.row(
             InlineKeyboardButton(
                 text=f"☁️ آپلود {sel_count} فایل انتخابی با CuteFTP",
@@ -458,7 +534,7 @@ def file_browser_kb(
             callback_data="fact:mkdir_here"
         ),
         InlineKeyboardButton(
-            text="📥 آپلود زیرنویس",
+            text="📥 آپلود زیرنویس / ZIP",
             callback_data="fact:upload_sub_here"
         )
     )
@@ -633,7 +709,7 @@ def subtitle_source_kb(
 
     builder.row(
         InlineKeyboardButton(
-            text=f"📤 آپلود فایل زیرنویس {language_name} جدید",
+            text=f"📤 آپلود فایل زیرنویس {language_name} جدید (.srt / .ass / .zip)",
             callback_data=f"subupload:{language}"
         )
     )
@@ -672,7 +748,7 @@ def subtitle_file_found_kb(
 
     builder.row(
         InlineKeyboardButton(
-            text="📤 آپلود یک فایل زیرنویس دیگر از تلگرام",
+            text="📤 آپلود یک فایل زیرنویس دیگر (.srt / .ass / .zip)",
             callback_data=f"subupload:{language}"
         )
     )
@@ -756,12 +832,6 @@ def subtitle_mode_kb() -> InlineKeyboardMarkup:
 
 
 def output_destination_choice_kb() -> InlineKeyboardMarkup:
-    """
-    انتخاب نحوه ذخیره فایل خروجی (برای سافت‌ساب و هاردساب):
-    - حالت پیش‌فرض (پوشه خودکار softsub / hardsub)
-    - کنار خودِ فایل فیلم (بدون ساخت ۳ پوشه)
-    - مرور پوشه‌ها و زیرپوشه‌ها + امکان ساخت پوشه جدید در هر مسیر
-    """
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
@@ -790,7 +860,6 @@ def output_destination_choice_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# حفظ نام قبلی برای سازگاری کامل
 hardsub_destination_choice_kb = output_destination_choice_kb
 
 
@@ -799,15 +868,8 @@ def output_dest_tree_browser_kb(
     current_dir: Path,
     is_root: bool
 ) -> InlineKeyboardMarkup:
-    """
-    مرورگر درختی پوشه‌ها و زیرپوشه‌ها برای انتخاب مقصد سافت‌ساب و هاردساب:
-    - امکان ورود به زیرپوشه‌های تودرتو
-    - امکان ساخت پوشه جدید در همان مسیر فعلی
-    - امکان تایید پوشه فعلی به عنوان مقصد نهایی (بدون ساخت ۳ پوشه)
-    """
     builder = InlineKeyboardBuilder()
 
-    # دکمه تایید پوشه فعلی که کاربر داخل آن قرار دارد
     builder.row(
         InlineKeyboardButton(
             text=f"✅ ذخیره در همین پوشه ({smart_middle_truncate(current_dir.name, 26)})",
@@ -815,7 +877,6 @@ def output_dest_tree_browser_kb(
         )
     )
 
-    # لیست زیرپوشه‌های داخل این پوشه برای ورود به آن‌ها
     for idx, folder in enumerate(subfolders[:22]):
         builder.row(
             InlineKeyboardButton(
@@ -824,7 +885,6 @@ def output_dest_tree_browser_kb(
             )
         )
 
-    # دکمه ساخت پوشه جدید در همین دایرکتوری و بازگشت به پوشه بالاتر
     builder.row(
         InlineKeyboardButton(
             text="➕ ساخت پوشه جدید در همین مسیر",
@@ -871,8 +931,16 @@ def skip_or_cancel_kb(
     return builder.as_markup()
 
 
-def video_actions_kb(is_video: bool = True) -> InlineKeyboardMarkup:
+def video_actions_kb(is_video: bool = True, is_zip: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+
+    if is_zip:
+        builder.row(
+            InlineKeyboardButton(
+                text="📦 اکسترکت این فایل ZIP در همین پوشه",
+                callback_data="fact:extract_zip"
+            )
+        )
 
     if is_video:
         builder.row(
