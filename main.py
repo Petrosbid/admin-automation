@@ -58,6 +58,7 @@ RELOADABLE_MODULES_ORDER = [
     "services.cuteftp_service",
     "services.scraper_service",
     "services.downloader_service",
+    "services.automation_service",
     "services.monitor_service",
     "bot.keyboards",
     "bot.queue_handlers",

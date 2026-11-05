@@ -10,12 +10,20 @@ from services.mkv_service import MKVService
 
 
 class HandBrakeService:
+    RESOLUTION_LIMITS = {
+        "1080p": ("1920", "1080"),
+        "720p": ("1280", "720"),
+        "480p": ("854", "480"),
+    }
+
     @staticmethod
     def list_available_presets() -> list[dict[str, str]]:
         """خواندن لیست تمام پریست‌های JSON موجود در پوشه presets"""
         presets_dir = Path(cfg.get("paths", "presets_dir"))
         presets = []
-        for file_path in presets_dir.glob("*.json"):
+        if not presets_dir.exists():
+            return presets
+        for file_path in sorted(presets_dir.glob("*.json")):
             try:
                 data = json.loads(file_path.read_text(encoding="utf-8"))
                 preset_list = data.get("PresetList", [])
@@ -39,20 +47,16 @@ class HandBrakeService:
         preset_json_path: str,
         preset_name: str,
         secondary_en_srt_path: Path | None = None,
-        sync_mode: str = "none",     # 'none' | 'auto' | 'manual'
+        sync_mode: str = "none",
         sync_offset_ms: int = 0,
+        target_resolution: str | None = None,   # '1080p' | '720p' | '480p'
         progress_callback: Callable[[str], None] = None
     ) -> Path:
         """
-        منطق دقیق هاردساب طبق دستور جدید شما:
-        ۱. اگر زیرنویس فارسی داده شده از نوع .srt باشد:
-           - به صورت بولد و زرد (#fbff00) هاردساب (Burn-in) می‌شود.
-           - دیگر هیچ زیرنویس انگلیسی‌ای (نه از فایل ارسالی و نه از داخل خود فیلم) به خروجی اضافه نمی‌شود!
-        ۲. فقط اگر زیرنویس فارسی داده شده از نوع .ass یا .ssa باشد:
-           - بدون تغییر رنگ و بولد شدن، با استایل اصلی خودش هاردساب (Burn-in) می‌شود.
-           - زیرنویس انگلیسی (ارسالی یا موجود در خود فایل فیلم) به صورت سافت‌ساب (بدون Burn-in) به فایل اضافه می‌شود.
-        ۳. اگر هیچ زیرنویس فارسی‌ای داده نشده باشد:
-           - فیلم بدون هاردساب کردن هیچ زیرنویسی انکود می‌شود (و تمام زیرنویس‌های داخلی قبلی نیز حذف می‌شوند).
+        هاردساب حرفه‌ای با HandBrakeCLI:
+        - اگر زیرنویس فارسی .srt باشد: بولد و زرد (#fbff00) می‌شود و هیچ زیرنویس انگلیسی‌ای به آن اضافه نمی‌شود.
+        - اگر زیرنویس فارسی .ass باشد: بدون تغییر رنگ هاردساب می‌شود و زیرنویس انگلیسی به صورت سافت‌ساب اضافه می‌گردد.
+        - پشتیبانی از تغییر رزولوشن به 1080p / 720p / 480p از روی سورس FullHD.
         """
         output_media_path.parent.mkdir(parents=True, exist_ok=True)
         unique_tag = str(uuid.uuid4())[:6]
@@ -77,7 +81,6 @@ class HandBrakeService:
                 working_sub = output_media_path.with_name(f"_temp_sync_{unique_tag}{ext_lower}")
                 working_sub.write_text(SubtitleService.read_subtitle_safe(primary_srt_path), encoding="utf-8-sig")
 
-                # اجرای سینک در صورت انتخاب کاربر
                 if sync_mode == "auto" or cfg.get("subtitle_sync", "always_auto_sync", False):
                     await MKVService.sync_sub_against_video(
                         video_path=video_path,
@@ -94,15 +97,13 @@ class HandBrakeService:
                     burn_in_sub_path = working_sub
                 else:
                     if progress_callback:
-                        progress_callback("آماده‌سازی SRT بولد و زرد (#fbff00) برای هاردساب (حذف کامل سایر زیرنویس‌ها)...")
+                        progress_callback("آماده‌سازی SRT بولد و زرد (#fbff00) برای هاردساب...")
                     SubtitleService.style_srt_bold_yellow(working_sub, temp_styled_srt)
                     burn_in_sub_path = temp_styled_srt
 
             if progress_callback:
                 progress_callback("آماده‌سازی استریم موقت برای HandBrake...")
 
-            # تعیین اینکه آیا زیرنویس انگلیسی به صورت سافت‌ساب اجازه ورود دارد یا خیر:
-            # فقط و فقط اگر زیرنویس فارسی فرمت .ass / .ssa داشته باشد!
             allow_english_softsub = is_ass_format
 
             await MKVService.merge_softsub(
@@ -110,7 +111,7 @@ class HandBrakeService:
                 output_path=temp_mkv,
                 fa_sub_path=burn_in_sub_path,
                 en_sub_path=(secondary_en_srt_path if (allow_english_softsub and has_secondary_en) else None),
-                keep_old_subs=allow_english_softsub,  # اگر SRT باشد False می‌شود تا زیرنویس انگلیسی خود فیلم هم حذف شود
+                keep_old_subs=allow_english_softsub,
                 custom_brand=brand,
                 sync_mode="none"
             )
@@ -126,22 +127,24 @@ class HandBrakeService:
                 "--output", str(output_media_path),
             ]
 
+            # تنظیم ابعاد تصویر در صورتی که کاربر کیفیت خاصی (مثلاً 720p یا 480p) را از روی فایل FullHD خواسته باشد
+            if target_resolution and target_resolution in cls.RESOLUTION_LIMITS:
+                max_w, max_h = cls.RESOLUTION_LIMITS[target_resolution]
+                cmd.extend(["--maxWidth", max_w, "--maxHeight", max_h])
+
             if burn_in_sub_path is not None:
                 if allow_english_softsub and num_subs >= 2:
-                    # حالت ASS: ترک ۱ (فارسی ASS) هاردساب (Burn-in) شود + ترک ۲ (انگلیسی) به صورت سافت‌ساب اضافه شود
                     cmd.extend([
                         "--subtitle", "1,2",
                         "--subtitle-burned=1",
                         "--subtitle-default=none",
                     ])
                 else:
-                    # حالت SRT (یا ASS بدون انگلیسی): فقط ترک ۱ هاردساب شود و هیچ زیرنویس دیگری نباشد
                     cmd.extend([
                         "--subtitle", "1",
                         "--subtitle-burned=1",
                     ])
             else:
-                # هیچ زیرنویسی داده نشده است -> انکود بدون هیچ زیرنویسی
                 cmd.extend(["--subtitle", "none"])
 
             proc = await asyncio.create_subprocess_exec(

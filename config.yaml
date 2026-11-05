@@ -18,11 +18,21 @@ monitor:
   interval_seconds: 300    # هر ۵ دقیقه (۳۰۰ ثانیه)
   use_real_browser: true
   sites:
-    pahe: "https://pahe.ink/"
-    psa: "https://psa.wf/"
-    yts: "https://yts.gg/home"
-    digimovie: "https://digimoviez53.top/"
-    avamovie: "https://avasaraw.top/"
+    pahe:
+      enabled: true
+      url: "https://pahe.ink/"
+    psa:
+      enabled: true
+      url: "https://psa.wf/"
+    yts:
+      enabled: true
+      url: "https://yts.gg/home"
+    digimovie:
+      enabled: true
+      url: "https://digimoviez53.top/"
+    avamovie:
+      enabled: true
+      url: "https://avasaraw.top/"
 
 paths:
   workspace_dir: "C:\\MediaBot\\workspace"

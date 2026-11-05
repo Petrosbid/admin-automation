@@ -34,12 +34,12 @@ def _add_cache_buster(url: str) -> str:
 
 
 class SiteMonitorService:
-    SITE_URLS = {
-        "pahe": "https://pahe.ink/",
-        "psa": "https://psa.wf/",
-        "yts": "https://yts.gg/home",
-        "digimovie": "https://digimoviez53.top/",
-        "avamovie": "https://avasaraw.top/",
+    DEFAULT_SITES = {
+        "pahe": {"title": "Pahe", "url": "https://pahe.ink/", "enabled": True},
+        "psa": {"title": "PSA", "url": "https://psa.wf/", "enabled": True},
+        "yts": {"title": "YTS", "url": "https://yts.gg/home", "enabled": True},
+        "digimovie": {"title": "Digimoviez", "url": "https://digimoviez53.top/", "enabled": True},
+        "avamovie": {"title": "AvaMovie", "url": "https://avasaraw.top/", "enabled": True},
     }
 
     def __init__(self):
@@ -52,6 +52,76 @@ class SiteMonitorService:
         self._check_lock = asyncio.Lock()
         self._pw_installed = importlib.util.find_spec("playwright") is not None
         self._last_error_notified: dict[str, float] = {}
+
+    @classmethod
+    def get_all_sites_config(cls) -> dict[str, dict]:
+        """
+        خواندن پویا و لحظه‌ای لیست سایت‌ها، لینک فعلی و وضعیت فعال/غیرفعال بودن هر کدام از config.yaml
+        (پشتیبانی هم از فرمت دیکشنری جدید و هم فرمت رشته‌ای قدیمی)
+        """
+        raw_sites = cfg.get("monitor", "sites") or {}
+        sites_Status = {}
+
+        for key, def_info in cls.DEFAULT_SITES.items():
+            val = raw_sites.get(key)
+            if isinstance(val, dict):
+                url = str(val.get("url") or def_info["url"]).strip()
+                enabled = bool(val.get("enabled", True))
+            elif isinstance(val, str) and val.strip():
+                url = val.strip()
+                enabled = True
+            else:
+                url = def_info["url"]
+                enabled = def_info["enabled"]
+
+            sites_Status[key] = {
+                "title": def_info["title"],
+                "url": url,
+                "enabled": enabled,
+            }
+        return sites_Status
+
+    @classmethod
+    def get_site_url(cls, site_key: str) -> str:
+        all_cfg = cls.get_all_sites_config()
+        return all_cfg.get(site_key, {}).get("url", cls.DEFAULT_SITES.get(site_key, {}).get("url", ""))
+
+    @classmethod
+    def is_site_enabled(cls, site_key: str) -> bool:
+        all_cfg = cls.get_all_sites_config()
+        return bool(all_cfg.get(site_key, {}).get("enabled", True))
+
+    @classmethod
+    def set_site_url(cls, site_key: str, new_url: str):
+        """تغییر آدرس یک سایت و ذخیره دائمی در config.yaml"""
+        clean_url = new_url.strip()
+        if not clean_url.startswith(("http://", "https://")):
+            clean_url = "https://" + clean_url
+
+        all_cfg = cls.get_all_sites_config()
+        if site_key in all_cfg:
+            all_cfg[site_key]["url"] = clean_url
+
+        serializable = {
+            k: {"enabled": v["enabled"], "url": v["url"]}
+            for k, v in all_cfg.items()
+        }
+        cfg.set_value("monitor", "sites", serializable)
+
+    @classmethod
+    def toggle_site_enabled(cls, site_key: str) -> bool:
+        """فعال یا غیرفعال کردن یک سایت خاص و ذخیره در config.yaml"""
+        all_cfg = cls.get_all_sites_config()
+        new_state = not all_cfg.get(site_key, {}).get("enabled", True)
+        if site_key in all_cfg:
+            all_cfg[site_key]["enabled"] = new_state
+
+        serializable = {
+            k: {"enabled": v["enabled"], "url": v["url"]}
+            for k, v in all_cfg.items()
+        }
+        cfg.set_value("monitor", "sites", serializable)
+        return new_state
 
     @property
     def state_file(self) -> Path:
@@ -67,13 +137,13 @@ class SiteMonitorService:
         return p_dir
 
     def _load_state(self) -> dict[str, list[str]]:
-        default_state = {k: [] for k in self.SITE_URLS}
+        default_state = {k: [] for k in self.DEFAULT_SITES}
         if self.state_file.exists():
             try:
                 raw = self.state_file.read_text(encoding="utf-8")
                 data = json.loads(raw)
                 if isinstance(data, dict):
-                    for k in self.SITE_URLS:
+                    for k in self.DEFAULT_SITES:
                         if isinstance(data.get(k), list):
                             default_state[k] = data[k]
             except Exception as e:
@@ -81,7 +151,6 @@ class SiteMonitorService:
         return default_state
 
     def _save_state(self, state: dict[str, list[str]]):
-        """ذخیره اتمیک و ایمن وضعیت سایت‌ها روی دیسک تا با ری‌استارت ربات هرگز پاک نشود"""
         try:
             trimmed = {k: list(dict.fromkeys(v))[-300:] for k, v in state.items()}
             temp_file = self.state_file.with_suffix(".tmp")
@@ -94,7 +163,6 @@ class SiteMonitorService:
             logging.error(f"Failed to save monitor_state.json: {e}")
 
     async def send_error_notification(self, bot: Bot | None, site_key: str, error_text: str, force: bool = False):
-        """ارسال پیام خطا به تلگرام (با محدودیت ضد اسپم هر ۳۰ دقیقه یک‌بار برای هر سایت در پس‌زمینه)"""
         if not bot:
             return
         now = time.time()
@@ -103,11 +171,12 @@ class SiteMonitorService:
             return
         self._last_error_notified[site_key] = now
 
-        url = self.SITE_URLS.get(site_key, site_key)
+        url = self.get_site_url(site_key)
         msg = (
             f"⚠️ **خطا در مانیتورینگ سایت `{site_key.upper()}`**\n"
-            f"🌐 آدرس: `{url}`\n"
-            f"❌ علت خطا:\n`{str(error_text)[:350]}`"
+            f"🌐 آدرس فعلی: `{url}`\n"
+            f"❌ علت خطا:\n`{str(error_text)[:350]}`\n\n"
+            "💡 اگر آدرس سایت تغییر کرده است، از بخش `/settings` ⬅️ **تنظیمات مانیتورینگ** لینک جدید را وارد کنید."
         )
         for admin_id in cfg.get("telegram", "admin_ids", []):
             try:
@@ -150,15 +219,18 @@ class SiteMonitorService:
                         **launch_kwargs
                     )
 
-                for key, url in self.SITE_URLS.items():
+                sites_cfg = self.get_all_sites_config()
+                for key, info in sites_cfg.items():
+                    if not info["enabled"]:
+                        continue
                     page = await self._browser_context.new_page()
                     self._pages[key] = page
                     try:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                        await page.goto(info["url"], wait_until="domcontentloaded", timeout=25000)
                     except Exception as e:
                         logging.warning(f"Initial navigation warning for {key}: {e}")
 
-                logging.info("Real Browser opened with 5 tabs for Captcha solving.")
+                logging.info("Real Browser opened for active monitored sites.")
                 return True
             except Exception as e:
                 logging.warning(f"Playwright browser could not start: {e}")
@@ -167,30 +239,33 @@ class SiteMonitorService:
 
     async def open_captcha_tabs_for_admin(self) -> str:
         self._pw_installed = importlib.util.find_spec("playwright") is not None
+        sites_cfg = self.get_all_sites_config()
+        active_sites = {k: v for k, v in sites_cfg.items() if v["enabled"]}
+
         ok = await self.ensure_real_browser_open()
         if ok and self._browser_context:
-            for key, url in self.SITE_URLS.items():
+            for key, info in active_sites.items():
                 page = self._pages.get(key)
                 if page is None or page.is_closed():
                     page = await self._browser_context.new_page()
                     self._pages[key] = page
                 try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                    await page.goto(info["url"], wait_until="domcontentloaded", timeout=25000)
                     await page.bring_to_front()
                 except Exception:
                     pass
             return (
-                "✅ پنجره مرورگر روی دسکتاپ ویندوز سرور باز شد و تب‌های هر ۵ سایت بارگذاری شدند.\n\n"
+                f"✅ پنجره مرورگر روی دسکتاپ ویندوز سرور باز شد و تب‌های `{len(active_sites)}` سایت فعال بارگذاری شدند.\n\n"
                 "🔓 اکنون می‌توانید روی سرور کپچای آن‌ها را حل کنید؛ کوکی‌های حل کپچا ذخیره می‌شوند."
             )
 
-        for url in self.SITE_URLS.values():
+        for info in active_sites.values():
             try:
-                webbrowser.open(url)
+                webbrowser.open(info["url"])
             except Exception:
                 pass
         return (
-            "🌐 صفحات سایت‌ها در مرورگر ویندوز سرور باز شدند.\n\n"
+            "🌐 صفحات سایت‌های فعال در مرورگر ویندوز سرور باز شدند.\n\n"
             "💡 برای راه‌اندازی مرورگر خودکار پایتون، دستورات زیر را در ترمینال سرور اجرا کنید:\n"
             "`pip install playwright`\n"
             "`playwright install chromium`"
@@ -206,10 +281,9 @@ class SiteMonitorService:
         return False
 
     async def _get_site_html(self, site_key: str, bot: Bot | None = None) -> str:
-        base_url = self.SITE_URLS[site_key]
+        base_url = self.get_site_url(site_key)
         fresh_url = _add_cache_buster(base_url)
 
-        # ۱. استفاده از مرورگر واقعی فقط اگر نصب و فعال باشد
         if cfg.get("monitor", "use_real_browser", True) and self._pw_installed:
             ok = await self.ensure_real_browser_open()
             if ok and self._browser_context:
@@ -239,7 +313,6 @@ class SiteMonitorService:
 
                     return html
 
-        # ۲. دریافت مستقیم با cloudscraper همراه با هدرهای ضدکش (جلوگیری از دریافت صفحه کش شده)
         def _sync_get():
             scraper = cloudscraper.create_scraper(
                 browser={"browser": "chrome", "platform": "windows", "desktop": True}
@@ -262,7 +335,7 @@ class SiteMonitorService:
         return html
 
     @staticmethod
-    def _parse_pahe_html(html: str) -> list[dict]:
+    def _parse_pahe_html(html: str, base_url: str) -> list[dict]:
         soup = _make_soup(html)
         posts = []
         articles = soup.select("section.recent-blog article.item-list") or soup.select("article.item-list")
@@ -272,7 +345,7 @@ class SiteMonitorService:
             if not title_el:
                 continue
             post_title = title_el.get_text(strip=True)
-            post_url = title_el.get("href", "").strip().split("?")[0]
+            post_url = urljoin(base_url, title_el.get("href", "").strip()).split("?")[0]
             if not post_url:
                 continue
 
@@ -280,15 +353,14 @@ class SiteMonitorService:
             post_date = date_el.get_text(strip=True) if date_el else ""
             cats = [a.get_text(strip=True) for a in art.select("span.post-cats a")]
             img_el = art.select_one("div.post-thumbnail img")
-            poster = img_el.get("src", "").strip() if img_el else ""
+            poster = urljoin(base_url, img_el.get("src", "").strip()) if img_el else ""
             excerpt_el = art.select_one("div.entry p")
             excerpt = excerpt_el.get_text(" ", strip=True) if excerpt_el else ""
 
-            # شناسه شامل لینک + عنوان کامل (که در Pahe حاوی شماره قسمت یا کیفیت جدید است)
             unique_id = f"{post_url}|{post_title}"
             posts.append({
                 "id": unique_id,
-                "site": "Pahe.ink",
+                "site": "Pahe",
                 "title": post_title,
                 "url": post_url,
                 "details": post_date,
@@ -299,8 +371,7 @@ class SiteMonitorService:
         return posts
 
     @staticmethod
-    def _parse_psa_html(html: str) -> list[dict]:
-        base_url = "https://psa.wf/"
+    def _parse_psa_html(html: str, base_url: str) -> list[dict]:
         soup = _make_soup(html)
         posts = []
         articles = soup.select("div.featured article.post, div#grid-wrapper article.post")
@@ -325,7 +396,7 @@ class SiteMonitorService:
             unique_id = f"{post_url}|{post_title}|{update_text}"
             posts.append({
                 "id": unique_id,
-                "site": "PSA.wf",
+                "site": "PSA",
                 "title": post_title,
                 "url": post_url,
                 "details": f"{update_text} ({post_date})".strip(),
@@ -336,19 +407,17 @@ class SiteMonitorService:
         return posts
 
     @staticmethod
-    def _parse_yts_html(html: str) -> list[dict]:
+    def _parse_yts_html(html: str, base_url: str) -> list[dict]:
         soup = _make_soup(html)
         posts = []
-        latest_cards = soup.select("div.content-dark div.home-movies div.browse-movie-wrap")
-        if not latest_cards:
-            latest_cards = soup.select("div.browse-movie-wrap")
+        latest_cards = soup.select("div.content-dark div.home-movies div.browse-movie-wrap") or soup.select("div.browse-movie-wrap")
 
         for card in latest_cards[:12]:
             title_el = card.select_one("a.browse-movie-title")
             if not title_el:
                 continue
             post_title = title_el.get_text(" ", strip=True)
-            post_url = urljoin("https://yts.gg", title_el.get("href", "").strip()).split("?")[0]
+            post_url = urljoin(base_url, title_el.get("href", "").strip()).split("?")[0]
 
             year_el = card.select_one("div.browse-movie-year")
             year_text = year_el.get_text(strip=True) if year_el else ""
@@ -370,12 +439,12 @@ class SiteMonitorService:
                 if "rating" not in (h4.get("class") or [])
             ]
             img_el = card.select_one("figure img.img-responsive")
-            poster = urljoin("https://yts.gg", img_el.get("src", "").strip()) if img_el else ""
+            poster = urljoin(base_url, img_el.get("src", "").strip()) if img_el else ""
 
             unique_id = f"{post_url}|{quality}"
             posts.append({
                 "id": unique_id,
-                "site": "YTS.gg",
+                "site": "YTS",
                 "title": f"{post_title} ({year_text})" if year_text else post_title,
                 "url": post_url,
                 "details": f"کیفیت: {quality or 'HD'} | امتیاز: ⭐ {rating}",
@@ -386,15 +455,12 @@ class SiteMonitorService:
         return posts
 
     @staticmethod
-    def _parse_digimovie_html(html: str) -> list[dict]:
-        base_url = "https://digimoviez53.top/"
+    def _parse_digimovie_html(html: str, base_url: str) -> list[dict]:
         soup = _make_soup(html)
         posts = []
 
         # ۱. رصد بخش «سریال‌های جدید و محبوب -> جدیدترین»
-        series_cards = soup.select("div.last_series div#box_tab1 div.item_dubbled")
-        if not series_cards:
-            series_cards = soup.select("div.last_series div.item_dubbled")
+        series_cards = soup.select("div.last_series div#box_tab1 div.item_dubbled") or soup.select("div.last_series div.item_dubbled")
 
         for s_card in series_cards[:15]:
             a_tag = s_card.select_one("a")
@@ -420,7 +486,9 @@ class SiteMonitorService:
             ep_el = s_card.select_one("div.text_holder_series")
             ep_update_text = re.sub(r"\s+", " ", ep_el.get_text(" ", strip=True)) if ep_el else "قسمت جدید منتشر شد"
 
-            unique_id = f"SERIE|{post_url}|{ep_update_text}"
+            # استفاده از مسیر نسبی (Path) در شناسه یکتا تا با تغییر دامنه سایت، پست‌های قبلی تکراری ارسال نشوند!
+            rel_path = urlparse(post_url).path.rstrip("/")
+            unique_id = f"SERIE|{rel_path}|{ep_update_text}"
             posts.append({
                 "id": unique_id,
                 "site": "Digimoviez (بروزرسانی سریال)",
@@ -447,14 +515,14 @@ class SiteMonitorService:
             notif_el = item.select_one("div.notif_items div.item_notif")
             notif_text = notif_el.get_text(strip=True) if notif_el else ""
 
-            # استخراج کیفیت فعلی پست (تا اگر کیفیت جدیدتری مثل 1080p BluRay اضافه شد، تشخیص دهد)
             qual_el = item.select_one("div.meta_item ul li span.res_item.iranYekanReg")
             qual_text = qual_el.get_text(strip=True) if qual_el else ""
 
             plot_el = item.select_one("div.plot_text")
             plot = plot_el.get_text(" ", strip=True) if plot_el else ""
 
-            unique_id = f"MAIN|{post_url}|{notif_text}|{qual_text}"
+            rel_path = urlparse(post_url).path.rstrip("/")
+            unique_id = f"MAIN|{rel_path}|{notif_text}|{qual_text}"
             posts.append({
                 "id": unique_id,
                 "site": "Digimoviez",
@@ -469,8 +537,7 @@ class SiteMonitorService:
         return posts
 
     @staticmethod
-    def _parse_avamovie_html(html: str) -> list[dict]:
-        base_url = "https://avasaraw.top/"
+    def _parse_avamovie_html(html: str, base_url: str) -> list[dict]:
         soup = _make_soup(html)
         posts = []
         series_items = soup.select("section.update-series div.item-series")
@@ -490,7 +557,8 @@ class SiteMonitorService:
             plot_el = item.select_one("div.plot div.text")
             plot = plot_el.get_text(" ", strip=True) if plot_el else ""
 
-            unique_id = f"SERIE|{post_url}|{update_txt}"
+            rel_path = urlparse(post_url).path.rstrip("/")
+            unique_id = f"SERIE|{rel_path}|{update_txt}"
             posts.append({
                 "id": unique_id,
                 "site": "AvaMovie (سریال)",
@@ -513,7 +581,8 @@ class SiteMonitorService:
             genre_el = item.select_one("div.hover div.genre")
             genres = genre_el.get_text(strip=True) if genre_el else ""
 
-            unique_id = f"MOVIE|{post_url}"
+            rel_path = urlparse(post_url).path.rstrip("/")
+            unique_id = f"MOVIE|{rel_path}"
             posts.append({
                 "id": unique_id,
                 "site": "AvaMovie (فیلم)",
@@ -527,23 +596,23 @@ class SiteMonitorService:
         return posts
 
     async def fetch_site_posts(self, site_key: str, bot: Bot | None = None) -> list[dict]:
-        # اعمال تایم‌اوت ۴۰ ثانیه‌ای روی دریافت هر سایت تا لوپ ۵ دقیقه‌ای هرگز قفل نشود
+        base_url = self.get_site_url(site_key)
         html = await asyncio.wait_for(self._get_site_html(site_key, bot=bot), timeout=40.0)
         if site_key == "pahe":
-            posts = self._parse_pahe_html(html)
+            posts = self._parse_pahe_html(html, base_url)
         elif site_key == "psa":
-            posts = self._parse_psa_html(html)
+            posts = self._parse_psa_html(html, base_url)
         elif site_key == "yts":
-            posts = self._parse_yts_html(html)
+            posts = self._parse_yts_html(html, base_url)
         elif site_key == "digimovie":
-            posts = self._parse_digimovie_html(html)
+            posts = self._parse_digimovie_html(html, base_url)
         elif site_key == "avamovie":
-            posts = self._parse_avamovie_html(html)
+            posts = self._parse_avamovie_html(html, base_url)
         else:
             posts = []
 
         if not posts:
-            raise RuntimeError("سایت باز شد اما هیچ پستی استخراج نشد (احتمال تغییر ساختار یا صفحه کپچا).")
+            raise RuntimeError("سایت باز شد اما هیچ پستی استخراج نشد (احتمال تغییر دامنه یا صفحه کپچا).")
         return posts
 
     @staticmethod
@@ -602,33 +671,32 @@ class SiteMonitorService:
                 logging.error(f"Failed to send monitor alert to {admin_id}: {e}")
 
     async def check_all_sites_once(self, bot: Bot, notify_on_first_seed: bool = False) -> dict[str, int]:
-        """
-        بررسی هر ۵ سایت:
-        - اگر برای سایتی هنوز هیچ سابقه‌ای در monitor_state.json ثبت نشده باشد (اولین اجرا):
-          پست‌های فعلی را بدون اسپم کردن تلگرام در فایل ذخیره (Seed) می‌کند تا در چرخه‌های ۵ دقیقه‌ای بعدی،
-          فقط پست‌های واقعاً جدید را اعلام کند!
-        - اگر در چرخه‌های بعدی پست جدیدی منتشر شده باشد، بلافاصله در تلگرام ارسال می‌کند.
-        """
         async with self._check_lock:
             now_str = datetime.now().strftime("%H:%M:%S")
-            logging.info(f"🔎 [MONITOR {now_str}] شروع بررسی خودکار ۵ سایت (Pahe, PSA, YTS, Digimoviez, AvaMovie)...")
+            sites_cfg = self.get_all_sites_config()
+            active_keys = [k for k, v in sites_cfg.items() if v["enabled"]]
+            logging.info(f"🔎 [MONITOR {now_str}] بررسی خودکار سایت‌های فعال: {active_keys}...")
 
             state = self._load_state()
-            site_keys = ("pahe", "psa", "yts", "digimovie", "avamovie")
-            new_counts = {k: 0 for k in site_keys}
+            new_counts = {k: 0 for k in self.DEFAULT_SITES}
 
-            for site_key in site_keys:
+            for site_key, s_info in sites_cfg.items():
+                if not s_info["enabled"]:
+                    continue
                 try:
                     posts = await self.fetch_site_posts(site_key, bot=bot)
                     seen_list = state.get(site_key, [])
                     seen_ids = set(seen_list)
+                    # تطبیق شناسه‌های قدیمی که با کل URL ذخیره شده بودند با شناسه‌های جدید مبتنی بر Path
+                    seen_paths = {sid.split("|")[1] if "|" in sid else sid for sid in seen_ids}
                     is_first_seed = (len(seen_ids) == 0)
 
-                    # حفظ ترتیب انتشار (از قدیمی‌ترینِ جدیدها به جدیدترین)
-                    new_posts = [p for p in reversed(posts) if p["id"] not in seen_ids]
+                    new_posts = [
+                        p for p in reversed(posts)
+                        if p["id"] not in seen_ids
+                    ]
 
                     if is_first_seed:
-                        # ذخیره اولیه تمام پست‌های موجود روی صفحه تا موقع ری‌استارت اسپم نشوند
                         state[site_key] = [p["id"] for p in reversed(posts)]
                         self._save_state(state)
                         logging.info(f"📌 [MONITOR] سایت {site_key}: تعداد {len(posts)} پست اولیه در حافظه ثبت شد.")
@@ -671,7 +739,7 @@ class SiteMonitorService:
     def start(self, bot: Bot):
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._loop(bot))
-            logging.info("Site Monitor started (checking 5 sites every 5 minutes).")
+            logging.info("Site Monitor started.")
 
     def stop(self):
         self._running = False

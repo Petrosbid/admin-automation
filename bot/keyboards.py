@@ -23,6 +23,14 @@ def smart_middle_truncate(text: str, max_len: int = 40) -> str:
 def main_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
+    # دکمه ویژه اتوماسیون کامل ۱-کلیکی فیلم و سریال در بالاترین بخش منو
+    builder.row(
+        InlineKeyboardButton(
+            text="🚀 اتوماسیون کامل و هوشمند (فیلم / سریال SxxEyy)",
+            callback_data="menu:smart_auto"
+        )
+    )
+
     builder.row(
         InlineKeyboardButton(
             text="📡 مانیتورینگ خودکار (۵ سایت فیلم و سریال)",
@@ -32,11 +40,11 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="📁 ساخت پوشه جدید در Workspace",
+            text="📁 ساخت پوشه (فیلم / سریال)",
             callback_data="menu:create_folder"
         ),
         InlineKeyboardButton(
-            text="📥 آپلود زیرنویس (SRT / ASS / ZIP)",
+            text="📥 آپلود زیرنویس (SRT/ASS/ZIP)",
             callback_data="menu:upload_sub_target"
         )
     )
@@ -45,26 +53,20 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(
             text="🔍 ۱. جستجو در سایت‌ها",
             callback_data="menu:search"
-        )
-    )
-
-    builder.row(
+        ),
         InlineKeyboardButton(
-            text="📥 ۲. دانلود لینک مستقیم / تورنت / Mega / GDrive",
+            text="📥 ۲. دانلود لینک / تورنت",
             callback_data="menu:direct_dl"
         )
     )
 
     builder.row(
         InlineKeyboardButton(
-            text="📤 ۳. استخراج زیرنویس (از فایل موجود در پوشه / از لینک)",
+            text="📤 ۳. استخراج زیرنویس (از پوشه / لینک)",
             callback_data="menu:link_extract_sub"
-        )
-    )
-
-    builder.row(
+        ),
         InlineKeyboardButton(
-            text="🎬 ۴. سافت‌ساب / هاردساب فیلم‌ها",
+            text="🎬 ۴. سافت‌ساب/هاردساب دستی",
             callback_data="menu:sub_to_files"
         )
     )
@@ -90,8 +92,164 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+# ==================================================
+# SMART FULL AUTOMATION KEYBOARDS
+# ==================================================
+
+def smart_auto_browser_kb(
+    folders: list[Path],
+    current_dir: Path,
+    is_root: bool,
+    detected_episodes: list[str]
+) -> InlineKeyboardMarkup:
+    """مرورگر انتخاب پوشه فیلم یا فصل سریال برای اتوماسیون کامل"""
+    builder = InlineKeyboardBuilder()
+
+    if not is_root:
+        if detected_episodes:
+            # اگر پوشه فصل سریال است و قسمت‌های SxxEyy در آن پیدا شده، دکمه انتخاب سریع هر قسمت را نمایش بده
+            for ep in detected_episodes[:15]:
+                builder.row(
+                    InlineKeyboardButton(
+                        text=f"⚡ شروع اتوماسیون برای قسمت {ep} در این فصل",
+                        callback_data=f"sauto:ep:{ep}"
+                    )
+                )
+        builder.row(
+            InlineKeyboardButton(
+                text=f"✅ اجرای اتوماسیون روی کل این پوشه ({smart_middle_truncate(current_dir.name, 24)})",
+                callback_data="sauto:select_dir"
+            )
+        )
+
+    for idx, folder in enumerate(folders[:22]):
+        builder.row(
+            InlineKeyboardButton(
+                text=f"📁 [{idx+1}] {smart_middle_truncate(folder.name, 38)}",
+                callback_data=f"sauto:open:{idx}"
+            )
+        )
+
+    if not is_root:
+        builder.row(
+            InlineKeyboardButton(
+                text="⬆️ بازگشت به پوشه قبلی (Up)",
+                callback_data="sauto:up"
+            )
+        )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 انصراف و منوی اصلی",
+            callback_data="menu:home"
+        )
+    )
+    return builder.as_markup()
+
+
+def smart_auto_sub_name_kb(suggested_name: str, original_name: str) -> InlineKeyboardMarkup:
+    """کیبورد انتخاب سریع نام فایل زیرنویس فارسی در پوشه srt/FA یا srt"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text=f"✅ نام استاندارد: {smart_middle_truncate(suggested_name, 32)}",
+            callback_data="sauto_subname:standard"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"📄 حفظ نام فعلی: {smart_middle_truncate(original_name, 32)}",
+            callback_data="sauto_subname:keep"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 انصراف",
+            callback_data="menu:home"
+        )
+    )
+    return builder.as_markup()
+
+
+def smart_auto_missing_en_kb(has_embedded_en: bool) -> InlineKeyboardMarkup:
+    """کیبورد تصمیم‌گیری در صورت نبودن زیرنویس انگلیسی در پوشه srt/EN"""
+    builder = InlineKeyboardBuilder()
+    if has_embedded_en:
+        builder.row(
+            InlineKeyboardButton(
+                text="✅ بله، خودکار از فیلم استخراج و در پوشه srt قرار بده",
+                callback_data="sauto_en:auto_extract"
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="📤 آپلود دستی فایل زیرنویس انگلیسی (.srt / .zip)",
+            callback_data="sauto_en:upload"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="⏭ ادامه بدون زیرنویس انگلیسی",
+            callback_data="sauto_en:skip"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 انصراف",
+            callback_data="menu:home"
+        )
+    )
+    return builder.as_markup()
+
+
+def smart_auto_hardsub_qualities_kb(selected_qualities: set[str]) -> InlineKeyboardMarkup:
+    """
+    سوال چندگزینه‌ای (Multi-Choice) برای انتخاب کدام یک از ۳ کیفیت اصلی هاردساب شوند
+    (از روی فایل موجود در پوشه FullHD)
+    """
+    builder = InlineKeyboardBuilder()
+
+    for q in ("1080p", "720p", "480p"):
+        mark = "✅" if q in selected_qualities else "⬜"
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{mark} هاردساب کیفیت {q} (در پوشه {q}-HardSub)",
+                callback_data=f"sauto_hbq:toggle:{q}"
+            )
+        )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="🔥 انتخاب هر ۳ کیفیت (1080p + 720p + 480p)",
+            callback_data="sauto_hbq:all"
+        ),
+        InlineKeyboardButton(
+            text="⚡ فقط 1080p و 720p",
+            callback_data="sauto_hbq:1080_720"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="⏭ بدون هاردساب (فقط ساخت تمام سافت‌ساب‌ها)",
+            callback_data="sauto_hbq:none"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"🚀 شروع اتوماسیون کامل ({len(selected_qualities)} هاردساب + تمام سافت‌ساب‌ها)",
+            callback_data="sauto_hbq:launch"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 انصراف",
+            callback_data="menu:home"
+        )
+    )
+    return builder.as_markup()
+
+
 def extract_sub_entry_kb() -> InlineKeyboardMarkup:
-    """منوی انتخاب روش استخراج زیرنویس: از فایل موجود در دایرکتوری یا دانلود از لینک"""
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
@@ -119,7 +277,6 @@ def local_extract_browser_kb(
     videos: list[Path],
     is_root: bool
 ) -> InlineKeyboardMarkup:
-    """مرورگر پوشه‌به‌پوشه برای انتخاب فایل ویدئویی موجود در دایرکتوری جهت استخراج زیرنویس"""
     builder = InlineKeyboardBuilder()
 
     for idx, folder in enumerate(folders[:20]):
@@ -159,15 +316,22 @@ def monitor_menu_kb(is_enabled: bool) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     status_label = (
-        "🟢 فعال (توقف مانیتورینگ)"
+        "🟢 مانیتورینگ کلی: فعال (توقف)"
         if is_enabled
-        else "🔴 غیرفعال (شروع مانیتورینگ)"
+        else "🔴 مانیتورینگ کلی: غیرفعال (شروع)"
     )
 
     builder.row(
         InlineKeyboardButton(
             text=status_label,
             callback_data="mon:toggle"
+        )
+    )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="⚙️ مدیریت لینک جدید و فعال/غیرفعال کردن تک‌تک سایت‌ها",
+            callback_data="cfgsec:monitor"
         )
     )
 
@@ -180,7 +344,7 @@ def monitor_menu_kb(is_enabled: bool) -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="🔄 بررسی فوری ۵ سایت",
+            text="🔄 بررسی فوری سایت‌های فعال",
             callback_data="mon:check_now"
         )
     )
@@ -204,14 +368,20 @@ def monitor_menu_kb(is_enabled: bool) -> InlineKeyboardMarkup:
 
     return builder.as_markup()
 
-
 def folder_structure_choice_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     builder.row(
         InlineKeyboardButton(
-            text="📂 ساختار استاندارد (softsub / hardsub / sub)",
-            callback_data="mktype:standard"
+            text="🎬 ساختار استاندارد فیلم (SoftSub / Hardsub / srt)",
+            callback_data="mktype:movie"
+        )
+    )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="📺 ساختار استاندارد فصل سریال (FullHD / HardSub / srt/FA & EN)",
+            callback_data="mktype:series"
         )
     )
 
@@ -424,6 +594,14 @@ def file_browser_kb(
 
     has_files_in_dir = False
 
+    if not is_root:
+        builder.row(
+            InlineKeyboardButton(
+                text="🚀 اجرای اتوماسیون هوشمند روی همین پوشه",
+                callback_data="fact:run_smart_auto_here"
+            )
+        )
+
     for idx, path in enumerate(items[:25]):
         if path.is_dir():
             builder.row(
@@ -482,7 +660,7 @@ def file_browser_kb(
         )
         builder.row(
             InlineKeyboardButton(
-                text=f"🎬 سافت‌ساب / هاردساب ({sel_count} فایل انتخابی)",
+                text=f"🎬 سافت‌ساب / هاردساب دستی ({sel_count} فایل)",
                 callback_data="fact:batch_sub"
             )
         )
@@ -648,20 +826,43 @@ def subtitle_folder_browser_kb(
     return builder.as_markup()
 
 
-def queue_management_kb(tasks: list[Any]) -> InlineKeyboardMarkup:
+def queue_management_kb(
+    page_tasks: list[Any],
+    page: int = 0,
+    total_pages: int = 1
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+
+    # ردیف ۱: دکمه‌های بروزرسانی صفحه فعلی و پاکسازی تمام‌شده‌ها
     builder.row(
         InlineKeyboardButton(
             text="🔄 بروزرسانی لحظه‌ای",
-            callback_data="menu:queues"
+            callback_data=f"qpage:{page}"
         ),
         InlineKeyboardButton(
             text="🧹 پاکسازی تمام‌شده‌ها",
-            callback_data="qact:clear_finished"
+            callback_data=f"qact:clear_finished:{page}"
         ),
     )
 
-    for t in reversed(tasks):
+    # ردیف ۲: دکمه‌های صفحه‌بندی (Pagination) در صورتی که بیش از ۱ صفحه وجود داشته باشد
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(
+                InlineKeyboardButton(text="⬅️ قبلی", callback_data=f"qpage:{page - 1}")
+            )
+        nav_buttons.append(
+            InlineKeyboardButton(text=f"📄 صفحه {page + 1} از {total_pages}", callback_data="qnoop")
+        )
+        if page < total_pages - 1:
+            nav_buttons.append(
+                InlineKeyboardButton(text="بعدی ➡️", callback_data=f"qpage:{page + 1}")
+            )
+        builder.row(*nav_buttons)
+
+    # ردیف‌های بعدی: دکمه‌های توقف یا حذف فقط برای ۶ پراسس موجود در همین صفحه
+    for t in page_tasks:
         status_str = str(getattr(t, "status", ""))
         is_done = getattr(
             t,
@@ -672,14 +873,14 @@ def queue_management_kb(tasks: list[Any]) -> InlineKeyboardMarkup:
             builder.row(
                 InlineKeyboardButton(
                     text=f"🗑 حذف #{t.task_id} | {smart_middle_truncate(t.title, 28)}",
-                    callback_data=f"qdel:{t.task_id}"
+                    callback_data=f"qdel:{t.task_id}:{page}"
                 )
             )
         else:
             builder.row(
                 InlineKeyboardButton(
                     text=f"🛑 توقف و حذف #{t.task_id} | {smart_middle_truncate(t.title, 24)}",
-                    callback_data=f"qcancel:{t.task_id}"
+                    callback_data=f"qcancel:{t.task_id}:{page}"
                 )
             )
 
@@ -691,7 +892,6 @@ def queue_management_kb(tasks: list[Any]) -> InlineKeyboardMarkup:
     )
     return builder.as_markup()
 
-
 def subtitle_source_kb(
     language: str,
     local_subs_count: int = 0
@@ -702,7 +902,7 @@ def subtitle_source_kb(
     count_badge = f" ({local_subs_count} فایل یافت شد)" if local_subs_count > 0 else ""
     builder.row(
         InlineKeyboardButton(
-            text=f"📂 انتخاب زیرنویس {language_name} از پوشه sub / فیلم{count_badge}",
+            text=f"📂 انتخاب زیرنویس {language_name} از پوشه srt / فیلم{count_badge}",
             callback_data=f"subscan:{language}"
         )
     )
@@ -738,7 +938,7 @@ def subtitle_file_found_kb(
     builder = InlineKeyboardBuilder()
 
     for idx, path in enumerate(files[:20]):
-        folder_hint = f"[{path.parent.name}] " if path.parent.name.lower() == "sub" else ""
+        folder_hint = f"[{path.parent.name}] " if path.parent.name.lower() in ("sub", "srt", "fa", "en") else ""
         builder.row(
             InlineKeyboardButton(
                 text=f"📄 [{idx+1}] {folder_hint}{smart_middle_truncate(path.name, 34)}",
@@ -835,7 +1035,7 @@ def output_destination_choice_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text="📂 حالت پیش‌فرض (ساخت ۳ پوشه و ذخیره در softsub/hardsub)",
+            text="📂 حالت پیش‌فرض (ذخیره در پوشه استاندارد SoftSub/HardSub)",
             callback_data="outdest:default"
         )
     )

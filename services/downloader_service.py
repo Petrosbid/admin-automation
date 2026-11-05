@@ -46,18 +46,18 @@ class DownloaderService:
 
     @staticmethod
     def create_movie_folders(movie_title: str) -> dict[str, Path]:
-        """ساخت پوشه فیلم به همراه زیرپوشه‌های softsub, hardsub, sub"""
+        """ساخت پوشه فیلم به همراه زیرپوشه‌های استاندارد SoftSub, Hardsub, srt"""
         workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-        safe_name = re.sub(r'[<>:"/\\|?*]', "", movie_title).strip().replace(" ", "_")
+        safe_name = re.sub(r'[<>:"/\\|?*]', "", movie_title).strip().replace(" ", ".")
         if not safe_name:
             safe_name = "Media_Download"
         base_dir = workspace / safe_name
 
         folders = {
             "base": base_dir,
-            "SoftSub": base_dir / "SoftSub",
-            "HardSub": base_dir / "HardSub",
-            "srt": base_dir / "srt",
+            "softsub": base_dir / "SoftSub",
+            "hardsub": base_dir / "Hardsub",
+            "sub": base_dir / "srt",
         }
         for p in folders.values():
             p.mkdir(parents=True, exist_ok=True)

@@ -43,6 +43,7 @@ class MainStates(StatesGroup):
     waiting_batch_rename_pattern = State()
     waiting_rename_dir = State()
     waiting_new_config_value = State()
+    waiting_new_site_url = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -253,24 +254,170 @@ async def handle_new_config_value(message: Message, state: FSMContext):
 
 
 # ==================== بخش مانیتورینگ ۵ دقیقه‌ای سایت‌ها و حل کپچا ====================
+class MainStates(StatesGroup):
+    waiting_new_folder_name = State()
+    waiting_new_folder_type = State()
+    waiting_target_folder_sub_file = State()
+    waiting_custom_cuteftp_path = State()
+    waiting_new_fav_cuteftp_path = State()
+    waiting_batch_rename_pattern = State()
+    waiting_rename_dir = State()
+    waiting_new_config_value = State()
+    waiting_new_site_url = State()
+
+
+# ==================== بخش تنظیمات تعاملی (/settings) + مدیریت لینک و وضعیت تک‌تک سایت‌ها ====================
+def _sections_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for sec_key, label in SECTION_LABELS.items():
+        if sec_key in cfg.data:
+            builder.row(InlineKeyboardButton(text=label, callback_data=f"cfgsec:{sec_key}"))
+    builder.row(InlineKeyboardButton(text="🔙 بازگشت به منوی اصلی", callback_data="menu:home"))
+    return builder.as_markup()
+
+
+def _section_keys_kb(section: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    sec_data = cfg.get(section) or {}
+    if isinstance(sec_data, dict):
+        for k, v in sec_data.items():
+            if isinstance(v, (dict, list)):
+                continue
+            val_preview = "🟢 True" if v is True else ("🔴 False" if v is False else str(v)[:28])
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"✏️ {k}: {val_preview}",
+                    callback_data=f"cfgkey:{section}:{k}"
+                )
+            )
+
+    # اگر بخش مانیتورینگ انتخاب شده است، دکمه‌های فعال/غیرفعال کردن و تغییر لینک تک‌تک سایت‌ها را اضافه کن
+    if section == "monitor":
+        sites_cfg = monitor_service.get_all_sites_config()
+        for s_key, s_info in sites_cfg.items():
+            status_icon = "🟢 فعال" if s_info["enabled"] else "🔴 غیرفعال"
+            short_url = s_info["url"].replace("https://", "").replace("http://", "").rstrip("/")
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"{status_icon} | {s_info['title']}",
+                    callback_data=f"monsite:toggle:{s_key}"
+                ),
+                InlineKeyboardButton(
+                    text=f"🔗 تغییر لینک ({short_url[:18]})",
+                    callback_data=f"monsite:url:{s_key}"
+                )
+            )
+        builder.row(InlineKeyboardButton(text="📡 بازگشت به پنل مانیتورینگ", callback_data="menu:monitor"))
+
+    builder.row(InlineKeyboardButton(text="🔙 بازگشت به دسته‌بندی تنظیمات", callback_data="menu:settings"))
+    return builder.as_markup()
+
+
+@router.callback_query(F.data.startswith("cfgsec:"))
+async def cb_open_config_section(call: CallbackQuery, state: FSMContext):
+    section = call.data.split(":", 1)[1]
+    sec_data = cfg.get(section) or {}
+    label = SECTION_LABELS.get(section, section)
+
+    lines = [f"⚙️ **بخش: {label}**\n"]
+    if isinstance(sec_data, dict):
+        for k, v in sec_data.items():
+            if isinstance(v, (dict, list)):
+                continue
+            lines.append(f"• `{k}` = `{v}`")
+
+    if section == "monitor":
+        lines.append("\n🌐 **وضعیت و آدرس فعلی تک‌تک سایت‌های مانیتورینگ:**")
+        sites_cfg = monitor_service.get_all_sites_config()
+        for s_key, s_info in sites_cfg.items():
+            st_badge = "🟢 فعال" if s_info["enabled"] else "🔴 غیرفعال"
+            lines.append(f"• **{s_info['title']}** ({st_badge}):\n  `{s_info['url']}`")
+        lines.append("\n👇 برای **فعال/غیرفعال کردن هر سایت** یا **وارد کردن لینک جدید** (مثلاً آدرس جدید دیجی‌موویز)، روی دکمه مربوطه کلیک کنید:")
+    else:
+        lines.append("\n👇 برای تغییر هر مورد، روی دکمه آن کلیک کنید:")
+
+    await call.message.edit_text(
+        "\n".join(lines),
+        reply_markup=_section_keys_kb(section),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("monsite:toggle:"))
+async def cb_toggle_single_monitor_site(call: CallbackQuery, state: FSMContext):
+    site_key = call.data.split(":")[2]
+    new_state = monitor_service.toggle_site_enabled(site_key)
+    status_txt = "فعال 🟢" if new_state else "غیرفعال 🔴"
+    await call.answer(f"مانیتورینگ سایت {site_key.upper()} {status_txt} شد!")
+    call.data = "cfgsec:monitor"
+    await cb_open_config_section(call, state)
+
+
+@router.callback_query(F.data.startswith("monsite:url:"))
+async def cb_change_single_monitor_site_url(call: CallbackQuery, state: FSMContext):
+    site_key = call.data.split(":")[2]
+    sites_cfg = monitor_service.get_all_sites_config()
+    s_info = sites_cfg.get(site_key, {})
+    current_url = s_info.get("url", "")
+    title = s_info.get("title", site_key.upper())
+
+    await state.update_data(edit_site_key=site_key, edit_site_title=title)
+    await state.set_state(MainStates.waiting_new_site_url)
+
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔙 انصراف و بازگشت", callback_data="cfgsec:monitor"))
+
+    await call.message.edit_text(
+        f"🔗 **تغییر آدرس سایت {title} (`{site_key}`)**\n\n"
+        f"🔹 آدرس فعلی (برای کپی لمس کنید):\n`{current_url}`\n\n"
+        "✏️ لطفاً **لینک (دامنه) جدید سایت** را ارسال کنید (مثلاً `https://digimoviez54.top/`):",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+
+
+@router.message(MainStates.waiting_new_site_url)
+async def handle_new_site_url_input(message: Message, state: FSMContext):
+    new_url = (message.text or "").strip()
+    if not new_url or "." not in new_url:
+        return await message.answer("⚠️ آدرس وارد شده معتبر نیست. لطفاً لینک کامل سایت را بفرستید:")
+
+    data = await state.get_data()
+    site_key = data["edit_site_key"]
+    title = data.get("edit_site_title", site_key)
+
+    monitor_service.set_site_url(site_key, new_url)
+    saved_url = monitor_service.get_site_url(site_key)
+    await state.clear()
+
+    await message.answer(
+        f"✅ آدرس سایت **{title}** با موفقیت به:\n`{saved_url}`\nتغییر یافت و در `config.yaml` ذخیره شد!",
+        reply_markup=_section_keys_kb("monitor"),
+        parse_mode="Markdown"
+    )
+
+
 @router.callback_query(F.data == "menu:monitor")
 async def cb_monitor_menu(call: CallbackQuery):
     enabled = bool(cfg.get("monitor", "enabled", True))
     interval = cfg.get("monitor", "interval_seconds", 300)
+    sites_cfg = monitor_service.get_all_sites_config()
+
+    site_lines = []
+    for idx, (s_key, s_info) in enumerate(sites_cfg.items(), start=1):
+        badge = "🟢" if s_info["enabled"] else "🔴"
+        site_lines.append(f"{idx}️⃣ {badge} **{s_info['title']}**: `{s_info['url']}`")
+
+    sites_block = "\n".join(site_lines)
     await call.message.edit_text(
         "📡 **پنل مانیتورینگ خودکار ۵ سایت**\n\n"
-        "🌐 سایت‌های تحت رصد:\n"
-        "1️⃣ `https://pahe.ink/`\n"
-        "2️⃣ `https://psa.wf/`\n"
-        "3️⃣ `https://yts.gg/home`\n"
-        "4️⃣ `https://digimoviez53.top/` (شامل باکس سریال‌های جدید)\n"
-        "5️⃣ `https://avasaraw.top/`\n\n"
+        f"🌐 **سایت‌های تحت رصد:**\n{sites_block}\n\n"
         f"⏱ بازه رفرش خودکار: هر `{interval // 60}` دقیقه یک‌بار\n"
-        f"📊 وضعیت فعلی: {'🟢 فعال' if enabled else '🔴 غیرفعال'}",
+        f"📊 وضعیت کلی مانیتورینگ: {'🟢 فعال' if enabled else '🔴 غیرفعال'}\n\n"
+        "💡 برای تغییر آدرس سایت‌ها (مثل لینک جدید دیجی‌موویز) یا خاموش/روشن کردن هر سایت، دکمه **«⚙️ مدیریت لینک...»** را بزنید.",
         reply_markup=monitor_menu_kb(enabled),
         parse_mode="Markdown"
     )
-
 
 @router.callback_query(F.data == "mon:toggle")
 async def cb_monitor_toggle(call: CallbackQuery):
@@ -396,18 +543,23 @@ async def handle_new_folder_name(message: Message, state: FSMContext):
 
 @router.callback_query(MainStates.waiting_new_folder_type, F.data.startswith("mktype:"))
 async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
-    mk_type = call.data.split(":")[1]
+    mk_type = call.data.split(":")[1]  # movie | series | standard | empty
     data = await state.get_data()
     parent_dir = Path(data.get("mkdir_parent", cfg.get("paths", "workspace_dir")))
     folder_name = data["new_folder_name"]
     new_dir = parent_dir / folder_name
     new_dir.mkdir(parents=True, exist_ok=True)
 
-    if mk_type == "standard":
-        for sub_name in ("softsub", "hardsub", "sub"):
+    if mk_type in ("movie", "standard"):
+        for sub_name in ("SoftSub", "Hardsub", "srt"):
             (new_dir / sub_name).mkdir(parents=True, exist_ok=True)
-        sub_target = new_dir / "sub"
-        desc = "به همراه زیرپوشه‌های `softsub`، `hardsub` و `sub`"
+        sub_target = new_dir / "srt"
+        desc = "با ساختار استاندارد فیلم (`SoftSub`, `Hardsub`, `srt`)"
+    elif mk_type == "series":
+        for sub_name in ("FullHD", "1080p-HardSub", "720p-HardSub", "srt/FA", "srt/EN"):
+            (new_dir / sub_name).mkdir(parents=True, exist_ok=True)
+        sub_target = new_dir / "srt" / "FA"
+        desc = "با ساختار استاندارد فصل سریال (`FullHD`, `1080p-HardSub`, `720p-HardSub`, `srt/FA`, `srt/EN`)"
     else:
         sub_target = new_dir
         desc = "به صورت پوشه خام"
@@ -416,7 +568,8 @@ async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
     await state.update_data(target_sub_dir=str(sub_target), current_dir=str(new_dir))
 
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="📥 آپلود زیرنویس در این پوشه", callback_data="qsub:now"))
+    kb.row(InlineKeyboardButton(text="🚀 اجرای اتوماسیون هوشمند در این پوشه", callback_data="fact:run_smart_auto_here"))
+    kb.row(InlineKeyboardButton(text="📥 آپلود زیرنویس / ZIP در این پوشه", callback_data="qsub:now"))
     kb.row(InlineKeyboardButton(text="📂 مشاهده پوشه در فایل‌منیجر", callback_data="menu:file_mgr"))
     kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
 
@@ -426,7 +579,6 @@ async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
         reply_markup=kb.as_markup(),
         parse_mode="Markdown"
     )
-
 
 # ==================== آپلود زیرنویس در پوشه هدف ====================
 @router.callback_query(F.data == "menu:upload_sub_target")
