@@ -23,7 +23,6 @@ def smart_middle_truncate(text: str, max_len: int = 40) -> str:
 def main_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
-    # دکمه ویژه اتوماسیون کامل ۱-کلیکی فیلم و سریال در بالاترین بخش منو
     builder.row(
         InlineKeyboardButton(
             text="🚀 اتوماسیون کامل و هوشمند (فیلم / سریال SxxEyy)",
@@ -40,7 +39,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="📁 ساخت پوشه (فیلم / سریال)",
+            text="📁 ساخت پوشه (فیلم / سریال / انیمه)",
             callback_data="menu:create_folder"
         ),
         InlineKeyboardButton(
@@ -55,7 +54,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             callback_data="menu:search"
         ),
         InlineKeyboardButton(
-            text="📥 ۲. دانلود لینک / تورنت",
+            text="📥 ۲. دانلود لینک / تورنت (Batch)",
             callback_data="menu:direct_dl"
         )
     )
@@ -66,7 +65,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             callback_data="menu:link_extract_sub"
         ),
         InlineKeyboardButton(
-            text="🎬 ۴. سافت‌ساب/هاردساب دستی",
+            text="🎬 ۴. سافت‌ساب / هاردساب / انکود دستی",
             callback_data="menu:sub_to_files"
         )
     )
@@ -103,15 +102,11 @@ def smart_auto_browser_kb(
     detected_episodes: list[str],
     selected_episodes: set[str] | None = None
 ) -> InlineKeyboardMarkup:
-    """
-    مرورگر انتخاب پوشه فیلم یا انتخاب چندقسمتی (Multi-Episode) فصل سریال برای اتوماسیون کامل
-    """
     selected_episodes = selected_episodes or set()
     builder = InlineKeyboardBuilder()
 
     if not is_root:
         if detected_episodes:
-            # نمایش دکمه‌های تیک‌دار برای انتخاب یک یا چند قسمت از فصل
             ep_buttons = []
             for ep in detected_episodes[:24]:
                 mark = "✅" if ep in selected_episodes else "⬜"
@@ -121,7 +116,6 @@ def smart_auto_browser_kb(
                         callback_data=f"sauto:ep_toggle:{ep}"
                     )
                 )
-            # چیدمان ۳تایی دکمه‌های قسمت‌ها در هر ردیف برای زیبایی و سرعت بالا
             for i in range(0, len(ep_buttons), 3):
                 builder.row(*ep_buttons[i:i + 3])
 
@@ -172,8 +166,8 @@ def smart_auto_browser_kb(
     )
     return builder.as_markup()
 
+
 def smart_auto_sub_name_kb(suggested_name: str, original_name: str) -> InlineKeyboardMarkup:
-    """کیبورد انتخاب سریع نام فایل زیرنویس فارسی در پوشه srt/FA یا srt"""
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
@@ -197,7 +191,6 @@ def smart_auto_sub_name_kb(suggested_name: str, original_name: str) -> InlineKey
 
 
 def smart_auto_missing_en_kb(has_embedded_en: bool) -> InlineKeyboardMarkup:
-    """کیبورد تصمیم‌گیری در صورت نبودن زیرنویس انگلیسی در پوشه srt/EN"""
     builder = InlineKeyboardBuilder()
     if has_embedded_en:
         builder.row(
@@ -227,23 +220,51 @@ def smart_auto_missing_en_kb(has_embedded_en: bool) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def smart_auto_hardsub_qualities_kb(
+def smart_auto_final_selection_kb(
+    available_softsub_qualities: list[str],
+    selected_softsub_qualities: set[str],
     selected_hardsub_srt: set[str],
-    selected_encode_ass: set[str] | None = None,
     auto_upload: bool = True
 ) -> InlineKeyboardMarkup:
     """
-    پنل انتخاب چندگزینه‌ای دو نوع هاردساب + سوییچ آپلود خودکار بعد از اتمام:
-    ۱. هاردساب فارسی SRT (در پوشه‌های 1080p-HardSub, 720p-HardSub, 480p-HardSub)
-    ۲. انکود با movie.ass + سافت‌ساب انگلیسی (در پوشه‌های 1080p-EBTV, 720p-EBTV, 480p-EBTV)
+    پنل نهایی اتوماسیون (بدون انکود movie.ass):
+    ۱. انتخاب تکی یا کلی پوشه‌های کیفیت خام (بدون سافت‌ساب) که باید سافت‌ساب شوند
+    ۲. انتخاب چندگزینه‌ای ۳ کیفیت هاردساب فارسی SRT (1080p-HardSub, 720p-HardSub, 480p-HardSub)
+    ۳. سوییچ آپلود خودکار بعد از اتمام
     """
-    selected_encode_ass = selected_encode_ass or set()
     builder = InlineKeyboardBuilder()
 
-    # بخش اول: هاردساب زیرنویس فارسی (SRT) -> پوشه X-HardSub
+    # بخش ۱: انتخاب کیفیت‌های خام برای سافت‌ساب کردن
+    if available_softsub_qualities:
+        builder.row(
+            InlineKeyboardButton(
+                text="━━ 📎 ۱. انتخاب پوشه‌های کیفیت خام برای SoftSub ━━",
+                callback_data="qnoop"
+            )
+        )
+        soft_btns = []
+        for idx, q_name in enumerate(available_softsub_qualities[:20]):
+            mark = "✅" if q_name in selected_softsub_qualities else "⬜"
+            soft_btns.append(
+                InlineKeyboardButton(
+                    text=f"{mark} {smart_middle_truncate(q_name, 22)}",
+                    callback_data=f"sauto_hbq:toggle_soft:{idx}"
+                )
+            )
+        for i in range(0, len(soft_btns), 2):
+            builder.row(*soft_btns[i:i + 2])
+
+        builder.row(
+            InlineKeyboardButton(
+                text="☑️ انتخاب / لغو انتخاب همه کیفیت‌های سافت‌ساب",
+                callback_data="sauto_hbq:all_soft"
+            )
+        )
+
+    # بخش ۲: انتخاب ۳ کیفیت اصلی هاردساب فارسی SRT (از پوشه FullHD)
     builder.row(
         InlineKeyboardButton(
-            text="━━ 🔥 ۱. هاردساب زیرنویس فارسی (پوشه HardSub) ━━",
+            text="━━ 🔥 ۲. انتخاب کیفیت‌های HardSub (از FullHD) ━━",
             callback_data="qnoop"
         )
     )
@@ -258,37 +279,18 @@ def smart_auto_hardsub_qualities_kb(
         )
     builder.row(*hb_btns)
 
-    # بخش دوم: انکود با movie.ass + سافت‌ساب انگلیسی -> پوشه X-EBTV
     builder.row(
         InlineKeyboardButton(
-            text="━━ 🎬 ۲. انکود با movie.ass (پوشه EBTV) ━━",
-            callback_data="qnoop"
-        )
-    )
-    enc_btns = []
-    for q in ("1080p", "720p", "480p"):
-        mark = "✅" if q in selected_encode_ass else "⬜"
-        enc_btns.append(
-            InlineKeyboardButton(
-                text=f"{mark} {q}-EBTV",
-                callback_data=f"sauto_hbq:toggle_ass:{q}"
-            )
-        )
-    builder.row(*enc_btns)
-
-    # دکمه‌های انتخاب سریع
-    builder.row(
-        InlineKeyboardButton(
-            text="⚡ هر دو نوع (1080p + 720p)",
-            callback_data="sauto_hbq:preset_both_hd"
+            text="🔥 هر ۳ هاردساب",
+            callback_data="sauto_hbq:all_srt"
         ),
         InlineKeyboardButton(
-            text="🧹 بدون هاردساب/انکود (فقط سافت‌ساب)",
-            callback_data="sauto_hbq:clear_all"
+            text="🧹 بدون هاردساب (فقط سافت‌ساب)",
+            callback_data="sauto_hbq:no_srt"
         )
     )
 
-    # سوییچ آپلود خودکار بعد از اتمام هر فایل
+    # بخش ۳: سوییچ آپلود خودکار پس از اتمام هر فایل
     up_mark = "🟢 فعال" if auto_upload else "🔴 غیرفعال"
     builder.row(
         InlineKeyboardButton(
@@ -297,10 +299,9 @@ def smart_auto_hardsub_qualities_kb(
         )
     )
 
-    total_jobs = len(selected_hardsub_srt) + len(selected_encode_ass)
     builder.row(
         InlineKeyboardButton(
-            text=f"🚀 شروع اتوماسیون ({total_jobs} هاردساب/انکود + تمام سافت‌ساب‌ها)",
+            text=f"🚀 شروع اتوماسیون ({len(selected_softsub_qualities)} سافت‌ساب + {len(selected_hardsub_srt)} هاردساب)",
             callback_data="sauto_hbq:launch"
         )
     )
@@ -311,6 +312,115 @@ def smart_auto_hardsub_qualities_kb(
         )
     )
     return builder.as_markup()
+
+
+def manual_encode_ass_qualities_kb(
+    selected_qualities: set[str],
+    auto_upload: bool = True
+) -> InlineKeyboardMarkup:
+    """
+    کیبورد اختصاصی انکود دستی با movie.ass (ترکیب‌شده با هاردساب دستی و بدون نیاز به آپلود زیرنویس):
+    ذخیره در پوشه‌های 1080p-EBTV, 720p-EBTV, 480p-EBTV
+    """
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="━━ 🎬 انتخاب کیفیت‌های انکود با movie.ass ━━",
+            callback_data="qnoop"
+        )
+    )
+    btns = []
+    for q in ("1080p", "720p", "480p"):
+        mark = "✅" if q in selected_qualities else "⬜"
+        btns.append(
+            InlineKeyboardButton(
+                text=f"{mark} {q}-EBTV",
+                callback_data=f"menc_q:toggle:{q}"
+            )
+        )
+    builder.row(*btns)
+
+    builder.row(
+        InlineKeyboardButton(
+            text="☑️ انتخاب هر ۳ کیفیت (1080p + 720p + 480p)",
+            callback_data="menc_q:all"
+        )
+    )
+
+    up_mark = "🟢 فعال" if auto_upload else "🔴 غیرفعال"
+    builder.row(
+        InlineKeyboardButton(
+            text=f"☁️ آپلود خودکار به سرور پس از اتمام انکود: {up_mark}",
+            callback_data="menc_q:toggle_upload"
+        )
+    )
+
+    builder.row(
+        InlineKeyboardButton(
+            text=f"🚀 شروع انکود با movie.ass ({len(selected_qualities)} کیفیت)",
+            callback_data="menc_q:launch"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 انصراف",
+            callback_data="menu:home"
+        )
+    )
+    return builder.as_markup()
+
+
+def download_folder_tree_browser_kb(
+    subfolders: list[Path],
+    current_dir: Path,
+    is_root: bool
+) -> InlineKeyboardMarkup:
+    """
+    مرورگر درختی کامل برای انتخاب پوشه مقصد دانلود (رفع محدودیت انتخاب فقط پوشه‌های اصلی):
+    - امکان ورود به زیرپوشه‌های تودرتو (Series -> نام سریال -> S01 -> FullHD و غیره)
+    - امکان ساخت پوشه جدید در هر سطح
+    - دکمه تایید دانلود در همان پوشه فعلی
+    """
+    builder = InlineKeyboardBuilder()
+
+    builder.row(
+        InlineKeyboardButton(
+            text=f"📥 دانلود در همین پوشه فعلی ({smart_middle_truncate(current_dir.name, 24)})",
+            callback_data="dlnav:select_here"
+        )
+    )
+
+    for idx, folder in enumerate(subfolders[:22]):
+        builder.row(
+            InlineKeyboardButton(
+                text=f"📁 [{idx+1}] باز کردن: {smart_middle_truncate(folder.name, 34)}",
+                callback_data=f"dlnav:open:{idx}"
+            )
+        )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="➕ ساخت پوشه جدید در همین مسیر",
+            callback_data="dlnav:mkdir_here"
+        )
+    )
+
+    if not is_root:
+        builder.row(
+            InlineKeyboardButton(
+                text="⬆️ بازگشت به پوشه قبلی (Up)",
+                callback_data="dlnav:up"
+            )
+        )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 انصراف و منوی اصلی",
+            callback_data="menu:home"
+        )
+    )
+    return builder.as_markup()
+
 
 def extract_sub_entry_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -431,6 +541,7 @@ def monitor_menu_kb(is_enabled: bool) -> InlineKeyboardMarkup:
 
     return builder.as_markup()
 
+
 def folder_structure_choice_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
@@ -472,46 +583,6 @@ def folder_structure_choice_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def subtitle_mode_kb() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-
-    builder.row(
-        InlineKeyboardButton(
-            text="📎 فقط SoftSub",
-            callback_data="submode:softsub"
-        )
-    )
-
-    builder.row(
-        InlineKeyboardButton(
-            text="🔥 هاردساب فارسی SRT (در پوشه HardSub)",
-            callback_data="submode:hardsub"
-        )
-    )
-
-    builder.row(
-        InlineKeyboardButton(
-            text="🎬 انکود با movie.ass + سافت‌ساب انگلیسی (در پوشه EBTV)",
-            callback_data="submode:encode_ass"
-        )
-    )
-
-    builder.row(
-        InlineKeyboardButton(
-            text="🚀 هر دو عملیات (SoftSub + HardSub)",
-            callback_data="submode:both"
-        )
-    )
-
-    builder.row(
-        InlineKeyboardButton(
-            text="🔙 انصراف",
-            callback_data="menu:home"
-        )
-    )
-
-    return builder.as_markup()
-
 def target_folders_kb(
     folders: list[Path],
     base_workspace: Path
@@ -534,36 +605,6 @@ def target_folders_kb(
     builder.row(
         InlineKeyboardButton(
             text="🔙 منوی اصلی",
-            callback_data="menu:home"
-        )
-    )
-
-    return builder.as_markup()
-
-
-def download_target_folders_kb(
-    folders: list[Path]
-) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-
-    for idx, folder in enumerate(folders[:25]):
-        builder.row(
-            InlineKeyboardButton(
-                text=f"📂 [{idx+1}] {smart_middle_truncate(folder.name, 38)}",
-                callback_data=f"dlfolder:{idx}"
-            )
-        )
-
-    builder.row(
-        InlineKeyboardButton(
-            text="➕ ساخت پوشه جدید",
-            callback_data="dlnew"
-        )
-    )
-
-    builder.row(
-        InlineKeyboardButton(
-            text="🔙 انصراف",
             callback_data="menu:home"
         )
     )
@@ -770,7 +811,7 @@ def file_browser_kb(
         )
         builder.row(
             InlineKeyboardButton(
-                text=f"🎬 سافت‌ساب / هاردساب دستی ({sel_count} فایل)",
+                text=f"🎬 سافت‌ساب / هاردساب / انکود دستی ({sel_count} فایل)",
                 callback_data="fact:batch_sub"
             )
         )
@@ -844,40 +885,6 @@ def file_browser_kb(
     return builder.as_markup()
 
 
-def multi_video_select_kb(
-    videos: list[Path],
-    selected_indices: set[int]
-) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-
-    for idx, video in enumerate(videos[:25]):
-        mark = "✅" if idx in selected_indices else "⬜"
-        rel_label = f"{video.parent.name}/{video.name}"
-
-        builder.row(
-            InlineKeyboardButton(
-                text=f"{mark} [{idx+1}] {smart_middle_truncate(rel_label, 36)}",
-                callback_data=f"mvsel:{idx}"
-            )
-        )
-
-    builder.row(
-        InlineKeyboardButton(
-            text="📎 ادامه به مرحله زیرنویس ➡️",
-            callback_data="mvact:proceed"
-        )
-    )
-
-    builder.row(
-        InlineKeyboardButton(
-            text="🔙 انصراف",
-            callback_data="menu:home"
-        )
-    )
-
-    return builder.as_markup()
-
-
 def subtitle_folder_browser_kb(
     folders: list[Path],
     videos: list[Path],
@@ -923,7 +930,7 @@ def subtitle_folder_browser_kb(
     count = len(selected_paths)
     builder.row(
         InlineKeyboardButton(
-            text=f"📎 ادامه به مرحله زیرنویس ({count} فایل انتخاب شده) ➡️",
+            text=f"➡️ ادامه و انتخاب نوع عملیات ({count} فایل انتخاب شده)",
             callback_data="mvact:proceed"
         )
     )
@@ -941,9 +948,6 @@ def queue_management_kb(
     page: int = 0,
     total_pages: int = 1
 ) -> InlineKeyboardMarkup:
-    """
-    کیبورد مدیریت صف مجهز به دکمه‌های تغییر اولویت (⏫ صدر صف، ⬆️ بالاتر، ⬇️ پایین‌تر) برای پراسس‌های در انتظار
-    """
     builder = InlineKeyboardBuilder()
 
     builder.row(
@@ -989,7 +993,6 @@ def queue_management_kb(
                 )
             )
         elif is_pending:
-            # برای پراسس‌های در انتظار: دکمه‌های جابجایی اولویت + دکمه لغو
             builder.row(
                 InlineKeyboardButton(
                     text=f"⏫ صدر #{t.task_id}",
@@ -1023,6 +1026,7 @@ def queue_management_kb(
         )
     )
     return builder.as_markup()
+
 
 def subtitle_source_kb(
     language: str,
@@ -1130,25 +1134,33 @@ def sync_options_kb() -> InlineKeyboardMarkup:
 
 
 def subtitle_mode_kb() -> InlineKeyboardMarkup:
+    """منوی انتخاب نوع عملیات در بخش دستی (ترکیب سافت‌ساب، هاردساب فارسی و انکود movie.ass بدون زیرنویس)"""
     builder = InlineKeyboardBuilder()
 
     builder.row(
         InlineKeyboardButton(
-            text="📎 فقط SoftSub",
+            text="🎬 انکود با movie.ass (در پوشه EBTV - بدون نیاز به زیرنویس)",
+            callback_data="submode:encode_ass"
+        )
+    )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="📎 فقط SoftSub (نیازمند زیرنویس)",
             callback_data="submode:softsub"
         )
     )
 
     builder.row(
         InlineKeyboardButton(
-            text="🔥 فقط HardSub",
+            text="🔥 فقط HardSub فارسی (نیازمند زیرنویس)",
             callback_data="submode:hardsub"
         )
     )
 
     builder.row(
         InlineKeyboardButton(
-            text="🚀 هر دو عملیات (SoftSub + HardSub)",
+            text="🚀 هر دو عملیات (SoftSub + HardSub فارسی)",
             callback_data="submode:both"
         )
     )
@@ -1288,8 +1300,15 @@ def video_actions_kb(is_video: bool = True, is_zip: bool = False) -> InlineKeybo
                 callback_data="vact:softsub"
             ),
             InlineKeyboardButton(
-                text="🔥 HardSub",
+                text="🔥 HardSub فارسی",
                 callback_data="vact:hardsub"
+            )
+        )
+
+        builder.row(
+            InlineKeyboardButton(
+                text="🎬 انکود با movie.ass (پوشه EBTV - بدون زیرنویس)",
+                callback_data="vact:encode_ass"
             )
         )
 

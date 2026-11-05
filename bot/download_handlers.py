@@ -14,9 +14,10 @@ from core.queue_manager import queue_engine
 from services.scraper_service import ScraperService
 from services.downloader_service import DownloaderService
 from services.mkv_service import MKVService
+from services.automation_service import AutomationService
 from bot.keyboards import (
     main_menu_kb, search_categories_kb, search_sites_kb,
-    search_results_kb, download_target_folders_kb,
+    search_results_kb, download_folder_tree_browser_kb,
     extract_sub_entry_kb, local_extract_browser_kb
 )
 
@@ -26,8 +27,8 @@ router = Router()
 class DownloadStates(StatesGroup):
     waiting_search_query = State()
     waiting_direct_link = State()
-    choosing_download_folder = State()
-    waiting_direct_folder_name = State()
+    browsing_download_folder = State()
+    waiting_new_dl_subfolder_name = State()
     waiting_link_for_sub_extract = State()
     browsing_local_for_sub_extract = State()
 
@@ -37,10 +38,6 @@ def is_admin(user_id: int) -> bool:
 
 
 def _extract_batch_links(raw_text: str) -> list[str]:
-    """
-    استخراج هوشمند یک یا چند لینک از متن ارسالی کاربر (پشتیبانی از Batch Download با خط فاصله یا خطوط پشت سر هم)
-    پشتیبانی از: http://, https://, magnet:?xt=
-    """
     if not raw_text:
         return []
     links: list[str] = []
@@ -48,7 +45,6 @@ def _extract_batch_links(raw_text: str) -> list[str]:
         clean = line.strip()
         if not clean:
             continue
-        # اگر در یک خط لینک وجود دارد
         matches = re.findall(r"(magnet:\?xt=[^\s]+|https?://[^\s]+)", clean)
         if matches:
             for m in matches:
@@ -60,25 +56,52 @@ def _extract_batch_links(raw_text: str) -> list[str]:
     return links
 
 
-async def _show_download_targets(target_msg_or_call: Message | CallbackQuery, state: FSMContext):
+async def _render_download_folder_browser(
+    target_msg_or_call: Message | CallbackQuery,
+    state: FSMContext,
+    current_dir: Path
+):
+    """
+    مرورگر درختی کامل برای انتخاب پوشه مقصد دانلود:
+    کاربر می‌تواند وارد پوشه‌های Series / Anime / Movies و تمام زیرپوشه‌های داخلی آن‌ها (مثل S01/FullHD) شود
+    یا در هر سطحی پوشه جدید بسازد.
+    """
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    AutomationService.ensure_workspace_root_categories()
+    current_dir = current_dir.resolve()
+    current_dir.mkdir(parents=True, exist_ok=True)
+
+    subfolders = sorted(
+        [
+            p for p in current_dir.iterdir()
+            if p.is_dir() and not p.name.startswith("_") and p.name != "browser_profile"
+        ],
+        key=lambda x: x.name.lower()
+    )
+
     data = await state.get_data()
     targets = data.get("pending_direct_targets", [])
-    folders = DownloaderService.list_workspace_folders()
-    await state.update_data(dl_available_folders=[str(f.resolve()) for f in folders])
-    await state.set_state(DownloadStates.choosing_download_folder)
 
-    folder_lines = "\n".join([f"`[{i+1}]` 📂 `{f.name}`" for i, f in enumerate(folders[:25])])
-    list_block = f"\n📋 **لیست پوشه‌ها:**\n{folder_lines}\n" if folder_lines else ""
+    await state.set_state(DownloadStates.browsing_download_folder)
+    await state.update_data(
+        dl_browser_curr_dir=str(current_dir),
+        dl_browser_subfolders=[str(f.resolve()) for f in subfolders]
+    )
 
-    batch_badge = f"📦 **تعداد لینک‌های دریافت‌شده برای دانلود گروهی (Batch):** `{len(targets)}` لینک\n" if len(targets) > 1 else ""
+    is_root = (current_dir == workspace)
+    folder_lines = "\n".join([f"`[{i+1}]` 📁 `{f.name}`" for i, f in enumerate(subfolders[:22])])
+    list_block = folder_lines if folder_lines else "_(زیرپوشه‌ای در این مسیر وجود ندارد)_"
+    batch_badge = f"📦 **تعداد لینک‌های آماده دانلود:** `{len(targets)}` مورد\n" if targets else ""
 
     text = (
-        f"📂 **انتخاب پوشه مقصد دانلود:**\n"
+        f"📂 **مرورگر انتخاب پوشه مقصد دانلود**\n"
         f"{batch_badge}"
-        f"{list_block}\n"
-        "یکی از پوشه‌های موجود زیر را انتخاب کنید و یا دکمه **«➕ ساخت پوشه جدید»** را بزنید:"
+        f"📍 **مسیر فعلی باز شده:**\n`{current_dir}`\n\n"
+        f"📋 **زیرپوشه‌های این مسیر:**\n{list_block}\n\n"
+        "• برای دانلود در همین پوشه فعلی، دکمه **«📥 دانلود در همین پوشه فعلی»** را بزنید.\n"
+        "• برای ورود به زیرپوشه‌های بعدی، روی نام پوشه کلیک کنید و یا در همینجا پوشه جدید بسازید:"
     )
-    kb = download_target_folders_kb(folders)
+    kb = download_folder_tree_browser_kb(subfolders, current_dir, is_root)
 
     if isinstance(target_msg_or_call, CallbackQuery):
         await target_msg_or_call.message.edit_text(text[:4000], reply_markup=kb, parse_mode="Markdown")
@@ -87,7 +110,6 @@ async def _show_download_targets(target_msg_or_call: Message | CallbackQuery, st
 
 
 async def _enqueue_batch_downloads(targets: list[str], dest_dir: Path) -> list[str]:
-    """قرار دادن یک یا چند لینک در صف دانلود"""
     task_ids = []
     total = len(targets)
     for idx, t_link in enumerate(targets, start=1):
@@ -169,10 +191,11 @@ async def cb_click_search_result(call: CallbackQuery, state: FSMContext):
         )
 
     await state.update_data(pending_direct_targets=[chosen["target"]])
-    await _show_download_targets(call, state)
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    await _render_download_folder_browser(call, state, workspace)
 
 
-# ==================== ۲. دانلود لینک مستقیم / تورنت / مگا / گوگل درایو (تکی و Batch) ====================
+# ==================== ۲. دانلود لینک مستقیم / تورنت / مگا / گوگل درایو (تکی و Batch با مرورگر درختی پوشه) ====================
 @router.callback_query(F.data == "menu:direct_dl")
 async def cb_direct_dl(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -202,18 +225,32 @@ async def handle_direct_link_input(message: Message, state: FSMContext):
         return await message.answer("⚠️ لطفاً لینک یا فایل `.torrent` ارسال کنید:")
 
     await state.update_data(pending_direct_targets=targets)
-    await _show_download_targets(message, state)
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    await _render_download_folder_browser(message, state, workspace)
 
 
-@router.callback_query(DownloadStates.choosing_download_folder, F.data.startswith("dlfolder:"))
-async def cb_select_existing_dl_folder(call: CallbackQuery, state: FSMContext):
-    idx = int(call.data.split(":")[1])
+@router.callback_query(DownloadStates.browsing_download_folder, F.data.startswith("dlnav:open:"))
+async def cb_dlnav_open_subfolder(call: CallbackQuery, state: FSMContext):
+    idx = int(call.data.split(":")[2])
     data = await state.get_data()
-    folders = data.get("dl_available_folders", [])
-    if idx >= len(folders):
-        return await call.answer("⚠️ پوشه یافت نشد.", show_alert=True)
+    subfolders = data.get("dl_browser_subfolders", [])
+    if idx < len(subfolders):
+        await _render_download_folder_browser(call, state, Path(subfolders[idx]))
 
-    chosen_dir = Path(folders[idx])
+
+@router.callback_query(DownloadStates.browsing_download_folder, F.data == "dlnav:up")
+async def cb_dlnav_up(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    curr = Path(data.get("dl_browser_curr_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    parent = curr.parent if curr != workspace else workspace
+    await _render_download_folder_browser(call, state, parent)
+
+
+@router.callback_query(DownloadStates.browsing_download_folder, F.data == "dlnav:select_here")
+async def cb_dlnav_select_here(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    chosen_dir = Path(data.get("dl_browser_curr_dir", cfg.get("paths", "workspace_dir"))).resolve()
     chosen_dir.mkdir(parents=True, exist_ok=True)
 
     targets = data.get("pending_direct_targets", [])
@@ -226,61 +263,57 @@ async def cb_select_existing_dl_folder(call: CallbackQuery, state: FSMContext):
     ids_str = ", ".join([f"`{tid}`" for tid in task_ids])
     await call.message.edit_text(
         f"✅ تعداد **`{len(task_ids)}` دانلود** با موفقیت در صف قرار گرفت!\n"
-        f"📂 پوشه مقصد: `{chosen_dir.name}`\n"
+        f"📂 مسیر دقیق ذخیره:\n`{chosen_dir}`\n"
         f"🆔 کد تسک‌ها: {ids_str}",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
 
 
-@router.callback_query(DownloadStates.choosing_download_folder, F.data == "dlnew")
-async def cb_create_new_dl_folder(call: CallbackQuery, state: FSMContext):
-    await state.set_state(DownloadStates.waiting_direct_folder_name)
-    await call.message.edit_text(
-        "📁 لطفاً **نام پوشه جدید** (نام فیلم یا سریال، مثلاً `VisionQuest/S02/1080p-Pahe` یا `Movie.2026`) را وارد کنید:",
-        parse_mode="Markdown"
-    )
-
-
-@router.message(DownloadStates.waiting_direct_folder_name)
-async def handle_direct_folder_name(message: Message, state: FSMContext):
-    if not message.text:
-        return await message.answer("⚠️ لطفاً نام پوشه را به صورت متن ارسال کنید:")
-
-    folder_name = message.text.strip()
+@router.callback_query(DownloadStates.browsing_download_folder, F.data == "dlnav:mkdir_here")
+async def cb_dlnav_mkdir_here(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    targets = data.get("pending_direct_targets", [])
-    if not targets and data.get("pending_direct_target"):
-        targets = [data["pending_direct_target"]]
+    curr_dir = data.get("dl_browser_curr_dir", cfg.get("paths", "workspace_dir"))
+    await state.set_state(DownloadStates.waiting_new_dl_subfolder_name)
 
-    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-    # پشتیبانی از مسیر تودرتو مثل VisionQuest/S02/FullHD
-    clean_rel = re.sub(r'[<>:"|?*]', "", folder_name).strip().lstrip("/\\")
-    if "/" in clean_rel or "\\" in clean_rel:
-        target_dir = workspace / clean_rel
-        target_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        folders = DownloaderService.create_movie_folders(clean_rel)
-        target_dir = folders["base"]
-
-    if targets:
-        task_ids = await _enqueue_batch_downloads(targets, target_dir)
-        await state.clear()
-        ids_str = ", ".join([f"`{tid}`" for tid in task_ids])
-        return await message.answer(
-            f"✅ تعداد **`{len(task_ids)}` دانلود** با موفقیت در صف قرار گرفت!\n"
-            f"📂 پوشه مقصد: `{target_dir}`\n"
-            f"🆔 کد تسک‌ها: {ids_str}",
-            reply_markup=main_menu_kb(),
-            parse_mode="Markdown"
-        )
-
-    await state.update_data(dl_folder_name=folder_name)
-    await state.set_state(DownloadStates.waiting_direct_link)
-    await message.answer(
-        f"📂 پوشه `{target_dir}` ساخته شد.\nحالا لینک (یا لیست لینک‌های Batch) را ارسال کنید:",
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔙 بازگشت به مرورگر پوشه", callback_data="dlnav:resume"))
+    await call.message.edit_text(
+        f"➕ **ساخت پوشه جدید در مسیر:**\n`{curr_dir}`\n\n"
+        "✏️ لطفاً **نام پوشه جدید** را ارسال کنید (می‌توانید نام ساده مثل `1080p-Pahe` یا مسیر چندسطحی مثل `The.Greatest/S01/FullHD` بفرستید):",
+        reply_markup=kb.as_markup(),
         parse_mode="Markdown"
     )
+
+
+@router.callback_query(F.data == "dlnav:resume")
+async def cb_dlnav_resume(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    curr_dir = Path(data.get("dl_browser_curr_dir", cfg.get("paths", "workspace_dir")))
+    await _render_download_folder_browser(call, state, curr_dir)
+
+
+@router.message(DownloadStates.waiting_new_dl_subfolder_name)
+async def handle_new_dl_subfolder_name(message: Message, state: FSMContext):
+    raw_name = re.sub(r'[<>:"|?*]', "", (message.text or "").strip()).strip().lstrip("/\\")
+    if not raw_name:
+        return await message.answer("⚠️ نام پوشه معتبر نیست. لطفاً دوباره ارسال کنید:")
+
+    data = await state.get_data()
+    curr_dir = Path(data.get("dl_browser_curr_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    new_dir = (curr_dir / raw_name).resolve()
+    new_dir.mkdir(parents=True, exist_ok=True)
+
+    # اگر در شاخه Movies پوشه ساخته شده، زیرپوشه‌های استاندارد فیلم را هم بساز
+    parts_low = [p.lower() for p in new_dir.parts]
+    if ("movies" in parts_low or "movie" in parts_low) and new_dir.parent.name.lower() in ("movies", "movie"):
+        AutomationService.create_movie_structure(new_dir)
+    # اگر پوشه فصل سریال است (مثل S01)، ساختار فصل را بساز
+    elif AutomationService.SEASON_DIR_REGEX.match(new_dir.name):
+        AutomationService.create_series_season_structure(new_dir)
+
+    await message.answer(f"✅ پوشه `{new_dir.name}` ساخته شد و وارد آن شدید!", parse_mode="Markdown")
+    await _render_download_folder_browser(message, state, new_dir)
 
 
 # ==================== ۳. استخراج زیرنویس (از فایل موجود در دایرکتوری و از لینک تکی/Batch) ====================
@@ -590,7 +623,8 @@ async def receive_download_torrent(message: Message, state: FSMContext):
         await message.bot.download(message.document, destination=t_path)
 
         await state.update_data(pending_direct_targets=[str(t_path.resolve())])
-        await _show_download_targets(message, state)
+        workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+        await _render_download_folder_browser(message, state, workspace)
 
 
 @router.message(StateFilter(None), F.text.regexp(r"(magnet:\?xt=|https?://)"))
@@ -601,4 +635,5 @@ async def catch_direct_links_in_chat(message: Message, state: FSMContext):
     if not targets:
         return
     await state.update_data(pending_direct_targets=targets)
-    await _show_download_targets(message, state)
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    await _render_download_folder_browser(message, state, workspace)

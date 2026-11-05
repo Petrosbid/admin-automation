@@ -28,8 +28,6 @@ class HardSubTarget:
     preset_file: str
     preset_name: str
     ass_logo_path: Path | None = None
-    also_create_softsub_dir: Path | None = None
-    also_create_softsub_file: Path | None = None
 
 
 @dataclass
@@ -72,7 +70,7 @@ class AutomationService:
     def get_movie_ass_logo_path(cls) -> Path:
         """
         مسیر فایل movie.ass که در دایرکتوری کنار دایرکتوری presets قرار دارد:
-        مثلاً C:\\MediaBot\\movie.ass (و بررسی داخل پوشه presets یا ریشه پروژه به عنوان پشتیبان)
+        مثلاً C:\\MediaBot\\movie.ass
         """
         presets_dir = Path(cfg.get("paths", "presets_dir", "C:\\MediaBot\\presets")).resolve()
         candidates = [
@@ -105,7 +103,6 @@ class AutomationService:
             return "/English"
 
         parts = [p for p in rel_posix.split("/") if p]
-        # نگاشت نام پوشه اول به ساختار سرور (/English/Series, /English/Anime, /English/Movies)
         first_low = parts[0].lower()
         if first_low in ("movie", "movies"):
             parts[0] = "Movies"
@@ -114,8 +111,6 @@ class AutomationService:
         elif first_low == "anime":
             parts[0] = "Anime"
 
-        if parts[0] in ("Movies", "Series", "Anime"):
-            return "/English/" + "/".join(parts)
         return "/English/" + "/".join(parts)
 
     @classmethod
@@ -139,7 +134,6 @@ class AutomationService:
 
     @staticmethod
     def detect_source_type(text: str) -> str:
-        """تشخیص WEB-DL یا BluRay از روی نام فایل ویدئو"""
         low = text.lower()
         if "bluray" in low or "blu-ray" in low or "bdrip" in low or "brrip" in low:
             return "BluRay"
@@ -147,7 +141,6 @@ class AutomationService:
 
     @classmethod
     def format_clean_title(cls, raw_title: str) -> str:
-        """تبدیل نام پوشه سریال یا فیلم به فرمت استاندارد نقطه‌دار: مثلاً The.Greatest"""
         cleaned = re.sub(r'[<>:"/\\|?*]', "", raw_title).strip()
         cleaned = re.sub(r"[\s_]+", ".", cleaned)
         return cleaned
@@ -162,11 +155,11 @@ class AutomationService:
         ext: str = ".srt"
     ) -> str:
         """
-        ساخت نام استاندارد زیرنویس طبق فرمت درخواستی شما:
+        فرمت نام زیرنویس:
         {name}.S{xx}E{yy}.WEB-DL(یا BluRay).FA/EN.srt
         """
         clean_name = cls.format_clean_title(series_or_movie_title)
-        lang_up = lang.upper()  # 'FA' | 'EN'
+        lang_up = lang.upper()
         if not ext.startswith("."):
             ext = f".{ext}"
         if season_ep_tag:
@@ -182,10 +175,8 @@ class AutomationService:
         source_type: str = "WEB-DL"
     ) -> str:
         """
-        فرمت نام‌گذاری نوع اول (هاردساب با زیرنویس فارسی SRT در پوشه 1080p-HardSub و ...):
+        فرمت نام‌گذاری هاردساب با زیرنویس فارسی SRT در پوشه 1080p-HardSub / 720p-HardSub / 480p-HardSub:
         {name}.S{xx}E{yy}.1080p.WEB-DL.HardSub.EBTV.mp4
-        {name}.S{xx}E{yy}.720p.WEB-DL.HardSub.EBTV.mp4
-        {name}.S{xx}E{yy}.480p.WEB-DL.HardSub.EBTV.mp4
         """
         clean_name = cls.format_clean_title(series_or_movie_title)
         if season_ep_tag:
@@ -201,7 +192,7 @@ class AutomationService:
         source_type: str = "WEB-DL"
     ) -> str:
         """
-        فرمت نام‌گذاری نوع دوم (انکود با movie.ass در پوشه‌های 1080p-EBTV، 720p-EBTV، 480p-EBTV):
+        فرمت نام‌گذاری انکود با movie.ass در پوشه‌های 1080p-EBTV، 720p-EBTV، 480p-EBTV:
         {name}.S{xx}E{yy}.1080p.WEB-DL.6CH.EBTV.mp4
         {name}.S{xx}E{yy}.720p.WEB-DL.EBTV.mp4
         {name}.S{xx}E{yy}.480p.WEB-DL.EBTV.mp4
@@ -236,11 +227,7 @@ class AutomationService:
 
     @classmethod
     def build_softsub_filename(cls, raw_video: Path) -> str:
-        """
-        تولید نام دقیق فایل سافت‌ساب:
-        - اگر فایل ورودی .mp4 باشد -> .SoftSub.EBTV.mp4
-        - در غیر این صورت -> .SoftSub.EBTV.mkv
-        """
+        """حفظ فرمت .mp4 برای فایل‌های MP4 و .mkv برای سایر فایل‌ها در سافت‌ساب"""
         clean = cls.clean_stem_for_ebtv(raw_video.stem)
         out_ext = ".mp4" if raw_video.suffix.lower() == ".mp4" else ".mkv"
         return f"{clean}.SoftSub.EBTV{out_ext}"
@@ -341,7 +328,6 @@ class AutomationService:
         clean_sub = re.sub(r"[^a-zA-Z0-9]+", " ", Path(sub_filename).stem).lower().split()
         title_tokens = [t for t in clean_sub if len(t) > 2 and not cls.EPISODE_REGEX.match(t)]
 
-        # جمع‌آوری پوشه‌های کاندید هم از ریشه Workspace و هم از داخل پوشه‌های Series, Anime, Movies
         candidate_roots = []
         for d in ws.iterdir():
             if not d.is_dir() or d.name.startswith("_") or d.name == "browser_profile":
@@ -484,7 +470,7 @@ class AutomationService:
                 plan.softsub_targets.append(
                     SoftSubTarget(
                         raw_video=vid.resolve(),
-                        quality_folder_name="Root",
+                        quality_folder_name=vid.name,
                         output_dir=paths["softsub"],
                         output_file=soft_out_file,
                     )
@@ -589,14 +575,20 @@ class AutomationService:
 
         matched = []
         target_ep_num = int(plan.season_ep_tag.split("E")[1])
+
         for f in all_subs:
             sub_ep = cls.extract_episode_tag(f.name)
-            if sub_ep == plan.season_ep_tag:
-                matched.append(f)
-            elif not sub_ep:
-                ep_num = cls.extract_episode_number_only(f.name)
-                if ep_num == target_ep_num:
+            sub_ep_num = cls.extract_episode_number_only(f.name)
+
+            if sub_ep:
+                if sub_ep == plan.season_ep_tag:
                     matched.append(f)
+            elif sub_ep_num is not None:
+                if sub_ep_num == target_ep_num:
+                    matched.append(f)
+            else:
+                matched.append(f)
+
         return matched
 
     @classmethod
@@ -632,13 +624,23 @@ class AutomationService:
             for sub in candidate_subs:
                 if str(sub) in used_subs:
                     continue
+                explicit_s_e = cls.extract_episode_tag(sub.name)
+                if explicit_s_e and explicit_s_e != ep_tag:
+                    continue
                 if cls.extract_episode_number_only(sub.name) == target_ep_num:
                     mapping[ep_tag] = sub
                     used_subs.add(str(sub))
                     break
 
-        if len(plans) == 1 and not mapping and len(candidate_subs) == 1:
-            mapping[plans[0].season_ep_tag] = candidate_subs[0]
+        if len(plans) == 1 and not mapping:
+            untagged_subs = [
+                sub for sub in candidate_subs
+                if str(sub) not in used_subs
+                and cls.extract_episode_tag(sub.name) is None
+                and cls.extract_episode_number_only(sub.name) is None
+            ]
+            if len(untagged_subs) == 1:
+                mapping[plans[0].season_ep_tag] = untagged_subs[0]
 
         return mapping
 
@@ -655,25 +657,18 @@ class AutomationService:
         return presets[0]
 
     @classmethod
-    def build_hardsub_and_encode_targets(
+    def build_hardsub_targets(
         cls,
         plan: AutomationPlan,
-        hardsub_srt_qualities: list[str],
-        encode_ass_qualities: list[str]
+        hardsub_srt_qualities: list[str]
     ) -> list[HardSubTarget]:
-        """
-        ساخت تسک‌های هر دو نوع هاردساب از روی فایل FullHD:
-        ۱. هاردساب فارسی SRT (در پوشه‌های 1080p-HardSub, 720p-HardSub, 480p-HardSub)
-        ۲. انکود با movie.ass (در پوشه‌های 1080p-EBTV, 720p-EBTV, 480p-EBTV) + تولید سافت‌ساب متناظر برای آن‌ها
-        """
-        if not plan.fullhd_source_video:
+        """ساخت تسک‌های هاردساب فارسی SRT از روی فایل FullHD برای بخش اتوماسیون"""
+        if not plan.fullhd_source_video or not hardsub_srt_qualities:
             return []
 
         targets: list[HardSubTarget] = []
         order_map = {"1080p": 1, "720p": 2, "480p": 3}
-        movie_ass_file = cls.get_movie_ass_logo_path()
 
-        # ۱. ساخت اهداف هاردساب فارسی (SRT)
         for q_tag in sorted(set(hardsub_srt_qualities), key=lambda q: order_map.get(q, 9)):
             pr = cls.resolve_preset_for_quality(q_tag)
             out_name = cls.build_hardsub_srt_filename(
@@ -691,36 +686,62 @@ class AutomationService:
                     preset_name=pr["name"],
                 )
             )
+        return targets
 
-        # ۲. ساخت اهداف انکود با movie.ass (در پوشه‌های 1080p-EBTV, 720p-EBTV, 480p-EBTV)
-        for q_tag in sorted(set(encode_ass_qualities), key=lambda q: order_map.get(q, 9)):
-            pr = cls.resolve_preset_for_quality(q_tag)
-            out_name = cls.build_encode_ass_filename(
-                plan.series_title, plan.season_ep_tag, q_tag, plan.source_type
-            )
-            out_dir = (plan.base_dir / f"{q_tag}-EBTV") if plan.is_series else plan.base_dir
-            out_file = out_dir / out_name
+    @classmethod
+    def build_manual_encode_ass_targets(
+        cls,
+        source_videos: list[Path],
+        selected_qualities: list[str]
+    ) -> list[HardSubTarget]:
+        """
+        ساخت تسک‌های انکود با movie.ass (خارج از اتوماسیون و بدون نیاز به آپلود زیرنویس):
+        ذخیره در پوشه‌های 1080p-EBTV, 720p-EBTV, 480p-EBTV با نام استاندارد و حفظ زیرنویس انگلیسی داخل فیلم.
+        """
+        order_map = {"1080p": 1, "720p": 2, "480p": 3}
+        sorted_quals = sorted(set(selected_qualities), key=lambda q: order_map.get(q, 9))
+        logo_ass = cls.get_movie_ass_logo_path()
+        targets: list[HardSubTarget] = []
 
-            # بررسی اینکه آیا انکود از قبل در پوشه 1080p-EBTV وجود دارد یا خیر؛
-            # اگر تازه انکود می‌شود، پس از اتمام انکود، نسخه SoftSub آن هم خودکار در 1080p-EBTV-SoftSub ساخته شود!
-            soft_dir = (plan.base_dir / f"{q_tag}-EBTV-SoftSub") if plan.is_series else (plan.base_dir / "SoftSub")
-            soft_file = soft_dir / cls.build_softsub_filename(out_file)
+        for vid in source_videos:
+            vid = Path(vid).resolve()
+            ep_tag = cls.extract_episode_tag(vid.name) or ""
+            src_type = cls.detect_source_type(vid.name)
 
-            targets.append(
-                HardSubTarget(
-                    mode="encode_ass",
-                    quality_tag=q_tag,
-                    source_video=plan.fullhd_source_video,
-                    output_dir=out_dir,
-                    output_file=out_file,
-                    preset_file=pr["file"],
-                    preset_name=pr["name"],
-                    ass_logo_path=movie_ass_file,
-                    also_create_softsub_dir=soft_dir,
-                    also_create_softsub_file=soft_file,
+            # پیدا کردن پوشه اصلی فصل سریال یا پوشه فیلم
+            if vid.parent.name.lower() in ("fullhd", "1080p", "720p") or cls.SEASON_DIR_REGEX.match(vid.parent.parent.name):
+                season_or_movie_dir = vid.parent.parent
+                series_title = (
+                    season_or_movie_dir.parent.name
+                    if cls.SEASON_DIR_REGEX.match(season_or_movie_dir.name)
+                    else season_or_movie_dir.name
                 )
-            )
+                is_series = True
+            elif cls.SEASON_DIR_REGEX.match(vid.parent.name):
+                season_or_movie_dir = vid.parent
+                series_title = season_or_movie_dir.parent.name
+                is_series = True
+            else:
+                season_or_movie_dir = vid.parent
+                series_title = vid.stem
+                is_series = bool(ep_tag)
 
+            for q_tag in sorted_quals:
+                pr = cls.resolve_preset_for_quality(q_tag)
+                out_name = cls.build_encode_ass_filename(series_title, ep_tag, q_tag, src_type)
+                out_dir = (season_or_movie_dir / f"{q_tag}-EBTV") if is_series else season_or_movie_dir
+                targets.append(
+                    HardSubTarget(
+                        mode="encode_ass",
+                        quality_tag=q_tag,
+                        source_video=vid,
+                        output_dir=out_dir,
+                        output_file=out_dir / out_name,
+                        preset_file=pr["file"],
+                        preset_name=pr["name"],
+                        ass_logo_path=logo_ass,
+                    )
+                )
         return targets
 
     @classmethod
@@ -734,7 +755,6 @@ class AutomationService:
         auto_upload: bool = False,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
-        """اجرای سافت‌ساب و در صورت فعال بودن auto_upload، افزودن خودکار فایل خروجی به صف آپلود با مسیر دقیق سرور"""
         res_path = await MKVService.merge_softsub(
             video_path=raw_video,
             output_path=output_file,
@@ -767,17 +787,11 @@ class AutomationService:
         auto_upload: bool = False,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
-        """
-        اجرای هاردساب فارسی SRT یا انکود movie.ass:
-        - اگر حالت 'encode_ass' باشد: از فایل movie.ass استفاده می‌کند، زیرنویس انگلیسی را سافت‌ساب می‌کند،
-          فایل را در 1080p-EBTV ذخیره و آپلود می‌کند و سپس نسخه سافت‌ساب فارسی آن را هم در 1080p-EBTV-SoftSub می‌سازد!
-        - اگر حالت 'hardsub_srt' باشد: زیرنویس فارسی SRT را بدون انگلیسی در 1080p-HardSub هاردساب و آپلود می‌کند.
-        """
         if ht.mode == "encode_ass":
             logo_ass = ht.ass_logo_path or cls.get_movie_ass_logo_path()
             if not logo_ass.exists():
                 raise FileNotFoundError(
-                    f"فایل لوگوی انکود (movie.ass) در مسیر {logo_ass} یافت نشد! لطفاً فایل movie.ass را کنار پوشه presets قرار دهید."
+                    f"فایل movie.ass در مسیر {logo_ass} یافت نشد! لطفاً فایل movie.ass را کنار پوشه presets قرار دهید."
                 )
             res_path = await HandBrakeService.encode_hardsub(
                 video_path=ht.source_video,
@@ -791,31 +805,6 @@ class AutomationService:
                 target_resolution=ht.quality_tag,
                 progress_callback=progress_callback
             )
-            if auto_upload and res_path.exists():
-                remote_dir = cls.compute_server_remote_dir_for_local_path(res_path)
-                await queue_engine.add_task(
-                    "upload",
-                    f"AutoUpload [{remote_dir}]: {res_path.name}",
-                    CuteFTPService.upload_path,
-                    res_path,
-                    remote_dir
-                )
-            # اگر زیرنویس فارسی هم داریم، سافت‌ساب این انکود جدید را در پوشه 1080p-EBTV-SoftSub بساز
-            if fa_sub and fa_sub.exists() and ht.also_create_softsub_file:
-                ht.also_create_softsub_dir.mkdir(parents=True, exist_ok=True)
-                await queue_engine.add_task(
-                    "mkvtoolnix",
-                    f"SoftSub [{ht.quality_tag}-EBTV]: {ht.also_create_softsub_file.name}",
-                    cls.run_softsub_and_optional_upload,
-                    res_path,
-                    ht.also_create_softsub_file,
-                    fa_sub,
-                    en_sub,
-                    brand,
-                    auto_upload
-                )
-            return res_path
-
         else:
             is_fa_ass = bool(fa_sub and fa_sub.suffix.lower() in (".ass", ".ssa"))
             secondary_en = en_sub if is_fa_ass else None
@@ -831,13 +820,14 @@ class AutomationService:
                 target_resolution=ht.quality_tag,
                 progress_callback=progress_callback
             )
-            if auto_upload and res_path.exists():
-                remote_dir = cls.compute_server_remote_dir_for_local_path(res_path)
-                await queue_engine.add_task(
-                    "upload",
-                    f"AutoUpload [{remote_dir}]: {res_path.name}",
-                    CuteFTPService.upload_path,
-                    res_path,
-                    remote_dir
-                )
-            return res_path
+
+        if auto_upload and res_path.exists():
+            remote_dir = cls.compute_server_remote_dir_for_local_path(res_path)
+            await queue_engine.add_task(
+                "upload",
+                f"AutoUpload [{remote_dir}]: {res_path.name}",
+                CuteFTPService.upload_path,
+                res_path,
+                remote_dir
+            )
+        return res_path
