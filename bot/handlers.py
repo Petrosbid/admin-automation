@@ -543,26 +543,34 @@ async def handle_new_folder_name(message: Message, state: FSMContext):
 
 @router.callback_query(MainStates.waiting_new_folder_type, F.data.startswith("mktype:"))
 async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
-    mk_type = call.data.split(":")[1]  # movie | series | standard | empty
+    mk_type = call.data.split(":")[1]  # movie | series | anime | empty
     data = await state.get_data()
-    parent_dir = Path(data.get("mkdir_parent", cfg.get("paths", "workspace_dir")))
-    folder_name = data["new_folder_name"]
-    new_dir = parent_dir / folder_name
-    new_dir.mkdir(parents=True, exist_ok=True)
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    parent_dir = Path(data.get("mkdir_parent", str(workspace))).resolve()
+    folder_name = data["new_folder_name"].replace("_", ".")
 
-    if mk_type in ("movie", "standard"):
-        for sub_name in ("SoftSub", "Hardsub", "srt"):
-            (new_dir / sub_name).mkdir(parents=True, exist_ok=True)
+    from services.automation_service import AutomationService
+    cats = AutomationService.ensure_workspace_root_categories()
+
+    if mk_type == "movie":
+        base_parent = cats["Movies"] if parent_dir == workspace else parent_dir
+        new_dir = base_parent / folder_name
+        AutomationService.create_movie_structure(new_dir)
         sub_target = new_dir / "srt"
-        desc = "با ساختار استاندارد فیلم (`SoftSub`, `Hardsub`, `srt`)"
-    elif mk_type == "series":
-        for sub_name in ("FullHD", "1080p-HardSub", "720p-HardSub", "srt/FA", "srt/EN"):
-            (new_dir / sub_name).mkdir(parents=True, exist_ok=True)
+        desc = "در شاخه `Movies` با ساختار استاندارد فیلم (`SoftSub`, `Hardsub`, `srt`)"
+    elif mk_type in ("series", "anime"):
+        cat_key = "Anime" if mk_type == "anime" else "Series"
+        base_parent = cats[cat_key] if parent_dir == workspace else parent_dir
+        show_dir = base_parent / folder_name
+        new_dir = show_dir / "S01" if not AutomationService.SEASON_DIR_REGEX.match(folder_name) else show_dir
+        AutomationService.create_series_season_structure(new_dir)
         sub_target = new_dir / "srt" / "FA"
-        desc = "با ساختار استاندارد فصل سریال (`FullHD`, `1080p-HardSub`, `720p-HardSub`, `srt/FA`, `srt/EN`)"
+        desc = f"در شاخه `{cat_key}` همراه با پوشه‌های استاندارد فصل (`FullHD`, `1080p-HardSub`, `1080p-EBTV`, `srt/FA`, `srt/EN`)"
     else:
+        new_dir = parent_dir / folder_name
+        new_dir.mkdir(parents=True, exist_ok=True)
         sub_target = new_dir
-        desc = "به صورت پوشه خام"
+        desc = "به صورت پوشه ساده"
 
     await state.clear()
     await state.update_data(target_sub_dir=str(sub_target), current_dir=str(new_dir))
@@ -575,7 +583,8 @@ async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
 
     await call.message.edit_text(
         f"✅ پوشه جدید {desc} ساخته شد!\n\n"
-        f"📂 مسیر: `{new_dir}`",
+        f"📂 مسیر در سرور:\n`{new_dir}`\n"
+        f"☁️ مسیر معادل در هاست دانلود:\n`{AutomationService.compute_server_remote_dir_for_local_path(new_dir)}`",
         reply_markup=kb.as_markup(),
         parse_mode="Markdown"
     )

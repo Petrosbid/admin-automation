@@ -2,6 +2,7 @@ import ctypes
 from ftplib import FTP
 import logging
 import struct
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -16,6 +17,9 @@ import win32process
 from core.config_loader import cfg
 
 user32 = ctypes.windll.user32
+
+# قفل سراسری برای تضمین اینکه هرگز دو آپلود هم‌زمان به CuteFTP ارسال نشوند
+_CUTEFTP_SERIAL_LOCK = threading.Lock()
 
 
 def _open_clipboard_safe(retries: int = 10, delay: float = 0.05):
@@ -94,6 +98,65 @@ def _find_cuteftp_gui_window() -> int | None:
 
     win32gui.EnumWindows(_enum_cb, None)
     return found_hwnds[0] if found_hwnds else None
+
+
+def _wait_until_cuteftp_responsive(main_hwnd: int, timeout_sec: float = 600.0):
+    """
+    صبر کردن تا زمانی که پنجره CuteFTP از حالت فریز خارج شود (برای زمانی که مشغول ساخت پوشه یا آپلود فایل سنگین است)
+    """
+    start_t = time.time()
+    res = ctypes.c_ulong()
+    while time.time() - start_t < timeout_sec:
+        ok = user32.SendMessageTimeoutW(
+            main_hwnd,
+            win32con.WM_NULL,
+            0,
+            0,
+            0x0002,  # SMTO_ABORTIFHUNG
+            2000,
+            ctypes.byref(res)
+        )
+        if ok:
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def _calc_target_total_bytes(local_target: Path) -> int:
+    if local_target.is_file():
+        return local_target.stat().st_size
+    return sum(f.stat().st_size for f in local_target.rglob("*") if f.is_file() and not f.name.startswith("_temp_"))
+
+
+def _wait_for_gui_transfer_completion(
+    main_hwnd: int,
+    local_target: Path,
+    progress_callback: Callable[[str], None] = None
+):
+    """
+    پایش هوشمند اتمام آپلود در حالت GUI:
+    ۱. صبر می‌کند تا پنجره CuteFTP اگر فریز شده کاملاً آزاد شود.
+    ۲. بر اساس حجم فایل و سرعت انتقال سرور (~45 MB/s در شبکه سرور دانلود شما)،
+       صبر می‌کند تا انتقال فایل فعلی به طور کامل تمام شود و سپس اجازه رفتن به پوشه مقصد بعدی را می‌دهد.
+    """
+    total_bytes = _calc_target_total_bytes(local_target)
+    total_mb = total_bytes / (1024 * 1024)
+
+    # تخمین زمان انتقال بر اساس حجم فایل (با حداقل ۴ ثانیه برای فایل‌های کوچک و زمان متناسب برای فایل‌های حجیم)
+    estimated_seconds = max(4.0, (total_mb / 35.0) + 3.5)
+    start_t = time.time()
+
+    while True:
+        _wait_until_cuteftp_responsive(main_hwnd, timeout_sec=300.0)
+        elapsed = time.time() - start_t
+        if elapsed >= estimated_seconds:
+            break
+        pct = min(99.0, (elapsed / estimated_seconds) * 100.0)
+        if progress_callback:
+            progress_callback(f"در حال آپلود در CuteFTP: {pct:.0f}% ({total_mb:.1f} MB)...")
+        time.sleep(1.2)
+
+    _wait_until_cuteftp_responsive(main_hwnd, timeout_sec=120.0)
 
 
 def _find_remote_controls(main_hwnd: int) -> tuple[int | None, int | None]:
@@ -238,9 +301,10 @@ def _upload_via_direct_ftp(
     target_remote_dir: str,
     progress_callback: Callable[[str], None] = None
 ) -> str:
+    """آپلود سنکرون و دقیق که تا پایان کامل انتقال ۱۰۰٪ بایت‌های فایل منتظر می‌ماند"""
     ftp = FTP()
     ftp.encoding = "utf-8"
-    ftp.connect(host=host, port=port, timeout=60)
+    ftp.connect(host=host, port=port, timeout=120)
     ftp.login(user=username, passwd=password)
     ftp.set_pasv(True)
 
@@ -302,107 +366,9 @@ def _upload_via_direct_ftp(
             ftp.close()
 
 
-def _set_com_option_safe(te, opt_name: str, opt_val):
-    try:
-        setter = getattr(te, "SetOption", None)
-        if callable(setter):
-            setter(opt_name, opt_val)
-            return
-    except Exception:
-        pass
-    try:
-        te._oleobj_.InvokeTypes(
-            18, 0, pythoncom.DISPATCH_PROPERTYPUT, None,
-            ((pythoncom.VT_BSTR, 0), (pythoncom.VT_VARIANT, 0)),
-            opt_name, opt_val
-        )
-    except Exception:
-        pass
-
-
-def _upload_via_cuteftp_com_engine(
-    local_target: Path,
-    target_remote_dir: str,
-    extracted_info: dict[str, str],
-    progress_callback: Callable[[str], None] = None
-) -> str:
-    pythoncom.CoInitialize()
-    try:
-        ftp_cfg = cfg.get("cuteftp") or {}
-        te = win32com.client.Dispatch("CuteFTPPro.TEConnection")
-        _set_com_option_safe(te, "ThrowError", False)
-        _set_com_option_safe(te, "AutoCloseMethod", 2)
-
-        host = extracted_info.get("host") or ftp_cfg.get("host", "185.130.50.130")
-        username = extracted_info.get("username") or ftp_cfg.get("username", "@dl15.cdnzed.sbs")
-        password = extracted_info.get("password") or ftp_cfg.get("password", "")
-        port = int(extracted_info.get("port") or ftp_cfg.get("port", 21))
-        site_profile = extracted_info.get("site_profile") or ftp_cfg.get("site_profile", "dl15")
-
-        if not bool(getattr(te, "IsConnected", False)):
-            connected = False
-            if password and password != "ftppassword":
-                try:
-                    te.Protocol = ftp_cfg.get("protocol", "FTP")
-                    te.Host = host
-                    te.Port = port
-                    te.Login = username
-                    te.Password = password
-                    te.Connect()
-                    connected = bool(getattr(te, "IsConnected", True))
-                except Exception:
-                    pass
-
-            if not connected and site_profile:
-                try:
-                    te.Connect(site_profile)
-                    connected = True
-                except Exception:
-                    pass
-
-            if not connected:
-                te.Host = host
-                te.Port = port
-                te.Login = username
-                te.Connect()
-
-        if progress_callback:
-            progress_callback(f"انتقال به مسیر {target_remote_dir} در موتور CuteFTP...")
-
-        accum = ""
-        for part in target_remote_dir.strip("/").split("/"):
-            if not part:
-                continue
-            accum = f"{accum}/{part}"
-            try:
-                if not te.RemoteExists(accum):
-                    te.CreateRemoteFolder(accum)
-            except Exception:
-                pass
-
-        if local_target.is_file():
-            te.RemoteFolder = target_remote_dir
-            te.Upload(str(local_target.resolve()))
-        else:
-            movie_remote_dir = f"{target_remote_dir.rstrip('/')}/{local_target.name}"
-            try:
-                if not te.RemoteExists(movie_remote_dir):
-                    te.CreateRemoteFolder(movie_remote_dir)
-            except Exception:
-                pass
-            te.RemoteFolder = movie_remote_dir
-            te.Upload(f"{local_target.resolve()}\\*.*")
-
-        return target_remote_dir
-    finally:
-        pythoncom.CoUninitialize()
-
-
 def _bring_cuteftp_to_front_and_focus(main_hwnd: int, remote_pane_hwnd: int | None):
-    """
-    بالا آوردن پنجره CuteFTP و دادن فوکوس سیستمی به پنل سمت راست
-    بدون ارسال کلیک ماوس (WM_LBUTTONDOWN) تا هرگز کادر نقطه‌چین انتخاب (Selection Box) ایجاد نشود!
-    """
+    _wait_until_cuteftp_responsive(main_hwnd, timeout_sec=120.0)
+
     if win32gui.IsIconic(main_hwnd):
         win32gui.ShowWindow(main_hwnd, win32con.SW_RESTORE)
         time.sleep(0.25)
@@ -420,7 +386,6 @@ def _bring_cuteftp_to_front_and_focus(main_hwnd: int, remote_pane_hwnd: int | No
         if fg_tid and fg_tid != target_tid and fg_tid != cur_tid:
             attached_fg = bool(user32.AttachThreadInput(fg_tid, target_tid, True))
 
-        # اگر از قبل کادر انتخاب ماوس باز مانده باشد، آن را فوراً آزاد کن
         user32.ReleaseCapture()
 
         if win32gui.GetForegroundWindow() != main_hwnd:
@@ -431,7 +396,6 @@ def _bring_cuteftp_to_front_and_focus(main_hwnd: int, remote_pane_hwnd: int | No
             time.sleep(0.2)
 
         if remote_pane_hwnd:
-            # فعال کردن فریم والد پنل Remote در MFC و دادن فوکوس مستقیم کیبورد بدون هیچ کلیک ماوسی
             parent_view = win32gui.GetParent(remote_pane_hwnd)
             if parent_view:
                 user32.SetFocus(parent_view)
@@ -449,38 +413,46 @@ def _bring_cuteftp_to_front_and_focus(main_hwnd: int, remote_pane_hwnd: int | No
 def _upload_via_open_cuteftp_gui(
     local_target: Path,
     target_remote_dir: str,
-    change_dir: bool = True
+    change_dir: bool = True,
+    progress_callback: Callable[[str], None] = None
 ) -> str:
     """
-    آپلود از طریق پنجره گرافیکی بازِ CuteFTP (بدون گیر کردن در کادر انتخاب ماوس):
-    ۱. فوکوس کیبورد روی پنل Remote
-    ۲. زدن Ctrl + D -> پیست مسیر با Ctrl + V -> زدن Enter
-    ۳. کپی فایل/پوشه در کلیپ‌بورد و زدن Ctrl + V برای شروع آپلود
+    آپلود ترتیبی از طریق پنجره بازِ CuteFTP همراه با صبر کامل تا اتمام آپلود و آزاد شدن برنامه از فریز
     """
     main_hwnd = _find_cuteftp_gui_window()
     if not main_hwnd:
         raise RuntimeError("پنجره باز CuteFTP روی دسکتاپ یافت نشد.")
 
+    # ۱. ابتدا صبر کن اگر CuteFTP از عملیات قبلی فریز است، کاملاً آزاد شود
+    _wait_until_cuteftp_responsive(main_hwnd, timeout_sec=300.0)
+
     remote_pane_hwnd, remote_edit_hwnd = _find_remote_controls(main_hwnd)
     _bring_cuteftp_to_front_and_focus(main_hwnd, remote_pane_hwnd)
 
     if change_dir and target_remote_dir:
-        _copy_text_to_windows_clipboard(target_remote_dir)
-        time.sleep(0.15)
-        _send_ctrl_key("D")
-        time.sleep(0.45)
-        _send_ctrl_key("V")
-        time.sleep(0.25)
-        _send_enter_key()
-        time.sleep(1.8)
+        current_in_box = _get_window_text_safe(remote_edit_hwnd) if remote_edit_hwnd else ""
+        if current_in_box.rstrip("/").lower() != target_remote_dir.rstrip("/").lower():
+            if progress_callback:
+                progress_callback(f"تغییر دایرکتوری CuteFTP به {target_remote_dir}...")
+            _copy_text_to_windows_clipboard(target_remote_dir)
+            time.sleep(0.15)
+            _send_ctrl_key("D")
+            time.sleep(0.45)
+            _send_ctrl_key("V")
+            time.sleep(0.25)
+            _send_enter_key()
+            time.sleep(2.2)
+            _wait_until_cuteftp_responsive(main_hwnd, timeout_sec=60.0)
 
     _bring_cuteftp_to_front_and_focus(main_hwnd, remote_pane_hwnd)
     _copy_files_to_windows_clipboard([str(local_target.resolve())])
     time.sleep(0.25)
 
-    # ارسال کلید Ctrl+V برای شروع آپلود در مسیر مقصد
     _send_ctrl_key("V")
-    time.sleep(0.35)
+    time.sleep(0.5)
+
+    # ۲. صبر قطعی تا پایان آپلود این فایل/پوشه قبل از رفتن سراغ دایرکتوری بعدی
+    _wait_for_gui_transfer_completion(main_hwnd, local_target, progress_callback=progress_callback)
 
     if remote_edit_hwnd:
         read_p = _get_window_text_safe(remote_edit_hwnd)
@@ -494,94 +466,86 @@ def sync_upload_cuteftp(
     remote_subpath: str = "__CURRENT__",
     progress_callback: Callable[[str], None] = None
 ) -> list[str]:
-    ftp_cfg = cfg.get("cuteftp") or {}
-    extracted = extract_credentials_from_open_cuteftp()
+    """
+    اجرای ترتیبی و انحصاری آپلود (با قفل _CUTEFTP_SERIAL_LOCK) تا هرگز دو آپلود با هم تداخل نکنند
+    """
+    with _CUTEFTP_SERIAL_LOCK:
+        ftp_cfg = cfg.get("cuteftp") or {}
+        extracted = extract_credentials_from_open_cuteftp()
 
-    host = extracted.get("host") or ftp_cfg.get("host", "185.130.50.130")
-    port = int(extracted.get("port") or ftp_cfg.get("port", 21))
-    username = extracted.get("username") or ftp_cfg.get("username", "@dl15.cdnzed.sbs")
-    password = extracted.get("password") or str(ftp_cfg.get("password", "")).strip()
-    if password == "ftppassword":
-        password = ""
+        host = extracted.get("host") or ftp_cfg.get("host", "185.130.50.130")
+        port = int(extracted.get("port") or ftp_cfg.get("port", 21))
+        username = extracted.get("username") or ftp_cfg.get("username", "@dl15.cdnzed.sbs")
+        password = extracted.get("password") or str(ftp_cfg.get("password", "")).strip()
+        if password == "ftppassword":
+            password = ""
 
-    base_url = str(ftp_cfg.get("base_download_url", "https://dl15.cdnzed.sbs")).rstrip("/")
-    if "dl.example.com" in base_url and username.startswith("@"):
-        base_url = f"https://{username.lstrip('@')}"
+        base_url = str(ftp_cfg.get("base_download_url", "https://dl15.cdnzed.sbs")).rstrip("/")
+        if "dl.example.com" in base_url and username.startswith("@"):
+            base_url = f"https://{username.lstrip('@')}"
 
-    is_current_dir_mode = (not remote_subpath or remote_subpath == "__CURRENT__")
-    if is_current_dir_mode:
-        target_remote_dir = extracted.get("remote_dir") or ftp_cfg.get("remote_base_dir", "/English/Movies")
-    else:
-        target_remote_dir = "/" + remote_subpath.replace("\\", "/").strip().lstrip("/")
-
-    if len(target_remote_dir) > 1:
-        target_remote_dir = target_remote_dir.rstrip("/")
-
-    def _generate_links(final_remote_dir: str) -> list[str]:
-        clean_sub = final_remote_dir.replace("\\", "/")
-        for pub_prefix in ("/public_html", "/www", "/htdocs"):
-            if clean_sub.startswith(pub_prefix):
-                clean_sub = clean_sub[len(pub_prefix):]
-        clean_sub = clean_sub.strip("/")
-
-        urls = []
-        if local_target.is_file():
-            rel_url = f"{clean_sub}/{local_target.name}".lstrip("/")
-            urls.append(f"{base_url}/{urllib.parse.quote(rel_url)}")
+        is_current_dir_mode = (not remote_subpath or remote_subpath == "__CURRENT__")
+        if is_current_dir_mode:
+            target_remote_dir = extracted.get("remote_dir") or ftp_cfg.get("remote_base_dir", "/English/Movies")
         else:
-            for file_p in local_target.rglob("*"):
-                if file_p.is_file() and not file_p.name.startswith("_temp_"):
-                    rel = file_p.relative_to(local_target.parent).as_posix()
-                    if clean_sub:
-                        rel = f"{clean_sub}/{rel}"
-                    urls.append(f"{base_url}/{urllib.parse.quote(rel)}")
-        return urls
+            target_remote_dir = "/" + remote_subpath.replace("\\", "/").strip().lstrip("/")
 
-    errors = []
+        if len(target_remote_dir) > 1:
+            target_remote_dir = target_remote_dir.rstrip("/")
 
-    # لایه ۱: آپلود مستقیم FTP در صورت وجود یا استخراج شدن پسورد
-    if password:
+        def _generate_links(final_remote_dir: str) -> list[str]:
+            clean_sub = final_remote_dir.replace("\\", "/")
+            for pub_prefix in ("/public_html", "/www", "/htdocs"):
+                if clean_sub.startswith(pub_prefix):
+                    clean_sub = clean_sub[len(pub_prefix):]
+            clean_sub = clean_sub.strip("/")
+
+            urls = []
+            if local_target.is_file():
+                rel_url = f"{clean_sub}/{local_target.name}".lstrip("/")
+                urls.append(f"{base_url}/{urllib.parse.quote(rel_url)}")
+            else:
+                for file_p in local_target.rglob("*"):
+                    if file_p.is_file() and not file_p.name.startswith("_temp_"):
+                        rel = file_p.relative_to(local_target.parent).as_posix()
+                        if clean_sub:
+                            rel = f"{clean_sub}/{rel}"
+                        urls.append(f"{base_url}/{urllib.parse.quote(rel)}")
+            return urls
+
+        errors = []
+
+        # لایه ۱: آپلود مستقیم FTP (که به صورت ذاتی تا اتمام ۱۰۰٪ فایل صبر می‌کند و پوشه مقصد را هم خودش می‌سازد)
+        if password:
+            try:
+                used_dir = _upload_via_direct_ftp(
+                    host=host,
+                    port=port,
+                    username=username,
+                    password=password,
+                    local_target=local_target,
+                    target_remote_dir=target_remote_dir,
+                    progress_callback=progress_callback
+                )
+                return _generate_links(used_dir)
+            except Exception as e1:
+                logging.warning(f"Direct FTP upload warning: {e1}")
+                errors.append(f"DirectFTP: {e1}")
+
+        # لایه ۲: آپلود از طریق پنجره گرافیکی CuteFTP با انتظار کامل تا پایان انتقال و آزاد شدن از فریز
         try:
-            used_dir = _upload_via_direct_ftp(
-                host=host,
-                port=port,
-                username=username,
-                password=password,
+            used_dir = _upload_via_open_cuteftp_gui(
                 local_target=local_target,
                 target_remote_dir=target_remote_dir,
+                change_dir=(not is_current_dir_mode),
                 progress_callback=progress_callback
             )
             return _generate_links(used_dir)
-        except Exception as e1:
-            logging.warning(f"Direct FTP upload warning: {e1}")
-            errors.append(f"DirectFTP: {e1}")
+        except Exception as e_gui:
+            logging.warning(f"CuteFTP GUI automation warning: {e_gui}")
+            errors.append(f"GUI: {e_gui}")
 
-    # لایه ۲: آپلود از طریق پنجره گرافیکی بازِ CuteFTP روی دسکتاپ سرور (بدون کلیک ماوس)
-    try:
-        used_dir = _upload_via_open_cuteftp_gui(
-            local_target=local_target,
-            target_remote_dir=target_remote_dir,
-            change_dir=(not is_current_dir_mode)
+        raise RuntimeError(
+            "خطا در آپلود به سرور دانلود!\n"
+            f"جزئیات: {' | '.join(errors)}"
         )
-        return _generate_links(used_dir)
-    except Exception as e_gui:
-        logging.warning(f"CuteFTP GUI automation warning: {e_gui}")
-        errors.append(f"GUI: {e_gui}")
-
-    # لایه ۳: آپلود از طریق موتور COM برنامه CuteFTP
-    try:
-        used_dir = _upload_via_cuteftp_com_engine(
-            local_target=local_target,
-            target_remote_dir=target_remote_dir,
-            extracted_info=extracted,
-            progress_callback=progress_callback
-        )
-        return _generate_links(used_dir)
-    except Exception as e2:
-        logging.warning(f"CuteFTP COM Engine warning: {e2}")
-        errors.append(f"COM: {e2}")
-
-    raise RuntimeError(
-        "خطا در آپلود به سرور دانلود!\n"
-        f"جزئیات: {' | '.join(errors)}"
-    )

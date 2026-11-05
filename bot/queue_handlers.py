@@ -196,3 +196,19 @@ async def cb_cancel_and_remove_task(call: CallbackQuery):
     queue_engine.remove_task(task_id)
     await call.answer(f"🛑 پراسس #{task_id} متوقف و حذف شد.", show_alert=True)
     await _render_queue_message(call, page=page)
+
+@router.callback_query(F.data.startswith("qprio:"))
+async def cb_change_task_priority(call: CallbackQuery):
+    """جابجایی اولویت پراسس‌های در انتظار (up / down / top)"""
+    parts = call.data.split(":")
+    direction = parts[1]   # 'up' | 'down' | 'top'
+    task_id = parts[2]
+    page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+
+    moved = queue_engine.move_pending_task(task_id, direction)
+    if moved:
+        pos, total_p = queue_engine.get_pending_position(task_id)
+        await call.answer(f"✅ اولویت #{task_id} به جایگاه {pos} از {total_p} تغییر یافت!")
+    else:
+        await call.answer("⚠️ امکان جابجایی بیشتر در این جهت وجود ندارد.")
+    await _render_queue_message(call, page=page)

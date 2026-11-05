@@ -1,190 +1,258 @@
 import asyncio
+import inspect
 import logging
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Awaitable, Any
+from typing import Any, Callable, Coroutine
+from aiogram import Bot
+
 from core.config_loader import cfg
 
 
 @dataclass
 class QueueTask:
     task_id: str
-    queue_type: str          # 'mkvtoolnix' | 'handbrake' | 'download' | 'upload'
+    queue_type: str          # 'download' | 'mkvtoolnix' | 'handbrake' | 'upload'
     title: str
-    coro_func: Callable[..., Awaitable[Any]]
+    func: Callable[..., Coroutine[Any, Any, Any]]
     args: tuple = field(default_factory=tuple)
     kwargs: dict = field(default_factory=dict)
-    status: str = "در صف انتظار ⏳"
+    status: str = "⏳ در انتظار"
     progress: str = "0%"
-    result: Any = None
-    error: str | None = None
-    worker_id: int = 1
-    async_task: asyncio.Task | None = None
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%H:%M:%S"))
+    error: str | None = None
+    result: Any = None
+    is_finished: bool = False
+    is_cancelled: bool = False
+    running_asyncio_task: asyncio.Task | None = None
 
-    @property
-    def is_finished(self) -> bool:
-        return any(k in self.status for k in ("تکمیل", "خطا", "لغو"))
 
+class QueueManager:
+    QUEUE_TYPES = ("download", "mkvtoolnix", "handbrake", "upload")
 
-class SequentialQueueEngine:
     def __init__(self):
-        self.queues: dict[str, asyncio.Queue[QueueTask]] = {
-            "mkvtoolnix": asyncio.Queue(),
-            "handbrake": asyncio.Queue(),
-            "download": asyncio.Queue(),
-            "upload": asyncio.Queue(),
-        }
-        self.tasks_registry: dict[str, QueueTask] = {}
+        self.tasks: dict[str, QueueTask] = {}
+        self.pending_lists: dict[str, list[str]] = {q: [] for q in self.QUEUE_TYPES}
+        self._events: dict[str, asyncio.Event] = {q: asyncio.Event() for q in self.QUEUE_TYPES}
+        self._locks: dict[str, asyncio.Lock] = {q: asyncio.Lock() for q in self.QUEUE_TYPES}
         self._workers: list[asyncio.Task] = []
-        self.bot: Any = None
+        self._bot: Bot | None = None
 
-    def set_bot(self, bot: Any):
-        """تنظیم نمونه ربات تلگرام برای ارسال اعلان خودکار پایان یا خطای پردازش‌ها"""
-        self.bot = bot
-
-    async def _notify_admins(self, text: str):
-        """ارسال پیام وضعیت به ادمین‌ها در تلگرام"""
-        if not self.bot:
-            return
-        admin_ids = cfg.get("telegram", "admin_ids", [])
-        for admin_id in admin_ids:
-            try:
-                await self.bot.send_message(
-                    chat_id=admin_id,
-                    text=text,
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                logging.warning(f"Failed to send queue notification to {admin_id}: {e}")
-
-    def start_workers(self):
-        """راه‌اندازی ورکرهای پس‌زمینه (۲ ورکر همزمان برای HandBrake)"""
-        if self._workers:
-            return
-        concurrency_cfg = cfg.get("concurrency") or {}
-        worker_counts = {
-            "handbrake": int(concurrency_cfg.get("handbrake_workers", 2)),
-            "mkvtoolnix": int(concurrency_cfg.get("mkvtoolnix_workers", 1)),
-            "download": int(concurrency_cfg.get("download_workers", 1)),
-            "upload": int(concurrency_cfg.get("upload_workers", 1)),
-        }
-
-        for q_name, count in worker_counts.items():
-            for w_idx in range(1, max(1, count) + 1):
-                worker = asyncio.create_task(self._worker_loop(q_name, w_idx))
-                self._workers.append(worker)
+    def set_bot(self, bot: Bot):
+        self._bot = bot
 
     async def add_task(
         self,
         queue_type: str,
         title: str,
-        coro_func: Callable[..., Awaitable[Any]],
+        func: Callable,
         *args,
+        priority_top: bool = False,
         **kwargs
     ) -> QueueTask:
+        if queue_type not in self.QUEUE_TYPES:
+            queue_type = "download"
+
         task_id = str(uuid.uuid4())[:6]
         task = QueueTask(
             task_id=task_id,
             queue_type=queue_type,
             title=title,
-            coro_func=coro_func,
+            func=func,
             args=args,
             kwargs=kwargs
         )
-        self.tasks_registry[task_id] = task
-        await self.queues[queue_type].put(task)
+        self.tasks[task_id] = task
+
+        async with self._locks[queue_type]:
+            if priority_top:
+                self.pending_lists[queue_type].insert(0, task_id)
+            else:
+                self.pending_lists[queue_type].append(task_id)
+            self._events[queue_type].set()
+
         return task
 
-    async def _worker_loop(self, queue_name: str, worker_id: int):
-        queue = self.queues[queue_name]
+    def move_pending_task(self, task_id: str, direction: str) -> bool:
+        """
+        جابجایی نوبت و اولویت پراسس‌های در انتظار:
+        direction: 'up' (یک پله بالاتر) | 'down' (یک پله پایین‌تر) | 'top' (انتقال به صدر صف)
+        """
+        task = self.tasks.get(task_id)
+        if not task or "انتظار" not in task.status:
+            return False
+
+        p_list = self.pending_lists.get(task.queue_type, [])
+        if task_id not in p_list:
+            return False
+
+        idx = p_list.index(task_id)
+        if direction == "top" and idx > 0:
+            p_list.pop(idx)
+            p_list.insert(0, task_id)
+            return True
+        elif direction == "up" and idx > 0:
+            p_list[idx - 1], p_list[idx] = p_list[idx], p_list[idx - 1]
+            return True
+        elif direction == "down" and idx < len(p_list) - 1:
+            p_list[idx + 1], p_list[idx] = p_list[idx], p_list[idx + 1]
+            return True
+        return False
+
+    def get_pending_position(self, task_id: str) -> tuple[int, int]:
+        """برگرداندن (جایگاه فعلی در صف انتظار، کل تعداد در انتظار همان صف)"""
+        task = self.tasks.get(task_id)
+        if not task:
+            return 0, 0
+        p_list = self.pending_lists.get(task.queue_type, [])
+        if task_id not in p_list:
+            return 0, len(p_list)
+        return p_list.index(task_id) + 1, len(p_list)
+
+    async def _pop_next_pending(self, queue_type: str) -> QueueTask | None:
         while True:
-            task: QueueTask = await queue.get()
-            if task.task_id not in self.tasks_registry or task.status == "لغو شده ❌":
-                queue.task_done()
+            async with self._locks[queue_type]:
+                while self.pending_lists[queue_type]:
+                    tid = self.pending_lists[queue_type].pop(0)
+                    t = self.tasks.get(tid)
+                    if t and not t.is_cancelled and not t.is_finished:
+                        return t
+                self._events[queue_type].clear()
+            await self._events[queue_type].wait()
+
+    async def _notify_admins(self, text: str):
+        if not self._bot:
+            return
+        for admin_id in cfg.get("telegram", "admin_ids", []):
+            try:
+                await self._bot.send_message(
+                    chat_id=admin_id,
+                    text=text[:4000],
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True
+                )
+            except Exception:
+                try:
+                    await self._bot.send_message(
+                        chat_id=admin_id,
+                        text=text.replace("`", "").replace("*", "")[:4000],
+                        disable_web_page_preview=True
+                    )
+                except Exception as e:
+                    logging.error(f"Queue notification error: {e}")
+
+    async def _worker_loop(self, queue_type: str, worker_idx: int):
+        while True:
+            task = await self._pop_next_pending(queue_type)
+            if not task:
                 continue
 
-            task.worker_id = worker_id
-            task.status = f"در حال اجرا (ورکر #{worker_id}) ⚙️"
+            task.status = f"⚙️ در حال اجرا (W{worker_idx})"
+            task.progress = "شروع پردازش..."
+
+            def _prog_cb(msg: str, t=task):
+                t.progress = str(msg)
+
+            kwargs = dict(task.kwargs)
             try:
-                def update_progress(pct_text: str):
-                    task.progress = pct_text
+                sig = inspect.signature(task.func)
+                if "progress_callback" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    kwargs["progress_callback"] = _prog_cb
+            except Exception:
+                kwargs["progress_callback"] = _prog_cb
 
-                task.kwargs["progress_callback"] = update_progress
-                task.async_task = asyncio.current_task()
-                task.result = await task.coro_func(*task.args, **task.kwargs)
-                task.status = "تکمیل شد ✅"
+            try:
+                coro = task.func(*task.args, **kwargs)
+                run_task = asyncio.create_task(coro)
+                task.running_asyncio_task = run_task
+                res = await run_task
+
+                task.result = res
+                task.status = "✅ تکمیل شد"
                 task.progress = "100%"
+                task.is_finished = True
 
-                # ارسال اعلان اتمام موفقیت‌آمیز به تلگرام
-                msg = (
-                    f"✅ **پردازش تکمیل شد!**\n"
-                    f"🆔 کد: `{task.task_id}`\n"
-                    f"⚙️ بخش: `{task.queue_type.upper()}`\n"
-                    f"📌 عنوان: `{task.title}`"
-                )
-                if isinstance(task.result, list) and task.result:
-                    links = "\n".join([f"🔗 {u}" for u in task.result[:10]])
-                    msg += f"\n\n📥 **لینک‌های تولید شده:**\n{links}"
-                elif task.result:
-                    msg += f"\n📂 خروجی: `{task.result}`"
-                await self._notify_admins(msg)
+                # اگر تسک آپلود بوده و لینک‌های دانلود تولید کرده، لینک‌ها را در تلگرام بفرست
+                if queue_type == "upload" and isinstance(res, list) and res:
+                    links_block = "\n".join([f"🔗 `{u}`" for u in res[:25]])
+                    await self._notify_admins(
+                        f"☁️ **آپلود با موفقیت به پایان رسید!**\n"
+                        f"📌 عنوان: `{task.title}`\n\n"
+                        f"📥 **لینک‌های مستقیم دانلود:**\n{links_block}"
+                    )
 
             except asyncio.CancelledError:
-                task.status = "لغو شده ❌"
-                task.error = "توسط کاربر متوقف شد."
+                task.status = "🛑 لغو شد"
+                task.progress = "متوقف شده توسط کاربر"
+                task.is_finished = True
             except Exception as e:
-                task.status = "خطا ❌"
+                logging.error(f"Task {task.task_id} failed:\n{traceback.format_exc()}")
                 task.error = str(e)
+                task.status = "❌ خطا"
+                task.progress = "متوقف شده به دلیل خطا"
+                task.is_finished = True
                 await self._notify_admins(
                     f"❌ **خطا در پردازش!**\n"
                     f"🆔 کد: `{task.task_id}`\n"
                     f"⚙️ بخش: `{task.queue_type.upper()}`\n"
                     f"📌 عنوان: `{task.title}`\n"
-                    f"⚠️ جزئیات خطا:\n`{str(e)[:300]}`"
+                    f"⚠️ جزئیات خطا:\n`{str(e)[:400]}`"
                 )
             finally:
-                task.async_task = None
-                queue.task_done()
+                task.running_asyncio_task = None
+
+    def start_workers(self):
+        if self._workers:
+            return
+        conc = cfg.get("concurrency") or {}
+        counts = {
+            "handbrake": int(conc.get("handbrake_workers", 2)),
+            "mkvtoolnix": int(conc.get("mkvtoolnix_workers", 1)),
+            "download": int(conc.get("download_workers", 1)),
+            "upload": 1,  # همیشه ۱ ورکر برای CuteFTP تا آپلودها به صورت ترتیبی و بدون فریز شدن انجام شوند
+        }
+        for q_type, num in counts.items():
+            for idx in range(1, max(1, num) + 1):
+                w = asyncio.create_task(self._worker_loop(q_type, idx))
+                self._workers.append(w)
 
     def get_queue_summary(self) -> list[QueueTask]:
-        """برگرداندن لیست تسک‌ها برای نمایش در تلگرام"""
-        return list(self.tasks_registry.values())[-20:]
+        return list(self.tasks.values())
 
     def cancel_task(self, task_id: str) -> bool:
-        """لغو تسک در صف انتظار یا در حال اجرا"""
-        task = self.tasks_registry.get(task_id)
-        if not task:
+        t = self.tasks.get(task_id)
+        if not t:
             return False
-        if task.status.startswith("در صف"):
-            task.status = "لغو شده ❌"
-            return True
-        if task.async_task and not task.async_task.done():
-            task.async_task.cancel()
-            task.status = "لغو شده ❌"
+        t.is_cancelled = True
+        if t.queue_type in self.pending_lists and task_id in self.pending_lists[t.queue_type]:
+            self.pending_lists[t.queue_type].remove(task_id)
+        if t.running_asyncio_task and not t.running_asyncio_task.done():
+            t.running_asyncio_task.cancel()
+        t.status = "🛑 لغو شد"
+        t.is_finished = True
+        return True
+
+    def remove_task(self, task_id: str) -> bool:
+        if task_id in self.tasks:
+            t = self.tasks[task_id]
+            if t.queue_type in self.pending_lists and task_id in self.pending_lists[t.queue_type]:
+                self.pending_lists[t.queue_type].remove(task_id)
+            del self.tasks[task_id]
             return True
         return False
 
-    def remove_task(self, task_id: str) -> bool:
-        """حذف یک تسک از لیست"""
-        task = self.tasks_registry.get(task_id)
-        if not task:
-            return False
-        if not task.is_finished:
-            self.cancel_task(task_id)
-        self.tasks_registry.pop(task_id, None)
-        return True
-
     def clear_finished_tasks(self) -> int:
-        """حذف یکجای تمامی پراسس‌های تمام‌شده، خطادار یا لغوشده"""
-        finished_ids = [
-            tid for tid, t in self.tasks_registry.items()
-            if t.is_finished
+        to_del = [
+            tid for tid, t in self.tasks.items()
+            if t.is_finished or any(k in str(t.status) for k in ("تکمیل", "خطا", "لغو"))
         ]
-        for tid in finished_ids:
-            self.tasks_registry.pop(tid, None)
-        return len(finished_ids)
+        for tid in to_del:
+            del self.tasks[tid]
+        return len(to_del)
 
 
-queue_engine = SequentialQueueEngine()
+queue_engine = QueueManager()

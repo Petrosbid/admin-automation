@@ -1,3 +1,5 @@
+import re
+import shutil
 import uuid
 from pathlib import Path
 from aiogram import Router, F, Bot
@@ -34,7 +36,33 @@ def is_admin(user_id: int) -> bool:
     return user_id in cfg.get("telegram", "admin_ids", [])
 
 
+def _extract_batch_links(raw_text: str) -> list[str]:
+    """
+    استخراج هوشمند یک یا چند لینک از متن ارسالی کاربر (پشتیبانی از Batch Download با خط فاصله یا خطوط پشت سر هم)
+    پشتیبانی از: http://, https://, magnet:?xt=
+    """
+    if not raw_text:
+        return []
+    links: list[str] = []
+    for line in raw_text.splitlines():
+        clean = line.strip()
+        if not clean:
+            continue
+        # اگر در یک خط لینک وجود دارد
+        matches = re.findall(r"(magnet:\?xt=[^\s]+|https?://[^\s]+)", clean)
+        if matches:
+            for m in matches:
+                if m not in links:
+                    links.append(m)
+        elif clean.startswith(("http://", "https://", "magnet:?")):
+            if clean not in links:
+                links.append(clean)
+    return links
+
+
 async def _show_download_targets(target_msg_or_call: Message | CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    targets = data.get("pending_direct_targets", [])
     folders = DownloaderService.list_workspace_folders()
     await state.update_data(dl_available_folders=[str(f.resolve()) for f in folders])
     await state.set_state(DownloadStates.choosing_download_folder)
@@ -42,8 +70,11 @@ async def _show_download_targets(target_msg_or_call: Message | CallbackQuery, st
     folder_lines = "\n".join([f"`[{i+1}]` 📂 `{f.name}`" for i, f in enumerate(folders[:25])])
     list_block = f"\n📋 **لیست پوشه‌ها:**\n{folder_lines}\n" if folder_lines else ""
 
+    batch_badge = f"📦 **تعداد لینک‌های دریافت‌شده برای دانلود گروهی (Batch):** `{len(targets)}` لینک\n" if len(targets) > 1 else ""
+
     text = (
-        "📂 **انتخاب پوشه مقصد دانلود:**\n"
+        f"📂 **انتخاب پوشه مقصد دانلود:**\n"
+        f"{batch_badge}"
         f"{list_block}\n"
         "یکی از پوشه‌های موجود زیر را انتخاب کنید و یا دکمه **«➕ ساخت پوشه جدید»** را بزنید:"
     )
@@ -53,6 +84,23 @@ async def _show_download_targets(target_msg_or_call: Message | CallbackQuery, st
         await target_msg_or_call.message.edit_text(text[:4000], reply_markup=kb, parse_mode="Markdown")
     else:
         await target_msg_or_call.answer(text[:4000], reply_markup=kb, parse_mode="Markdown")
+
+
+async def _enqueue_batch_downloads(targets: list[str], dest_dir: Path) -> list[str]:
+    """قرار دادن یک یا چند لینک در صف دانلود"""
+    task_ids = []
+    total = len(targets)
+    for idx, t_link in enumerate(targets, start=1):
+        label = f"دانلود [{idx}/{total}] در {dest_dir.name}" if total > 1 else f"دانلود در {dest_dir.name}"
+        task = await queue_engine.add_task(
+            "download",
+            label,
+            DownloaderService.download,
+            t_link,
+            dest_dir
+        )
+        task_ids.append(task.task_id)
+    return task_ids
 
 
 # ==================== ۱. جستجو و دانلود از ۹ سایت ====================
@@ -120,18 +168,20 @@ async def cb_click_search_result(call: CallbackQuery, state: FSMContext):
             reply_markup=search_results_kb(sub_links)
         )
 
-    await state.update_data(pending_direct_target=chosen["target"])
+    await state.update_data(pending_direct_targets=[chosen["target"]])
     await _show_download_targets(call, state)
 
 
-# ==================== ۲. دانلود لینک مستقیم / تورنت / مگا / گوگل درایو ====================
+# ==================== ۲. دانلود لینک مستقیم / تورنت / مگا / گوگل درایو (تکی و Batch) ====================
 @router.callback_query(F.data == "menu:direct_dl")
 async def cb_direct_dl(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(DownloadStates.waiting_direct_link)
     await call.message.edit_text(
-        "📥 **دانلود فیلم یا سریال**\n\n"
-        "🔗 لطفاً **لینک مستقیم، لینک Magnet، لینک Mega.nz یا Google Drive** را ارسال کنید (و یا **فایل `.torrent`** بفرستید):",
+        "📥 **دانلود فیلم یا سریال (تکی و گروهی Batch)**\n\n"
+        "🔗 لطفاً **یک یا چند لینک (مستقیم، Magnet، Mega.nz، Google Drive)** را ارسال کنید:\n"
+        "• برای **دانلود گروهی (Batch)**، کافی است بین هر لینک یک خط فاصله بگذارید (یا هر لینک را در یک خط قرار دهید).\n"
+        "• همچنین می‌توانید فایل `.torrent` ارسال کنید:",
         parse_mode="Markdown"
     )
 
@@ -143,13 +193,15 @@ async def handle_direct_link_input(message: Message, state: FSMContext):
         temp_dir.mkdir(parents=True, exist_ok=True)
         t_path = temp_dir / message.document.file_name
         await message.bot.download(message.document, destination=t_path)
-        target = str(t_path.resolve())
+        targets = [str(t_path.resolve())]
     elif message.text:
-        target = message.text.strip()
+        targets = _extract_batch_links(message.text)
+        if not targets:
+            return await message.answer("⚠️ هیچ لینک معتبری در پیام شما یافت نشد! لطفاً لینک‌ها را با `http://`، `https://` یا `magnet:?` ارسال کنید:")
     else:
-        return await message.answer("⚠️ لطفاً یک لینک معتبر یا یک فایل `.torrent` ارسال کنید:")
+        return await message.answer("⚠️ لطفاً لینک یا فایل `.torrent` ارسال کنید:")
 
-    await state.update_data(pending_direct_target=target)
+    await state.update_data(pending_direct_targets=targets)
     await _show_download_targets(message, state)
 
 
@@ -162,22 +214,20 @@ async def cb_select_existing_dl_folder(call: CallbackQuery, state: FSMContext):
         return await call.answer("⚠️ پوشه یافت نشد.", show_alert=True)
 
     chosen_dir = Path(folders[idx])
-    for sub_name in ("softsub", "hardsub", "sub"):
-        (chosen_dir / sub_name).mkdir(parents=True, exist_ok=True)
+    chosen_dir.mkdir(parents=True, exist_ok=True)
 
-    target = data["pending_direct_target"]
-    task = await queue_engine.add_task(
-        "download",
-        f"دانلود در {chosen_dir.name}",
-        DownloaderService.download,
-        target,
-        chosen_dir
-    )
+    targets = data.get("pending_direct_targets", [])
+    if not targets and data.get("pending_direct_target"):
+        targets = [data["pending_direct_target"]]
+
+    task_ids = await _enqueue_batch_downloads(targets, chosen_dir)
     await state.clear()
+
+    ids_str = ", ".join([f"`{tid}`" for tid in task_ids])
     await call.message.edit_text(
-        f"✅ دانلود با موفقیت در صف قرار گرفت!\n"
+        f"✅ تعداد **`{len(task_ids)}` دانلود** با موفقیت در صف قرار گرفت!\n"
         f"📂 پوشه مقصد: `{chosen_dir.name}`\n"
-        f"🆔 کد تسک: `{task.task_id}`",
+        f"🆔 کد تسک‌ها: {ids_str}",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -187,7 +237,7 @@ async def cb_select_existing_dl_folder(call: CallbackQuery, state: FSMContext):
 async def cb_create_new_dl_folder(call: CallbackQuery, state: FSMContext):
     await state.set_state(DownloadStates.waiting_direct_folder_name)
     await call.message.edit_text(
-        "📁 لطفاً **نام پوشه جدید** (نام فیلم یا سریال) را وارد کنید:",
+        "📁 لطفاً **نام پوشه جدید** (نام فیلم یا سریال، مثلاً `VisionQuest/S02/1080p-Pahe` یا `Movie.2026`) را وارد کنید:",
         parse_mode="Markdown"
     )
 
@@ -199,22 +249,28 @@ async def handle_direct_folder_name(message: Message, state: FSMContext):
 
     folder_name = message.text.strip()
     data = await state.get_data()
-    pending_target = data.get("pending_direct_target")
+    targets = data.get("pending_direct_targets", [])
+    if not targets and data.get("pending_direct_target"):
+        targets = [data["pending_direct_target"]]
 
-    folders = DownloaderService.create_movie_folders(folder_name)
-    if pending_target:
-        task = await queue_engine.add_task(
-            "download",
-            f"دانلود در {folders['base'].name}",
-            DownloaderService.download,
-            pending_target,
-            folders["base"]
-        )
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    # پشتیبانی از مسیر تودرتو مثل VisionQuest/S02/FullHD
+    clean_rel = re.sub(r'[<>:"|?*]', "", folder_name).strip().lstrip("/\\")
+    if "/" in clean_rel or "\\" in clean_rel:
+        target_dir = workspace / clean_rel
+        target_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        folders = DownloaderService.create_movie_folders(clean_rel)
+        target_dir = folders["base"]
+
+    if targets:
+        task_ids = await _enqueue_batch_downloads(targets, target_dir)
         await state.clear()
+        ids_str = ", ".join([f"`{tid}`" for tid in task_ids])
         return await message.answer(
-            f"✅ دانلود با موفقیت در صف قرار گرفت!\n"
-            f"📂 پوشه ساخته شده: `{folders['base'].name}` (شامل `softsub`, `hardsub`, `sub`)\n"
-            f"🆔 کد تسک: `{task.task_id}`",
+            f"✅ تعداد **`{len(task_ids)}` دانلود** با موفقیت در صف قرار گرفت!\n"
+            f"📂 پوشه مقصد: `{target_dir}`\n"
+            f"🆔 کد تسک‌ها: {ids_str}",
             reply_markup=main_menu_kb(),
             parse_mode="Markdown"
         )
@@ -222,12 +278,12 @@ async def handle_direct_folder_name(message: Message, state: FSMContext):
     await state.update_data(dl_folder_name=folder_name)
     await state.set_state(DownloadStates.waiting_direct_link)
     await message.answer(
-        f"📂 پوشه `{folders['base'].name}` ساخته شد.\nحالا لینک یا فایل `.torrent` را ارسال کنید:",
+        f"📂 پوشه `{target_dir}` ساخته شد.\nحالا لینک (یا لیست لینک‌های Batch) را ارسال کنید:",
         parse_mode="Markdown"
     )
 
 
-# ==================== ۳. استخراج زیرنویس (هم از فایل موجود در دایرکتوری و هم از لینک دانلود) ====================
+# ==================== ۳. استخراج زیرنویس (از فایل موجود در دایرکتوری و از لینک تکی/Batch) ====================
 @router.callback_query(F.data == "menu:link_extract_sub")
 async def cb_link_extract_sub_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -235,13 +291,12 @@ async def cb_link_extract_sub_menu(call: CallbackQuery, state: FSMContext):
         "📤 **بخش استخراج زیرنویس از فیلم**\n\n"
         "لطفاً روش مورد نظر خود را انتخاب کنید:\n"
         "1️⃣ **از فایل موجود در دایرکتوری:** انتخاب فیلم از داخل پوشه‌های سرور و دریافت زیرنویس‌های داخل آن.\n"
-        "2️⃣ **از طریق لینک دانلود:** ارسال لینک یا فایل تورنت تا فیلم دانلود شده و زیرنویس‌هایش در چت ارسال شود.",
+        "2️⃣ **از طریق لینک دانلود (تکی یا Batch):** ارسال یک یا چند لینک تا دانلود شده، زیرنویس‌هایشان در چت ارسال شود و پوشه موقتشان خودکار پاک گردد.",
         reply_markup=extract_sub_entry_kb(),
         parse_mode="Markdown"
     )
 
 
-# --- الف) استخراج زیرنویس از فایل موجود در دایرکتوری (مرورگر پوشه و فایل) ---
 async def _render_local_extract_browser(call: CallbackQuery, state: FSMContext, browse_dir: Path):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     browse_dir = browse_dir.resolve()
@@ -370,8 +425,7 @@ async def cb_extract_single_local_track(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     video_path = Path(data["selected_video"]).resolve()
 
-    # ذخیره در پوشه sub فیلم (در صورت وجود) یا کنار خود فیلم
-    sub_dir = (video_path.parent / "sub") if (video_path.parent / "sub").is_dir() else video_path.parent
+    sub_dir = (video_path.parent / "srt") if (video_path.parent / "srt").is_dir() else video_path.parent
     ext = ".ass" if ("ass" in codec_lower or "ssa" in codec_lower) else (".sup" if "pgs" in codec_lower else ".srt")
     out_sub = sub_dir / f"{video_path.stem}_Track{track_id}{ext}"
 
@@ -398,7 +452,7 @@ async def cb_extract_single_local_track(call: CallbackQuery, state: FSMContext):
 async def cb_extract_all_local_tracks(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     video_path = Path(data["selected_video"]).resolve()
-    sub_dir = (video_path.parent / "sub") if (video_path.parent / "sub").is_dir() else video_path.parent
+    sub_dir = (video_path.parent / "srt") if (video_path.parent / "srt").is_dir() else video_path.parent
 
     await call.message.edit_text(
         f"⏳ در حال استخراج تمامی زیرنویس‌های:\n`{video_path.name}`...",
@@ -420,7 +474,6 @@ async def cb_extract_all_local_tracks(call: CallbackQuery, state: FSMContext):
     await _render_local_extract_browser(call, state, curr)
 
 
-# --- ب) استخراج زیرنویس با دانلود از لینک ---
 async def _download_and_extract_subs_job(
     bot: Bot,
     chat_id: int,
@@ -428,30 +481,45 @@ async def _download_and_extract_subs_job(
     temp_dir: Path,
     progress_callback=None
 ) -> list[str]:
-    await DownloaderService.download(target_link, temp_dir, progress_callback=progress_callback)
-    videos = DownloaderService.find_video_files(temp_dir)
-    if not videos:
-        raise FileNotFoundError("هیچ فایل ویدئویی پس از دانلود یافت نشد.")
+    try:
+        await DownloaderService.download(target_link, temp_dir, progress_callback=progress_callback)
+        videos = DownloaderService.find_video_files(temp_dir)
+        if not videos:
+            raise FileNotFoundError("هیچ فایل ویدئویی پس از دانلود یافت نشد.")
 
-    video_file = videos[0]
-    if progress_callback:
-        progress_callback(f"در حال استخراج زیرنویس‌ها از {video_file.name}...")
+        video_file = videos[0]
+        if progress_callback:
+            progress_callback(f"در حال استخراج زیرنویس‌ها از {video_file.name}...")
 
-    subs_dir = temp_dir / "extracted_subs"
-    extracted = await MKVService.extract_all_subtitles(video_file, subs_dir, progress_callback=progress_callback)
+        subs_dir = temp_dir / "extracted_subs"
+        extracted = await MKVService.extract_all_subtitles(video_file, subs_dir, progress_callback=progress_callback)
 
-    if not extracted:
-        await bot.send_message(chat_id, f"⚠️ فیلم `{video_file.name}` دانلود شد اما هیچ ترک زیرنویسی داخل آن وجود نداشت.", parse_mode="Markdown")
-        return []
+        if not extracted:
+            await bot.send_message(
+                chat_id,
+                f"⚠️ فیلم `{video_file.name}` دانلود شد اما هیچ ترک زیرنویسی داخل آن وجود نداشت.",
+                parse_mode="Markdown"
+            )
+            return []
 
-    for sub_p in extracted:
-        await bot.send_document(
-            chat_id,
-            FSInputFile(sub_p),
-            caption=f"📤 زیرنویس استخراج شده از:\n`{video_file.name}`\n📄 فایل: `{sub_p.name}`",
-            parse_mode="Markdown"
-        )
-    return [str(p) for p in extracted]
+        for sub_p in extracted:
+            await bot.send_document(
+                chat_id,
+                FSInputFile(sub_p),
+                caption=f"📤 زیرنویس استخراج شده از:\n`{video_file.name}`\n📄 فایل: `{sub_p.name}`",
+                parse_mode="Markdown"
+            )
+
+        if progress_callback:
+            progress_callback("در حال پاکسازی پوشه موقت SubExtract...")
+        return [sub_p.name for sub_p in extracted]
+
+    finally:
+        try:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data == "extmode:link")
@@ -460,9 +528,9 @@ async def cb_extmode_link_start(call: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="🔙 بازگشت", callback_data="menu:link_extract_sub"))
     await call.message.edit_text(
-        "📤 **دانلود فیلم و استخراج خودکار زیرنویس**\n\n"
-        "لینک مستقیم فیلم، لینک Magnet/تورنت، یا لینک Mega/GDrive را ارسال کنید (یا فایل `.torrent` بفرستید).\n"
-        "ربات فیلم را دانلود کرده و تمام زیرنویس‌های داخل آن را استخراج و در همین چت برایتان ارسال می‌کند:",
+        "📤 **دانلود فیلم و استخراج خودکار زیرنویس (تکی و Batch)**\n\n"
+        "یک یا چند لینک فیلم (مستقیم، Magnet، Mega، GDrive) را با یک خط فاصله ارسال کنید.\n"
+        "ربات فیلم‌ها را دانلود کرده، زیرنویس‌هایشان را در چت می‌فرستد و پوشه موقت `SubExtract` را خودکار پاک می‌کند:",
         reply_markup=kb.as_markup(),
         parse_mode="Markdown"
     )
@@ -470,38 +538,47 @@ async def cb_extmode_link_start(call: CallbackQuery, state: FSMContext):
 
 @router.message(DownloadStates.waiting_link_for_sub_extract)
 async def handle_link_for_sub_extract(message: Message, state: FSMContext):
-    job_uid = str(uuid.uuid4())[:6]
-    temp_dir = Path(cfg.get("paths", "workspace_dir")) / f"SubExtract_{job_uid}"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
+    targets: list[str] = []
     if message.document and message.document.file_name and message.document.file_name.lower().endswith(".torrent"):
+        job_uid = str(uuid.uuid4())[:6]
+        temp_dir = Path(cfg.get("paths", "workspace_dir")) / f"SubExtract_{job_uid}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
         t_path = temp_dir / message.document.file_name
         await message.bot.download(message.document, destination=t_path)
-        target = str(t_path.resolve())
+        targets = [str(t_path.resolve())]
     elif message.text:
-        target = message.text.strip()
-    else:
-        return await message.answer("⚠️ لطفاً لینک یا فایل `.torrent` ارسال کنید:")
+        targets = _extract_batch_links(message.text)
 
-    task = await queue_engine.add_task(
-        "download",
-        f"دانلود + استخراج زیرنویس ({job_uid})",
-        _download_and_extract_subs_job,
-        message.bot,
-        message.chat.id,
-        target,
-        temp_dir
-    )
+    if not targets:
+        return await message.answer("⚠️ لطفاً حداقل یک لینک معتبر یا فایل `.torrent` ارسال کنید:")
+
+    task_ids = []
+    for t_link in targets:
+        job_uid = str(uuid.uuid4())[:6]
+        temp_dir = Path(cfg.get("paths", "workspace_dir")) / f"SubExtract_{job_uid}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        task = await queue_engine.add_task(
+            "download",
+            f"دانلود + استخراج زیرنویس ({job_uid})",
+            _download_and_extract_subs_job,
+            message.bot,
+            message.chat.id,
+            t_link,
+            temp_dir
+        )
+        task_ids.append(task.task_id)
+
     await state.clear()
+    ids_str = ", ".join([f"`{tid}`" for tid in task_ids])
     await message.answer(
-        f"✅ در صف قرار گرفت! (کد تسک: `{task.task_id}`)\n"
-        "به محض اتمام دانلود، فایل‌های زیرنویس استخراج شده در همین صفحه برایتان ارسال می‌شوند.",
+        f"✅ تعداد **`{len(task_ids)}` تسک استخراج زیرنویس** در صف قرار گرفت! ({ids_str})\n"
+        "به محض اتمام دانلود هر کدام، زیرنویس‌ها ارسال شده و پوشه موقت حذف می‌گردد.",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
 
 
-# ==================== دریافت مستقیم فایل .torrent یا لینک در حالت بدون استیت ====================
+# ==================== دریافت مستقیم فایل .torrent یا لینک‌های Batch در حالت بدون استیت ====================
 @router.message(StateFilter(None), F.document)
 async def receive_download_torrent(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -512,13 +589,16 @@ async def receive_download_torrent(message: Message, state: FSMContext):
         t_path = temp_dir / message.document.file_name
         await message.bot.download(message.document, destination=t_path)
 
-        await state.update_data(pending_direct_target=str(t_path.resolve()))
+        await state.update_data(pending_direct_targets=[str(t_path.resolve())])
         await _show_download_targets(message, state)
 
 
-@router.message(StateFilter(None), F.text.regexp(r"^(magnet:\?xt=|https?://)"))
+@router.message(StateFilter(None), F.text.regexp(r"(magnet:\?xt=|https?://)"))
 async def catch_direct_links_in_chat(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    await state.update_data(pending_direct_target=message.text.strip())
+    targets = _extract_batch_links(message.text or "")
+    if not targets:
+        return
+    await state.update_data(pending_direct_targets=targets)
     await _show_download_targets(message, state)

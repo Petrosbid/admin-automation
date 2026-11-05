@@ -11,6 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.config_loader import cfg
 from core.queue_manager import queue_engine
+from services.cuteftp_service import CuteFTPService
 from services.downloader_service import DownloaderService
 from services.subtitle_service import SubtitleService
 from services.mkv_service import MKVService
@@ -29,7 +30,7 @@ router = Router()
 
 
 class SubtitleStates(StatesGroup):
-    # استیت‌های اتوماسیون هوشمند ۱-کلیکی (فیلم و سریال SxxEyy)
+    # استیت‌های اتوماسیون هوشمند (تک‌قسمتی، چندقسمتی و فیلم)
     sauto_browsing_dir = State()
     sauto_waiting_fa_sub = State()
     sauto_waiting_fa_sub_name = State()
@@ -61,7 +62,7 @@ def _natural_sort_key(path_str: str) -> list:
 
 
 # ==============================================================================
-# بخش اول: اتوماسیون کامل و هوشمند فیلم و سریال (Smart Full Automation UX)
+# بخش اول: اتوماسیون کامل و هوشمند فیلم و چندقسمتی سریال (Multi-Episode Automation)
 # ==============================================================================
 
 async def _render_smart_auto_browser(call_or_msg: CallbackQuery | Message, state: FSMContext, current_dir: Path):
@@ -84,30 +85,47 @@ async def _render_smart_auto_browser(call_or_msg: CallbackQuery | Message, state
     detected_eps = AutomationService.scan_available_episodes_in_season(current_dir)
     is_root = (current_dir == workspace)
 
+    data = await state.get_data()
+    # اگر پوشه عوض شده، انتخاب قسمت‌های قبلی را ریست کن
+    prev_dir = data.get("sauto_curr_dir")
+    selected_eps = set(data.get("sauto_selected_eps", [])) if prev_dir == str(current_dir) else set()
+    selected_eps = {ep for ep in selected_eps if ep in detected_eps}
+
     await state.set_state(SubtitleStates.sauto_browsing_dir)
     await state.update_data(
         sauto_curr_dir=str(current_dir),
-        sauto_subfolders=[str(f.resolve()) for f in folders]
+        sauto_subfolders=[str(f.resolve()) for f in folders],
+        sauto_detected_eps=detected_eps,
+        sauto_selected_eps=sorted(list(selected_eps))
     )
 
     folder_lines = [f"`[{i+1}]` 📁 `{f.name}`" for i, f in enumerate(folders[:22])]
     list_block = "\n".join(folder_lines) if folder_lines else "_(زیرپوشه‌ای وجود ندارد)_"
-    ep_badge = f"\n🎞 **قسمت‌های شناسایی‌شده در این فصل:** `{', '.join(detected_eps)}`" if detected_eps else ""
+
+    ep_badge = ""
+    if detected_episodes := detected_eps:
+        ep_badge = (
+            f"\n🎞 **قسمت‌های موجود در این فصل ({len(detected_episodes)} قسمت):**\n"
+            f"`{', '.join(detected_episodes)}`\n"
+            f"✅ **قسمت‌های انتخاب‌شده:** `{len(selected_eps)}` قسمت\n"
+        )
 
     text = (
-        "🚀 **اتوماسیون کامل و هوشمند (فیلم و سریال)**\n"
-        f"📂 مسیر فعلی:\n`{current_dir}`"
-        f"{ep_badge}\n\n"
+        "🚀 **اتوماسیون کامل و هوشمند (فیلم و چندقسمتی سریال)**\n"
+        f"📂 مسیر فعلی:\n`{current_dir}`\n"
+        f"{ep_badge}\n"
         f"📋 **پوشه‌ها:**\n{list_block}\n\n"
         "💡 **راهنما:**\n"
-        "• برای **فیلم**: وارد پوشه فیلم شوید و دکمه **«✅ اجرای اتوماسیون روی کل این پوشه»** را بزنید.\n"
-        "• برای **سریال**: وارد پوشه فصل (مثلاً `VisionQuest/S02`) شوید و روی دکمه قسمت مورد نظر (مثلاً `S02E01`) کلیک کنید.\n"
-        "• همچنین می‌توانید همین الان مستقیماً **فایل زیرنویس فارسی (`.srt` / `.ass` / `.zip`)** را در چت بفرستید!"
+        "• برای **سریال (تک‌قسمتی یا چندقسمتی)**: روی دکمه‌های `SxxEyy` کلیک کنید تا تیک (`✅`) بخورند (یا «انتخاب همه قسمت‌ها» را بزنید) و سپس روی **«🚀 شروع اتوماسیون»** کلیک کنید.\n"
+        "• برای **فیلم**: وارد پوشه فیلم شوید و دکمه تایید پوشه را بزنید."
     )
-    kb = smart_auto_browser_kb(folders, current_dir, is_root, detected_eps)
+    kb = smart_auto_browser_kb(folders, current_dir, is_root, detected_eps, selected_eps)
 
     if isinstance(call_or_msg, CallbackQuery):
-        await call_or_msg.message.edit_text(text[:4000], reply_markup=kb, parse_mode="Markdown")
+        try:
+            await call_or_msg.message.edit_text(text[:4000], reply_markup=kb, parse_mode="Markdown")
+        except Exception:
+            await call_or_msg.answer()
     else:
         await call_or_msg.answer(text[:4000], reply_markup=kb, parse_mode="Markdown")
 
@@ -123,6 +141,7 @@ async def cb_smart_auto_start(call: CallbackQuery, state: FSMContext):
 async def cb_run_smart_auto_from_filemgr(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     curr_dir = Path(data.get("current_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    await state.update_data(sauto_selected_eps=[])
     await _render_smart_auto_browser(call, state, curr_dir)
 
 
@@ -144,12 +163,42 @@ async def cb_sauto_up(call: CallbackQuery, state: FSMContext):
     await _render_smart_auto_browser(call, state, parent)
 
 
-@router.callback_query(SubtitleStates.sauto_browsing_dir, F.data.startswith("sauto:ep:"))
-async def cb_sauto_select_episode(call: CallbackQuery, state: FSMContext):
+@router.callback_query(SubtitleStates.sauto_browsing_dir, F.data.startswith("sauto:ep_toggle:"))
+async def cb_sauto_toggle_episode(call: CallbackQuery, state: FSMContext):
     ep_tag = call.data.split(":")[2]
     data = await state.get_data()
+    selected = set(data.get("sauto_selected_eps", []))
+    if ep_tag in selected:
+        selected.remove(ep_tag)
+    else:
+        selected.add(ep_tag)
+    await state.update_data(sauto_selected_eps=sorted(list(selected)))
     curr_dir = Path(data["sauto_curr_dir"]).resolve()
-    await _init_smart_auto_plan(call, state, curr_dir, ep_tag)
+    await _render_smart_auto_browser(call, state, curr_dir)
+
+
+@router.callback_query(SubtitleStates.sauto_browsing_dir, F.data == "sauto:ep_all")
+async def cb_sauto_toggle_all_episodes(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    detected = data.get("sauto_detected_eps", [])
+    selected = set(data.get("sauto_selected_eps", []))
+    if detected and all(ep in selected for ep in detected):
+        selected.clear()
+    else:
+        selected = set(detected)
+    await state.update_data(sauto_selected_eps=sorted(list(selected)))
+    curr_dir = Path(data["sauto_curr_dir"]).resolve()
+    await _render_smart_auto_browser(call, state, curr_dir)
+
+
+@router.callback_query(SubtitleStates.sauto_browsing_dir, F.data == "sauto:ep_proceed")
+async def cb_sauto_proceed_selected_episodes(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected_eps = sorted(data.get("sauto_selected_eps", []))
+    if not selected_eps:
+        return await call.answer("⚠️ حداقل یک قسمت را تیک بزنید!", show_alert=True)
+    curr_dir = Path(data["sauto_curr_dir"]).resolve()
+    await _init_smart_auto_batch(call, state, curr_dir, selected_eps)
 
 
 @router.callback_query(SubtitleStates.sauto_browsing_dir, F.data == "sauto:select_dir")
@@ -157,78 +206,119 @@ async def cb_sauto_select_dir(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     curr_dir = Path(data["sauto_curr_dir"]).resolve()
     eps = AutomationService.scan_available_episodes_in_season(curr_dir)
-    ep_tag = eps[-1] if eps else None
-    await _init_smart_auto_plan(call, state, curr_dir, ep_tag)
+    await _init_smart_auto_batch(call, state, curr_dir, eps)
 
 
-async def _init_smart_auto_plan(
+async def _init_smart_auto_batch(
     call_or_msg: CallbackQuery | Message,
     state: FSMContext,
     target_dir: Path,
-    ep_tag: str | None,
-    pre_uploaded_fa_sub: Path | None = None
+    selected_episodes: list[str],
+    pre_uploaded_subs: list[Path] | None = None
 ):
-    """ساخت نقشه اتوماسیون و درخواست زیرنویس فارسی (یا پردازش زیرنویس از قبل ارسال‌شده)"""
-    plan = await AutomationService.analyze_and_build_plan(target_dir, ep_tag)
-    if not plan.softsub_targets:
-        msg = (
-            f"⚠️ هیچ فایل ویدئویی خامی در پوشه `{target_dir.name}` "
-            f"{f'برای قسمت `{ep_tag}` ' if ep_tag else ''}پیدا نشد!\n"
-            "لطفاً مطمئن شوید فایل‌های خام در پوشه قرار دارند."
-        )
+    """
+    موتور شروع اتوماسیون هوشمند (برای ۱ فیلم، ۱ قسمت سریال، یا چندین قسمت سریال به صورت هم‌زمان)
+    """
+    plans = await AutomationService.analyze_multi_episodes_plan(target_dir, selected_episodes)
+    if not plans:
+        msg = f"⚠️ هیچ فایل ویدئویی خامی در پوشه `{target_dir.name}` یافت نشد!"
         if isinstance(call_or_msg, CallbackQuery):
-            return await call_or_msg.answer(msg[:200], show_alert=True)
+            return await call_or_msg.answer(msg, show_alert=True)
         return await call_or_msg.answer(msg, parse_mode="Markdown")
+
+    first_plan = plans[0]
+    ep_tags = [p.season_ep_tag for p in plans if p.season_ep_tag]
 
     await state.update_data(
         sauto_target_dir=str(target_dir),
-        sauto_ep_tag=plan.season_ep_tag,
-        sauto_is_series=plan.is_series,
-        sauto_fa_dest_dir=str(plan.fa_sub_dest_dir),
-        sauto_en_dest_dir=str(plan.en_sub_dest_dir),
+        sauto_ep_tags=ep_tags,
+        sauto_is_series=first_plan.is_series,
+        sauto_fa_dest_dir=str(first_plan.fa_sub_dest_dir),
+        sauto_en_dest_dir=str(first_plan.en_sub_dest_dir),
+        sauto_fa_sub_map={},
+        sauto_en_sub_map={},
     )
 
-    if pre_uploaded_fa_sub and pre_uploaded_fa_sub.exists():
-        return await _process_sauto_fa_subtitle_placement(call_or_msg, state, plan, pre_uploaded_fa_sub)
+    # ۱. جمع‌آوری زیرنویس‌های فارسی از فایل‌های آپلودشده قبلی یا موجود در پوشه
+    local_subs = AutomationService.collect_all_local_fa_subtitles_in_dir(
+        first_plan.base_dir, first_plan.fa_sub_dest_dir
+    )
+    all_candidate_subs = (pre_uploaded_subs or []) + [p for p in local_subs if p not in (pre_uploaded_subs or [])]
 
-    # بررسی اینکه آیا از قبل در پوشه srt/FA یا srt زیرنویس فارسی وجود دارد یا خیر
-    existing_fa_subs = [
-        f for f in plan.fa_sub_dest_dir.iterdir()
-        if f.is_file() and f.suffix.lower() in (".srt", ".ass", ".ssa")
-        and (not plan.season_ep_tag or plan.season_ep_tag.lower() in f.name.lower())
-        and not f.name.lower().endswith(".en.srt")
-    ] if plan.fa_sub_dest_dir.exists() else []
+    matched_map = AutomationService.match_subtitles_to_episodes(plans, all_candidate_subs)
 
+    # اگر برای تمام قسمت‌های انتخاب‌شده (یا فیلم) زیرنویس فارسی منطبق در پوشه پیدا شد، مستقیم برو به مرحله قرارگیری و نام‌گذاری!
+    required_keys = ep_tags if ep_tags else ["MOVIE"]
+    if all(k in matched_map for k in required_keys):
+        return await _place_and_ask_fa_sub_names(call_or_msg, state, plans, matched_map)
+
+    # در غیر این صورت، وضعیت زیرنویس‌های یافت‌شده و کسری‌ها را نشان بده تا کاربر آپلود کند (مثلاً یک فایل ZIP شامل همه زیرنویس‌ها)
     await state.set_state(SubtitleStates.sauto_waiting_fa_sub)
-    await state.update_data(sauto_existing_fa_candidates=[str(p.resolve()) for p in existing_fa_subs])
+    await state.update_data(
+        sauto_partial_fa_map={k: str(v) for k, v in matched_map.items()},
+        sauto_existing_fa_candidates=[str(p) for p in all_candidate_subs]
+    )
 
     kb = InlineKeyboardBuilder()
-    for idx, f_sub in enumerate(existing_fa_subs[:10]):
+    if matched_map:
         kb.row(
             InlineKeyboardButton(
-                text=f"📄 استفاده از زیرنویس موجود: {f_sub.name[:35]}",
-                callback_data=f"sauto_pickfa:{idx}"
+                text=f"▶️ ادامه با همین {len(matched_map)} زیرنویس یافت‌شده",
+                callback_data="sauto_fa:use_partial"
             )
         )
+    if len(plans) == 1 and all_candidate_subs:
+        for idx, f_sub in enumerate(all_candidate_subs[:10]):
+            kb.row(
+                InlineKeyboardButton(
+                    text=f"📄 [{idx+1}] انتخاب: {f_sub.name[:34]}",
+                    callback_data=f"sauto_pickfa:{idx}"
+                )
+            )
     kb.row(InlineKeyboardButton(text="🔙 انصراف", callback_data="menu:home"))
 
-    qualities_list = ", ".join([t.quality_folder_name for t in plan.softsub_targets])
-    fullhd_status = f"✅ `{plan.fullhd_source_video.name}`" if plan.fullhd_source_video else "⚠️ یافت نشد"
+    total_soft = sum(len(p.softsub_targets) for p in plans)
+    total_fhd = sum(1 for p in plans if p.fullhd_source_video)
+
+    status_lines = []
+    for p in plans:
+        key = p.season_ep_tag or "MOVIE"
+        if key in matched_map:
+            status_lines.append(f"✅ `{key}`: `{matched_map[key].name}`")
+        else:
+            status_lines.append(f"❌ `{key}`: _زیرنویس فارسی یافت نشد_")
+
+    ep_status_block = "\n".join(status_lines)
 
     info_text = (
         f"🚀 **اتوماسیون هوشمند آماده شد!**\n\n"
-        f"🎬 عنوان: **`{plan.series_title}`** {f'(`{plan.season_ep_tag}`)' if plan.season_ep_tag else '(فیلم سینمایی)'}\n"
-        f"📦 تعداد کیفیت‌های خام شناسایی‌شده برای سافت‌ساب: **`{len(plan.softsub_targets)}` فایل**\n"
-        f"   └ پوشه‌ها: `{qualities_list}`\n"
-        f"🔥 سورس هاردساب (`FullHD`): {fullhd_status}\n\n"
-        f"🇮🇷 **لطفاً فایل زیرنویس فارسی (`.srt` / `.ass` / `.zip`) را ارسال کنید**"
-        f"{' و یا از دکمه زیرنویس‌های موجود در پوشه استفاده نمایید:' if existing_fa_subs else ':'}"
+        f"🎬 عنوان: **`{first_plan.series_title}`**\n"
+        f"🎞 تعداد قسمت‌های انتخاب‌شده: **`{len(plans)}` مورد**\n"
+        f"📦 مجموع فایل‌های خام برای سافت‌ساب: **`{total_soft}` فایل**\n"
+        f"🔥 سورس‌های آماده هاردساب (`FullHD`): **`{total_fhd}` فایل**\n\n"
+        f"📋 **وضعیت تطبیق زیرنویس فارسی در پوشه:**\n{ep_status_block}\n\n"
+        "📤 **لطفاً فایل زیرنویس فارسی (`.srt` / `.ass`) یا یک فایل `.zip` حاوی زیرنویس قسمت‌ها را ارسال کنید**\n"
+        "*(می‌توانید چند فایل زیرنویس را هم پشت سر هم بفرستید؛ ربات بر اساس `SxxEyy` آن‌ها را به قسمت مربوطه وصل می‌کند)*:"
     )
 
     if isinstance(call_or_msg, CallbackQuery):
         await call_or_msg.message.edit_text(info_text[:4000], reply_markup=kb.as_markup(), parse_mode="Markdown")
     else:
-        await call_or_msg.answer(info_text[:4000], reply_markup=kb.as_markup(), parse_mode="Markdown")
+        await call_or_msg.answer(info_text[:4000], reply_markup=kb, parse_mode="Markdown")
+
+
+@router.callback_query(SubtitleStates.sauto_waiting_fa_sub, F.data == "sauto_fa:use_partial")
+async def cb_sauto_use_partial_fa(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    partial_map = {k: Path(v) for k, v in data.get("sauto_partial_fa_map", {}).items()}
+    if not partial_map:
+        return await call.answer("⚠️ هیچ زیرنویسی تطبیق نیافته است!", show_alert=True)
+
+    target_dir = Path(data["sauto_target_dir"])
+    ep_tags = [k for k in data.get("sauto_ep_tags", []) if k in partial_map]
+    await state.update_data(sauto_ep_tags=ep_tags)
+    plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
+    await _place_and_ask_fa_sub_names(call, state, plans, partial_map)
 
 
 @router.callback_query(SubtitleStates.sauto_waiting_fa_sub, F.data.startswith("sauto_pickfa:"))
@@ -239,182 +329,279 @@ async def cb_sauto_pick_existing_fa(call: CallbackQuery, state: FSMContext):
     if idx >= len(cands):
         return await call.answer("⚠️ فایل یافت نشد.")
     chosen_fa = Path(cands[idx])
-    plan = await AutomationService.analyze_and_build_plan(
-        Path(data["sauto_target_dir"]), data.get("sauto_ep_tag")
-    )
-    await _process_sauto_fa_subtitle_placement(call, state, plan, chosen_fa)
+    target_dir = Path(data["sauto_target_dir"])
+    ep_tags = data.get("sauto_ep_tags", [])
+    plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
+    key = plans[0].season_ep_tag if (plans[0].is_series and plans[0].season_ep_tag) else "MOVIE"
+    await _place_and_ask_fa_sub_names(call, state, plans, {key: chosen_fa})
 
 
 @router.message(SubtitleStates.sauto_waiting_fa_sub, F.document)
 async def handle_sauto_fa_sub_upload(message: Message, state: FSMContext):
     data = await state.get_data()
     target_dir = Path(data["sauto_target_dir"])
-    ep_tag = data.get("sauto_ep_tag")
-    plan = await AutomationService.analyze_and_build_plan(target_dir, ep_tag)
+    ep_tags = data.get("sauto_ep_tags", [])
+    plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
 
-    fa_dir = plan.fa_sub_dest_dir
+    fa_dir = plans[0].fa_sub_dest_dir
     fa_dir.mkdir(parents=True, exist_ok=True)
 
     orig_name = message.document.file_name or "subtitle.FA.srt"
     temp_dest = fa_dir / orig_name
     await message.bot.download(message.document, destination=temp_dest)
 
+    new_subs: list[Path] = []
     if temp_dest.suffix.lower() == ".zip":
         extracted = SubtitleService.extract_zip_archive(temp_dest, fa_dir, remove_zip=True)
-        sub_files = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
-        if not sub_files:
+        new_subs = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
+        if not new_subs:
             return await message.answer("❌ هیچ فایل زیرنویسی داخل ZIP یافت نشد! لطفاً فایل دیگری بفرستید:")
-        # اگر در فایل زیپ چند قسمت بود، قسمتی که با SxxEyy مطابقت دارد را بردار
-        matched_ep_subs = [
-            p for p in sub_files
-            if ep_tag and AutomationService.extract_episode_tag(p.name) == ep_tag
-        ]
-        chosen_sub = matched_ep_subs[0] if matched_ep_subs else sub_files[0]
     else:
-        chosen_sub = temp_dest
-        if chosen_sub.suffix.lower() == ".srt":
-            SubtitleService.normalize_srt_utf8(chosen_sub)
+        if temp_dest.suffix.lower() == ".srt":
+            SubtitleService.normalize_srt_utf8(temp_dest)
+        new_subs = [temp_dest]
 
-    await _process_sauto_fa_subtitle_placement(message, state, plan, chosen_sub)
+    # ترکیب زیرنویس‌های جدید با زیرنویس‌های قبلی پوشه و تطبیق مجدد با تمام قسمت‌ها
+    local_subs = AutomationService.collect_all_local_fa_subtitles_in_dir(plans[0].base_dir, fa_dir)
+    all_cands = new_subs + [p for p in local_subs if p not in new_subs]
+
+    matched_map = AutomationService.match_subtitles_to_episodes(plans, all_cands)
+    partial_prev = {k: Path(v) for k, v in data.get("sauto_partial_fa_map", {}).items() if Path(v).exists()}
+    partial_prev.update(matched_map)
+
+    required_keys = ep_tags if ep_tags else ["MOVIE"]
+    if all(k in partial_prev for k in required_keys):
+        return await _place_and_ask_fa_sub_names(message, state, plans, partial_prev)
+
+    # اگر هنوز برخی قسمت‌ها زیرنویس ندارند، منتظر فایل‌های بعدی بمان یا اجازه ادامه بده
+    await state.update_data(sauto_partial_fa_map={k: str(v) for k, v in partial_prev.items()})
+    missing_keys = [k for k in required_keys if k not in partial_prev]
+
+    kb = InlineKeyboardBuilder()
+    if partial_prev:
+        kb.row(
+            InlineKeyboardButton(
+                text=f"▶️ ادامه با همین {len(partial_prev)} قسمت تطبیق‌یافته",
+                callback_data="sauto_fa:use_partial"
+            )
+        )
+    kb.row(InlineKeyboardButton(text="🔙 انصراف", callback_data="menu:home"))
+
+    await message.answer(
+        f"✅ تعداد `{len(partial_prev)}` از `{len(required_keys)}` قسمت زیرنویس فارسی دریافت کردند.\n"
+        f"⏳ قسمت‌های باقی‌مانده: `{', '.join(missing_keys)}`\n\n"
+        "می‌توانید زیرنویس قسمت‌های باقی‌مانده را هم بفرستید و یا دکمه ادامه را بزنید:",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
 
 
-async def _process_sauto_fa_subtitle_placement(
+async def _place_and_ask_fa_sub_names(
     call_or_msg: CallbackQuery | Message,
     state: FSMContext,
-    plan: AutomationPlan,
-    fa_sub_path: Path
+    plans: list[AutomationPlan],
+    fa_sub_map: dict[str, Path]
 ):
     """
-    قرار دادن زیرنویس فارسی در پوشه درست (srt/FA برای سریال یا srt برای فیلم)
-    و پرسیدن سوال درباره نام فایل زیرنویس فارسی
+    قرار دادن زیرنویس‌های فارسی در پوشه استاندارد و پیشنهاد نام دقیق طبق الگوی:
+    {name}.S{xx}E{yy}.WEB-DL(یا BluRay).FA.srt
     """
-    fa_dir = plan.fa_sub_dest_dir
+    first_plan = plans[0]
+    fa_dir = first_plan.fa_sub_dest_dir
     fa_dir.mkdir(parents=True, exist_ok=True)
 
-    if fa_sub_path.parent.resolve() != fa_dir.resolve():
-        dest_p = fa_dir / fa_sub_path.name
-        shutil.copy2(fa_sub_path, dest_p)
-        fa_sub_path = dest_p
+    placed_map: dict[str, str] = {}
+    suggested_map: dict[str, str] = {}
 
-    ext = fa_sub_path.suffix
-    if plan.is_series and plan.season_ep_tag:
-        clean_series = re.sub(r'[<>:"/\\|?*]', "", plan.series_title).strip().replace(" ", ".")
-        suggested_fa_name = f"{clean_series}.{plan.season_ep_tag}.FA{ext}"
-    else:
-        clean_movie = AutomationService.clean_stem_for_ebtv(plan.base_dir.name)
-        suggested_fa_name = f"{clean_movie}.FA{ext}"
+    for p in plans:
+        key = p.season_ep_tag if (p.is_series and p.season_ep_tag) else "MOVIE"
+        sub_p = fa_sub_map.get(key)
+        if not sub_p or not sub_p.exists():
+            continue
+
+        if sub_p.suffix.lower() == ".srt":
+            SubtitleService.normalize_srt_utf8(sub_p)
+
+        if sub_p.parent.resolve() != fa_dir.resolve():
+            dest_p = fa_dir / sub_p.name
+            if dest_p.exists():
+                dest_p.unlink(missing_ok=True)
+            shutil.move(str(sub_p), str(dest_p))
+            sub_p = dest_p
+
+        sug_name = AutomationService.build_standard_subtitle_filename(
+            series_or_movie_title=p.series_title,
+            season_ep_tag=p.season_ep_tag,
+            source_type=p.source_type,
+            lang="FA",
+            ext=sub_p.suffix
+        )
+
+        placed_map[key] = str(sub_p.resolve())
+        suggested_map[key] = sug_name
 
     await state.update_data(
-        sauto_fa_sub_current_path=str(fa_sub_path.resolve()),
-        sauto_suggested_fa_name=suggested_fa_name
+        sauto_fa_sub_map=placed_map,
+        sauto_suggested_fa_map=suggested_map
     )
     await state.set_state(SubtitleStates.sauto_waiting_fa_sub_name)
 
-    text = (
-        f"✅ زیرنویس فارسی در مسیر استاندارد قرار گرفت:\n"
-        f"📂 `{fa_dir}`\n\n"
-        f"📄 **نام فعلی زیرنویس (برای کپی لمس کنید):**\n`{fa_sub_path.name}`\n"
-        f"✨ **نام استاندارد پیشنهادی:**\n`{suggested_fa_name}`\n\n"
-        "✏️ **نام فایل زیرنویس فارسی چه باشد؟**\n"
-        "می‌توانید روی یکی از ۲ دکمه زیر کلیک کنید و یا **نام دلخواه خودتان** را تایپ و ارسال نمایید:"
-    )
-    kb = smart_auto_sub_name_kb(suggested_fa_name, fa_sub_path.name)
+    if len(placed_map) == 1:
+        only_key = next(iter(placed_map))
+        curr_p = Path(placed_map[only_key])
+        sug_n = suggested_map[only_key]
+        text = (
+            f"✅ زیرنویس فارسی در مسیر استاندارد قرار گرفت:\n"
+            f"📂 `{fa_dir}`\n\n"
+            f"📄 **نام فعلی زیرنویس:**\n`{curr_p.name}`\n"
+            f"✨ **نام استاندارد پیشنهادی:**\n`{sug_n}`\n\n"
+            "✏️ **نام فایل زیرنویس فارسی چه باشد؟** (روی دکمه‌ها کلیک کنید یا نام دلخواه را بفرستید):"
+        )
+        kb = smart_auto_sub_name_kb(sug_n, curr_p.name)
+    else:
+        preview_lines = [
+            f"• `{k}`: `{Path(placed_map[k]).name}` ⬅️ `{suggested_map[k]}`"
+            for k in sorted(placed_map.keys())[:12]
+        ]
+        first_sug = next(iter(suggested_map.values()))
+        text = (
+            f"✅ تعداد **`{len(placed_map)}` فایل زیرنویس فارسی** در پوشه `{fa_dir}` قرار گرفتند!\n\n"
+            f"📋 **پیش‌نمایش نام‌های استاندارد پیشنهادی (`{{name}}.S{{xx}}E{{yy}}.{first_plan.source_type}.FA.srt`):**\n"
+            + "\n".join(preview_lines)
+            + "\n\n✏️ **نام زیرنویس‌ها چگونه تنظیم شود؟**"
+        )
+        kb = smart_auto_sub_name_kb(f"استاندارد برای همه ({first_sug})", "حفظ نام فعلی همه فایل‌ها")
 
     if isinstance(call_or_msg, CallbackQuery):
-        await call_or_msg.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+        await call_or_msg.message.edit_text(text[:4000], reply_markup=kb, parse_mode="Markdown")
     else:
-        await call_or_msg.answer(text, reply_markup=kb, parse_mode="Markdown")
+        await call_or_msg.answer(text[:4000], reply_markup=kb, parse_mode="Markdown")
 
 
 @router.callback_query(SubtitleStates.sauto_waiting_fa_sub_name, F.data.startswith("sauto_subname:"))
 async def cb_sauto_fa_sub_name_choice(call: CallbackQuery, state: FSMContext):
     choice = call.data.split(":")[1]
     data = await state.get_data()
-    curr_fa = Path(data["sauto_fa_sub_current_path"])
+    placed_map: dict[str, str] = data.get("sauto_fa_sub_map", {})
+    suggested_map: dict[str, str] = data.get("sauto_suggested_fa_map", {})
+    final_fa_map: dict[str, str] = {}
 
-    if choice == "standard":
-        new_name = data["sauto_suggested_fa_name"]
-        new_path = curr_fa.with_name(new_name)
+    for key, path_str in placed_map.items():
+        curr_fa = Path(path_str)
+        if choice == "standard" and key in suggested_map:
+            new_path = curr_fa.with_name(suggested_map[key])
+            if curr_fa.resolve() != new_path.resolve():
+                if new_path.exists():
+                    new_path.unlink(missing_ok=True)
+                curr_fa.rename(new_path)
+                curr_fa = new_path
+        final_fa_map[key] = str(curr_fa.resolve())
+
+    await state.update_data(sauto_final_fa_map=final_fa_map)
+    await _check_english_sub_batch_step(call, state)
+
+
+@router.message(SubtitleStates.sauto_waiting_fa_sub_name)
+async def handle_sauto_custom_fa_sub_name(message: Message, state: FSMContext):
+    raw_pattern = re.sub(r'[<>:"/\\|?]', "", (message.text or "").strip()).strip()
+    if not raw_pattern:
+        return await message.answer("⚠️ نام وارد شده معتبر نیست. دوباره بفرستید:")
+
+    data = await state.get_data()
+    placed_map: dict[str, str] = data.get("sauto_fa_sub_map", {})
+    suggested_map: dict[str, str] = data.get("sauto_suggested_fa_map", {})
+    final_fa_map: dict[str, str] = {}
+    sorted_keys = sorted(placed_map.keys())
+    total = len(sorted_keys)
+
+    for idx, key in enumerate(sorted_keys, start=1):
+        curr_fa = Path(placed_map[key])
+        ext = curr_fa.suffix
+
+        if raw_pattern == "1":
+            target_name = suggested_map.get(key, curr_fa.name)
+        elif raw_pattern == "2":
+            target_name = curr_fa.name
+        else:
+            pat = raw_pattern
+            if pat.lower().endswith(ext.lower()):
+                pat = pat[:-len(ext)]
+            # اگر شماره قسمت واقعی در key وجود دارد (مثلا S02E05 -> 05) از شماره قسمت واقعی برای * استفاده کن
+            ep_num_str = key.split("E")[1] if ("E" in key and key != "MOVIE") else f"{idx:02d}"
+            if "*" in pat:
+                stem = pat.replace("*", ep_num_str)
+            elif total > 1:
+                stem = f"{pat}{ep_num_str}"
+            else:
+                stem = pat
+            if not stem.lower().endswith(".fa"):
+                stem += ".FA"
+            target_name = f"{stem}{ext}"
+
+        new_path = curr_fa.with_name(target_name)
         if curr_fa.resolve() != new_path.resolve():
             if new_path.exists():
                 new_path.unlink(missing_ok=True)
             curr_fa.rename(new_path)
             curr_fa = new_path
+        final_fa_map[key] = str(curr_fa.resolve())
 
-    await state.update_data(sauto_final_fa_sub=str(curr_fa.resolve()))
-    await _check_english_sub_step(call, state)
-
-
-@router.message(SubtitleStates.sauto_waiting_fa_sub_name)
-async def handle_sauto_custom_fa_sub_name(message: Message, state: FSMContext):
-    raw_name = re.sub(r'[<>:"/\\|?*]', "", (message.text or "").strip()).strip()
-    if not raw_name:
-        return await message.answer("⚠️ نام وارد شده معتبر نیست. دوباره بفرستید:")
-
-    data = await state.get_data()
-    curr_fa = Path(data["sauto_fa_sub_current_path"])
-    if raw_name == "1":
-        raw_name = data["sauto_suggested_fa_name"]
-    elif raw_name == "2":
-        raw_name = curr_fa.name
-
-    if not raw_name.lower().endswith(curr_fa.suffix.lower()):
-        # اگر پسوند .FA.srt نداشت اضافه کن
-        if not raw_name.lower().endswith(".fa"):
-            raw_name += ".FA"
-        raw_name += curr_fa.suffix
-
-    new_path = curr_fa.with_name(raw_name)
-    if curr_fa.resolve() != new_path.resolve():
-        if new_path.exists():
-            new_path.unlink(missing_ok=True)
-        curr_fa.rename(new_path)
-        curr_fa = new_path
-
-    await state.update_data(sauto_final_fa_sub=str(curr_fa.resolve()))
-    await _check_english_sub_step(message, state)
+    await state.update_data(sauto_final_fa_map=final_fa_map)
+    await _check_english_sub_batch_step(message, state)
 
 
-async def _check_english_sub_step(call_or_msg: CallbackQuery | Message, state: FSMContext):
+async def _check_english_sub_batch_step(call_or_msg: CallbackQuery | Message, state: FSMContext):
     """
-    بررسی وجود زیرنویس انگلیسی در پوشه srt/EN (برای سریال) یا srt (برای فیلم):
-    اگر وجود نداشت، از کاربر می‌پرسد که آیا به طور خودکار از فایل ویدئو استخراج و در آنجا قرار داده شود؟
+    بررسی وجود زیرنویس انگلیسی برای تمام قسمت‌های انتخاب‌شده در پوشه srt/EN (یا srt فیلم):
+    اگر برای قسمتی وجود نداشت اما داخل فایل ویدئو بود، از کاربر برای استخراج خودکار گروهی سوال می‌پرسد.
     """
     data = await state.get_data()
     target_dir = Path(data["sauto_target_dir"])
-    ep_tag = data.get("sauto_ep_tag")
-    plan = await AutomationService.analyze_and_build_plan(target_dir, ep_tag)
+    ep_tags = data.get("sauto_ep_tags", [])
+    plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
 
-    if plan.existing_en_sub and plan.existing_en_sub.exists():
-        await state.update_data(sauto_final_en_sub=str(plan.existing_en_sub))
+    en_map: dict[str, str] = {}
+    missing_extractable: list[str] = []
+    missing_no_source: list[str] = []
+
+    for p in plans:
+        key = p.season_ep_tag if (p.is_series and p.season_ep_tag) else "MOVIE"
+        if p.existing_en_sub and p.existing_en_sub.exists():
+            en_map[key] = str(p.existing_en_sub.resolve())
+        elif p.embedded_en_source_video and p.embedded_en_track_id is not None:
+            missing_extractable.append(key)
+        else:
+            missing_no_source.append(key)
+
+    await state.update_data(sauto_final_en_map=en_map)
+
+    # اگر همه قسمت‌ها از قبل در پوشه srt/EN زیرنویس انگلیسی دارند، مستقیم برو به مرحله انتخاب کیفیت هاردساب!
+    if not missing_extractable and not missing_no_source:
         return await _prompt_hardsub_qualities_step(
-            call_or_msg, state, plan,
-            en_note=f"✅ زیرنویس انگلیسی در پوشه یافت شد: `{plan.existing_en_sub.name}`"
+            call_or_msg, state, plans,
+            en_note=f"✅ زیرنویس انگلیسی برای هر `{len(en_map)}` مورد در پوشه موجود است."
         )
 
-    # زیرنویس انگلیسی در پوشه srt/EN (یا srt) وجود ندارد -> از کاربر سوال بپرس
     await state.set_state(SubtitleStates.sauto_waiting_en_decision)
-    has_embedded = bool(plan.embedded_en_source_video and plan.embedded_en_track_id is not None)
-    await state.update_data(
-        sauto_emb_vid=str(plan.embedded_en_source_video) if has_embedded else None,
-        sauto_emb_tid=plan.embedded_en_track_id,
-        sauto_emb_codec=plan.embedded_en_codec,
-    )
+    has_embedded = len(missing_extractable) > 0
+
+    lines = ["🇬🇧 **بررسی وضعیت زیرنویس انگلیسی:**\n"]
+    if en_map:
+        lines.append(f"✅ موجود در پوشه (`{len(en_map)}` مورد): `{', '.join(en_map.keys())}`")
+    if missing_extractable:
+        lines.append(
+            f"🔍 **قابل استخراج خودکار از داخل فیلم (`{len(missing_extractable)}` مورد):** `{', '.join(missing_extractable)}`"
+        )
+    if missing_no_source:
+        lines.append(f"⚠️ بدون زیرنویس انگلیسی (`{len(missing_no_source)}` مورد): `{', '.join(missing_no_source)}`")
 
     if has_embedded:
-        text = (
-            f"🇬🇧 **وضعیت زیرنویس انگلیسی ({plan.season_ep_tag or 'فیلم'}):**\n\n"
-            f"در پوشه `{plan.en_sub_dest_dir.name}` فایل زیرنویس انگلیسی یافت نشد، اما **داخل فایل ویدئوی `{plan.embedded_en_source_video.name}` زیرنویس انگلیسی وجود دارد!**\n\n"
-            "آیا می‌خواهید ربات به طور خودکار زیرنویس انگلیسی را استخراج کرده و در پوشه قرار دهد؟"
-        )
+        lines.append("\nآیا می‌خواهید ربات زیرنویس انگلیسی قسمت‌های کسری را **به طور خودکار از فایل فیلم استخراج کرده و در پوشه `srt` قرار دهد**؟")
     else:
-        text = (
-            f"🇬🇧 **وضعیت زیرنویس انگلیسی ({plan.season_ep_tag or 'فیلم'}):**\n\n"
-            f"زیرنویس انگلیسی در پوشه `{plan.en_sub_dest_dir.name}` یافت نشد.\n"
-            "می‌توانید فایل زیرنویس انگلیسی را آپلود کنید یا بدون زیرنویس انگلیسی ادامه دهید:"
-        )
+        lines.append("\nمی‌توانید فایل زیرنویس انگلیسی (`.srt` / `.zip`) آپلود کنید یا ادامه دهید:")
 
     kb = smart_auto_missing_en_kb(has_embedded)
+    text = "\n".join(lines)
     if isinstance(call_or_msg, CallbackQuery):
         await call_or_msg.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
     else:
@@ -425,35 +612,45 @@ async def _check_english_sub_step(call_or_msg: CallbackQuery | Message, state: F
 async def cb_sauto_auto_extract_en(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     target_dir = Path(data["sauto_target_dir"])
-    ep_tag = data.get("sauto_ep_tag")
-    plan = await AutomationService.analyze_and_build_plan(target_dir, ep_tag)
+    ep_tags = data.get("sauto_ep_tags", [])
+    fa_map: dict[str, str] = data.get("sauto_final_fa_map", {})
+    en_map: dict[str, str] = data.get("sauto_final_en_map", {})
 
-    emb_vid = Path(data["sauto_emb_vid"])
-    emb_tid = int(data["sauto_emb_tid"])
-    fa_sub = Path(data["sauto_final_fa_sub"])
+    plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
 
-    # نام‌گذاری استاندارد زیرنویس انگلیسی هماهنگ با نام زیرنویس فارسی
-    en_filename = re.sub(r"\.FA(\.[^.]+)$", r".EN\1", fa_sub.name, flags=re.IGNORECASE)
-    if en_filename == fa_sub.name:
-        en_filename = f"{fa_sub.stem}.EN.srt"
+    await call.message.edit_text("⏳ در حال استخراج خودکار زیرنویس انگلیسی و قرار دادن در پوشه `srt`...", parse_mode="Markdown")
 
-    out_en_path = plan.en_sub_dest_dir / en_filename
-    await call.message.edit_text(
-        f"⏳ در حال استخراج خودکار زیرنویس انگلیسی از `{emb_vid.name}` و ذخیره در `{out_en_path}`...",
-        parse_mode="Markdown"
+    extracted_count = 0
+    for p in plans:
+        key = p.season_ep_tag if (p.is_series and p.season_ep_tag) else "MOVIE"
+        if key in en_map:
+            continue
+        if p.embedded_en_source_video and p.embedded_en_track_id is not None:
+            fa_sub_p = Path(fa_map[key]) if key in fa_map else None
+            if fa_sub_p:
+                en_filename = re.sub(r"\.FA(\.[^.]+)$", r".EN\1", fa_sub_p.name, flags=re.IGNORECASE)
+                if en_filename == fa_sub_p.name:
+                    en_filename = f"{fa_sub_p.stem}.EN.srt"
+            else:
+                en_filename = f"{p.series_title}.{key}.EN.srt"
+
+            out_en_path = p.en_sub_dest_dir / en_filename
+            try:
+                await MKVService.extract_subtitle_track(
+                    p.embedded_en_source_video, p.embedded_en_track_id, out_en_path
+                )
+                if out_en_path.suffix.lower() == ".srt":
+                    SubtitleService.normalize_srt_utf8(out_en_path)
+                en_map[key] = str(out_en_path.resolve())
+                extracted_count += 1
+            except Exception as e:
+                logging.warning(f"Auto EN extract failed for {key}: {e}")
+
+    await state.update_data(sauto_final_en_map=en_map)
+    await _prompt_hardsub_qualities_step(
+        call, state, plans,
+        en_note=f"✅ تعداد `{extracted_count}` زیرنویس انگلیسی به طور خودکار استخراج و در پوشه قرار گرفت."
     )
-    try:
-        await MKVService.extract_subtitle_track(emb_vid, emb_tid, out_en_path)
-        if out_en_path.suffix.lower() == ".srt":
-            SubtitleService.normalize_srt_utf8(out_en_path)
-        await state.update_data(sauto_final_en_sub=str(out_en_path.resolve()))
-        en_note = f"✅ زیرنویس انگلیسی به طور خودکار در `{out_en_path.name}` قرار گرفت."
-    except Exception as e:
-        logging.warning(f"Auto EN extract failed: {e}")
-        await state.update_data(sauto_final_en_sub=None)
-        en_note = f"⚠️ خطا در استخراج خودکار انگلیسی ({e})؛ ادامه با زیرنویس داخلی."
-
-    await _prompt_hardsub_qualities_step(call, state, plan, en_note=en_note)
 
 
 @router.callback_query(SubtitleStates.sauto_waiting_en_decision, F.data == "sauto_en:upload")
@@ -470,41 +667,48 @@ async def cb_sauto_upload_en_ask(call: CallbackQuery, state: FSMContext):
 async def handle_sauto_en_upload(message: Message, state: FSMContext):
     data = await state.get_data()
     target_dir = Path(data["sauto_target_dir"])
-    ep_tag = data.get("sauto_ep_tag")
-    plan = await AutomationService.analyze_and_build_plan(target_dir, ep_tag)
+    ep_tags = data.get("sauto_ep_tags", [])
+    fa_map: dict[str, str] = data.get("sauto_final_fa_map", {})
+    en_map: dict[str, str] = data.get("sauto_final_en_map", {})
 
-    en_dir = plan.en_sub_dest_dir
+    plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
+    en_dir = plans[0].en_sub_dest_dir
     en_dir.mkdir(parents=True, exist_ok=True)
-    fa_sub = Path(data["sauto_final_fa_sub"])
 
-    en_filename = re.sub(r"\.FA(\.[^.]+)$", r".EN\1", fa_sub.name, flags=re.IGNORECASE)
-    if en_filename == fa_sub.name:
-        en_filename = f"{fa_sub.stem}.EN.srt"
-
-    temp_dest = en_dir / (message.document.file_name or en_filename)
+    temp_dest = en_dir / (message.document.file_name or "subtitle.EN.srt")
     await message.bot.download(message.document, destination=temp_dest)
 
     if temp_dest.suffix.lower() == ".zip":
         extracted = SubtitleService.extract_zip_archive(temp_dest, en_dir, remove_zip=True)
-        sub_files = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
-        chosen_en = sub_files[0] if sub_files else temp_dest
+        en_cands = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
     else:
-        chosen_en = temp_dest
+        en_cands = [temp_dest]
 
-    final_en = en_dir / en_filename
-    if chosen_en.exists() and chosen_en.resolve() != final_en.resolve():
-        if final_en.exists():
-            final_en.unlink(missing_ok=True)
-        chosen_en.rename(final_en)
-        chosen_en = final_en
+    matched_en = AutomationService.match_subtitles_to_episodes(plans, en_cands)
+    for key, chosen_en in matched_en.items():
+        fa_sub_p = Path(fa_map[key]) if key in fa_map else None
+        if fa_sub_p:
+            en_filename = re.sub(r"\.FA(\.[^.]+)$", r".EN\1", fa_sub_p.name, flags=re.IGNORECASE)
+            if en_filename == fa_sub_p.name:
+                en_filename = f"{fa_sub_p.stem}.EN{chosen_en.suffix}"
+        else:
+            en_filename = chosen_en.name
 
-    if chosen_en.suffix.lower() == ".srt":
-        SubtitleService.normalize_srt_utf8(chosen_en)
+        final_en = en_dir / en_filename
+        if chosen_en.exists() and chosen_en.resolve() != final_en.resolve():
+            if final_en.exists():
+                final_en.unlink(missing_ok=True)
+            chosen_en.rename(final_en)
+            chosen_en = final_en
 
-    await state.update_data(sauto_final_en_sub=str(chosen_en.resolve()))
+        if chosen_en.suffix.lower() == ".srt":
+            SubtitleService.normalize_srt_utf8(chosen_en)
+        en_map[key] = str(chosen_en.resolve())
+
+    await state.update_data(sauto_final_en_map=en_map)
     await _prompt_hardsub_qualities_step(
-        message, state, plan,
-        en_note=f"✅ زیرنویس انگلیسی در `{chosen_en.name}` ذخیره شد."
+        message, state, plans,
+        en_note=f"✅ تعداد `{len(en_map)}` زیرنویس انگلیسی در پوشه ذخیره شد."
     )
 
 
@@ -512,171 +716,190 @@ async def handle_sauto_en_upload(message: Message, state: FSMContext):
 async def cb_sauto_skip_en(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     target_dir = Path(data["sauto_target_dir"])
-    ep_tag = data.get("sauto_ep_tag")
-    plan = await AutomationService.analyze_and_build_plan(target_dir, ep_tag)
-    await state.update_data(sauto_final_en_sub=None)
-    await _prompt_hardsub_qualities_step(call, state, plan, en_note="⏭ بدون فایل زیرنویس انگلیسی جداگانه.")
+    ep_tags = data.get("sauto_ep_tags", [])
+    plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
+    await _prompt_hardsub_qualities_step(call, state, plans, en_note="⏭ ادامه بدون زیرنویس انگلیسی جدید.")
 
 
 async def _prompt_hardsub_qualities_step(
     call_or_msg: CallbackQuery | Message,
     state: FSMContext,
-    plan: AutomationPlan,
+    plans: list[AutomationPlan],
     en_note: str = ""
 ):
-    """
-    نمایش سوال چندگزینه‌ای (Multi-Choice) برای انتخاب کدام یک از ۳ کیفیت اصلی (1080p, 720p, 480p)
-    از روی فایل موجود در پوشه FullHD هاردساب شوند.
-    """
-    default_selected = ["1080p", "720p"]
-    await state.set_state(SubtitleStates.sauto_waiting_hb_qualities)
-    await state.update_data(sauto_hb_qualities=default_selected)
+    default_srt_hb = ["1080p", "720p"]
+    default_ass_enc = []
+    default_auto_upload = True
 
-    soft_summary = "\n".join([
-        f"   • `{t.quality_folder_name}` ⬅️ `{t.output_dir.name}/{t.output_file.name}`"
-        for t in plan.softsub_targets[:10]
-    ])
-    fullhd_name = plan.fullhd_source_video.name if plan.fullhd_source_video else "یافت نشد"
+    await state.set_state(SubtitleStates.sauto_waiting_hb_qualities)
+    await state.update_data(
+        sauto_hb_srt_qualities=default_srt_hb,
+        sauto_encode_ass_qualities=default_ass_enc,
+        sauto_auto_upload=default_auto_upload
+    )
+
+    total_soft = sum(len(p.softsub_targets) for p in plans)
+    fhd_list = [f"• `{p.season_ep_tag or 'فیلم'}`: `{p.fullhd_source_video.name}`" for p in plans if p.fullhd_source_video]
+    fhd_block = "\n".join(fhd_list[:8]) if fhd_list else "_(فایل FullHD یافت نشد)_"
+    movie_ass_path = AutomationService.get_movie_ass_logo_path()
+    ass_status = f"✅ موجود (`{movie_ass_path}`)" if movie_ass_path.exists() else f"⚠️ یافت نشد (`{movie_ass_path}`)"
 
     text = (
         f"{en_note}\n\n"
-        f"🎯 **مرحله نهایی: انتخاب کیفیت‌های هاردساب (سوال چندگزینه‌ای)**\n\n"
-        f"📎 **سافت‌ساب‌ها (`{len(plan.softsub_targets)}` کیفیت خام که خودکار در پوشه متناظر قرار می‌گیرند):**\n"
-        f"{soft_summary}\n\n"
-        f"🔥 **سورس هاردساب (از پوشه `FullHD`):**\n`{fullhd_name}`\n\n"
-        "👇 **کدام یک از ۳ کیفیت اصلی زیر می‌خواهید هاردساب شوند؟** (روی گزینه‌ها کلیک کنید تا تیک بخورند و سپس دکمه شروع اتوماسیون را بزنید):"
+        f"🎯 **مرحله نهایی: انتخاب کیفیت‌های هاردساب / انکود و آپلود خودکار**\n\n"
+        f"🎞 تعداد قسمت‌های آماده: **`{len(plans)}` مورد** ▏ 📎 سافت‌ساب‌ها: **`{total_soft}` فایل**\n"
+        f"🎨 وضعیت فایل تگ انکود (`movie.ass`): {ass_status}\n"
+        f"🔥 **سورس `FullHD`:**\n{fhd_block}\n\n"
+        "1️⃣ **هاردساب فارسی SRT:** بدون زیرنویس انگلیسی، ذخیره در `1080p-HardSub` / `720p-HardSub` / `480p-HardSub`\n"
+        "2️⃣ **انکود با `movie.ass`:** همراه با سافت‌ساب انگلیسی، ذخیره در `1080p-EBTV` (با تگ `6CH`) / `720p-EBTV` / `480p-EBTV`"
     )
-    kb = smart_auto_hardsub_qualities_kb(set(default_selected))
+    kb = smart_auto_hardsub_qualities_kb(
+        set(default_srt_hb),
+        set(default_ass_enc),
+        auto_upload=default_auto_upload
+    )
 
     if isinstance(call_or_msg, CallbackQuery):
         await call_or_msg.message.edit_text(text[:4000], reply_markup=kb, parse_mode="Markdown")
     else:
         await call_or_msg.answer(text[:4000], reply_markup=kb, parse_mode="Markdown")
 
-
 @router.callback_query(SubtitleStates.sauto_waiting_hb_qualities, F.data.startswith("sauto_hbq:"))
 async def cb_sauto_hb_quality_action(call: CallbackQuery, state: FSMContext):
     action = call.data.split(":", 1)[1]
     data = await state.get_data()
-    selected = set(data.get("sauto_hb_qualities", ["1080p", "720p"]))
+    srt_set = set(data.get("sauto_hb_srt_qualities", ["1080p", "720p"]))
+    ass_set = set(data.get("sauto_encode_ass_qualities", []))
+    auto_up = bool(data.get("sauto_auto_upload", True))
 
-    if action.startswith("toggle:"):
+    if action.startswith("toggle_srt:"):
         q = action.split(":")[1]
-        if q in selected:
-            selected.remove(q)
-        else:
-            selected.add(q)
-        await state.update_data(sauto_hb_qualities=list(selected))
-        return await call.message.edit_reply_markup(reply_markup=smart_auto_hardsub_qualities_kb(selected))
-
-    elif action == "all":
-        selected = {"1080p", "720p", "480p"}
-        await state.update_data(sauto_hb_qualities=list(selected))
-        return await call.message.edit_reply_markup(reply_markup=smart_auto_hardsub_qualities_kb(selected))
-
-    elif action == "1080_720":
-        selected = {"1080p", "720p"}
-        await state.update_data(sauto_hb_qualities=list(selected))
-        return await call.message.edit_reply_markup(reply_markup=smart_auto_hardsub_qualities_kb(selected))
-
-    elif action == "none":
-        selected = set()
-        await state.update_data(sauto_hb_qualities=[])
-        return await _execute_smart_automation_plan(call, state, [])
-
+        srt_set.remove(q) if q in srt_set else srt_set.add(q)
+    elif action.startswith("toggle_ass:"):
+        q = action.split(":")[1]
+        ass_set.remove(q) if q in ass_set else ass_set.add(q)
+    elif action == "preset_both_hd":
+        srt_set = {"1080p", "720p"}
+        ass_set = {"1080p", "720p"}
+    elif action == "clear_all":
+        srt_set.clear()
+        ass_set.clear()
+    elif action == "toggle_upload":
+        auto_up = not auto_up
     elif action == "launch":
-        return await _execute_smart_automation_plan(call, state, list(selected))
+        return await _execute_smart_automation_batch(call, state, list(srt_set), list(ass_set), auto_up)
+
+    await state.update_data(
+        sauto_hb_srt_qualities=list(srt_set),
+        sauto_encode_ass_qualities=list(ass_set),
+        sauto_auto_upload=auto_up
+    )
+    await call.message.edit_reply_markup(
+        reply_markup=smart_auto_hardsub_qualities_kb(srt_set, ass_set, auto_upload=auto_up)
+    )
 
 
-async def _execute_smart_automation_plan(
+async def _execute_smart_automation_batch(
     call: CallbackQuery,
     state: FSMContext,
-    selected_hb_qualities: list[str]
+    selected_hb_srt: list[str],
+    selected_encode_ass: list[str],
+    auto_upload: bool
 ):
-    """اجرای یکجای تمام سافت‌ساب‌ها در پوشه‌های متناظر و هاردساب‌های انتخابی از پوشه FullHD"""
     data = await state.get_data()
     target_dir = Path(data["sauto_target_dir"])
-    ep_tag = data.get("sauto_ep_tag")
-    fa_sub = Path(data["sauto_final_fa_sub"]) if data.get("sauto_final_fa_sub") else None
-    en_sub = Path(data["sauto_final_en_sub"]) if data.get("sauto_final_en_sub") else None
+    ep_tags = data.get("sauto_ep_tags", [])
+    fa_map: dict[str, str] = data.get("sauto_final_fa_map", {})
+    en_map: dict[str, str] = data.get("sauto_final_en_map", {})
     brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
 
-    plan = await AutomationService.analyze_and_build_plan(target_dir, ep_tag)
-    hardsub_targets = AutomationService.build_hardsub_targets(plan, selected_hb_qualities)
+    plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
 
     scheduled_soft_lines = []
     scheduled_hard_lines = []
+    scheduled_enc_lines = []
 
-    # ۱. صف‌بندی خودکار تمام سافت‌ساب‌ها در پوشه‌های اختصاصی خودشان (.SoftSub.EBTV.mkv)
-    for st in plan.softsub_targets:
-        st.output_dir.mkdir(parents=True, exist_ok=True)
-        t_soft = await queue_engine.add_task(
-            "mkvtoolnix",
-            f"SoftSub [{st.quality_folder_name}]: {st.output_file.name}",
-            MKVService.merge_softsub,
-            st.raw_video,
-            st.output_file,
-            fa_sub,
-            en_sub,
-            True,
-            brand,
-            "none",
-            0
+    for plan in plans:
+        key = plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
+        fa_sub = Path(fa_map[key]) if key in fa_map else None
+        en_sub = Path(en_map[key]) if key in en_map else plan.existing_en_sub
+
+        # ۱. آپلود خودکار فایل‌های زیرنویس استاندارد شده در پوشه srt/FA و srt/EN سرور
+        if auto_upload:
+            if fa_sub and fa_sub.exists():
+                r_dir_fa = AutomationService.compute_server_remote_dir_for_local_path(fa_sub)
+                await queue_engine.add_task("upload", f"AutoUpload Sub [{r_dir_fa}]: {fa_sub.name}", CuteFTPService.upload_path, fa_sub, r_dir_fa)
+            if en_sub and en_sub.exists():
+                r_dir_en = AutomationService.compute_server_remote_dir_for_local_path(en_sub)
+                await queue_engine.add_task("upload", f"AutoUpload Sub [{r_dir_en}]: {en_sub.name}", CuteFTPService.upload_path, en_sub, r_dir_en)
+
+        # ۲. صف‌بندی سافت‌ساب‌ها برای تمام پوشه‌های کیفیت خام موجود
+        if fa_sub:
+            for st in plan.softsub_targets:
+                st.output_dir.mkdir(parents=True, exist_ok=True)
+                t_soft = await queue_engine.add_task(
+                    "mkvtoolnix",
+                    f"SoftSub [{st.quality_folder_name}]: {st.output_file.name}",
+                    AutomationService.run_softsub_and_optional_upload,
+                    st.raw_video,
+                    st.output_file,
+                    fa_sub,
+                    en_sub,
+                    brand,
+                    auto_upload
+                )
+                scheduled_soft_lines.append(f"📎 `{st.output_dir.name}/{st.output_file.name}` (`{t_soft.task_id}`)")
+
+        # ۳. صف‌بندی هاردساب‌های فارسی SRT و انکودهای movie.ass از روی فایل پوشه FullHD
+        hb_targets = AutomationService.build_hardsub_and_encode_targets(
+            plan, selected_hb_srt, selected_encode_ass
         )
-        scheduled_soft_lines.append(f"📎 `{st.output_dir.name}/{st.output_file.name}` (`{t_soft.task_id}`)")
-
-    # ۲. صف‌بندی خودکار هاردساب‌ها از روی فایل پوشه FullHD در پوشه‌های 1080p-HardSub / 720p-HardSub / 480p-HardSub
-    is_fa_ass = bool(fa_sub and fa_sub.suffix.lower() in (".ass", ".ssa"))
-    secondary_en_for_hb = en_sub if is_fa_ass else None
-
-    for ht in hardsub_targets:
-        ht.output_dir.mkdir(parents=True, exist_ok=True)
-        t_hard = await queue_engine.add_task(
-            "handbrake",
-            f"HardSub [{ht.quality_tag}]: {ht.output_file.name}",
-            HandBrakeService.encode_hardsub,
-            ht.source_video,
-            fa_sub,
-            ht.output_file,
-            ht.preset_file,
-            ht.preset_name,
-            secondary_en_for_hb,
-            "none",
-            0,
-            ht.quality_tag
-        )
-        scheduled_hard_lines.append(f"🔥 `{ht.output_dir.name}/{ht.output_file.name}` (`{t_hard.task_id}`)")
+        for ht in hb_targets:
+            ht.output_dir.mkdir(parents=True, exist_ok=True)
+            label_prefix = "Encode-ASS" if ht.mode == "encode_ass" else "HardSub-SRT"
+            t_hb = await queue_engine.add_task(
+                "handbrake",
+                f"{label_prefix} [{ht.quality_tag}]: {ht.output_file.name}",
+                AutomationService.run_hardsub_or_encode_and_optional_upload,
+                ht,
+                fa_sub,
+                en_sub,
+                brand,
+                auto_upload
+            )
+            if ht.mode == "encode_ass":
+                scheduled_enc_lines.append(f"🎬 `{ht.output_dir.name}/{ht.output_file.name}` (`{t_hb.task_id}`)")
+            else:
+                scheduled_hard_lines.append(f"🔥 `{ht.output_dir.name}/{ht.output_file.name}` (`{t_hb.task_id}`)")
 
     await state.clear()
     await state.update_data(current_dir=str(target_dir))
 
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="📊 مشاهده زنده پیشرفت صف‌ها", callback_data="menu:queues"))
-    kb.row(InlineKeyboardButton(text="☁️ آپلود کل این پوشه با CuteFTP", callback_data="fact:upload_current_dir"))
+    kb.row(InlineKeyboardButton(text="📊 مشاهده صف و تغییر اولویت‌ها", callback_data="menu:queues"))
     kb.row(InlineKeyboardButton(text="📂 باز کردن در فایل‌منیجر", callback_data="menu:file_mgr"))
     kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
 
-    soft_block = "\n".join(scheduled_soft_lines) if scheduled_soft_lines else "_(ندارد)_"
-    hard_block = "\n".join(scheduled_hard_lines) if scheduled_hard_lines else "_(بدون هاردساب)_"
+    title_str = plans[0].series_title if plans else target_dir.name
+    up_status = "🟢 فعال (پس از اتمام هر فایل به ترتیب آپلود می‌شود)" if auto_upload else "🔴 غیرفعال"
 
     report = (
-        f"🎉 **اتوماسیون کامل `{plan.series_title}` {f'({plan.season_ep_tag})' if plan.season_ep_tag else ''} آغاز شد!**\n\n"
-        f"🇮🇷 زیرنویس فارسی:\n`{fa_sub.name if fa_sub else 'ندارد'}`\n"
-        f"🇬🇧 زیرنویس انگلیسی:\n`{en_sub.name if en_sub else 'داخلی / ندارد'}`\n\n"
-        f"📦 **سافت‌ساب‌های ثبت‌شده (`{len(scheduled_soft_lines)}` فایل):**\n{soft_block}\n\n"
-        f"🔥 **هاردساب‌های ثبت‌شده از FullHD (`{len(scheduled_hard_lines)}` فایل):**\n{hard_block}"
+        f"🎉 **اتوماسیون کامل `{title_str}` آغاز شد!**\n"
+        f"☁️ آپلود خودکار به هاست: {up_status}\n\n"
+        f"📎 **سافت‌ساب‌ها (`{len(scheduled_soft_lines)}` فایل):**\n"
+        + ("\n".join(scheduled_soft_lines[:8]) or "_(ندارد)_")
+        + f"\n\n🔥 **هاردساب‌های فارسی SRT (`{len(scheduled_hard_lines)}` فایل):**\n"
+        + ("\n".join(scheduled_hard_lines[:6]) or "_(ندارد)_")
+        + f"\n\n🎬 **انکودهای `movie.ass` در پوشه EBTV (`{len(scheduled_enc_lines)}` فایل):**\n"
+        + ("\n".join(scheduled_enc_lines[:6]) or "_(ندارد)_")
     )
 
     await call.message.edit_text(report[:4000], reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
-# ==================== تشخیص بدون کلیک (Zero-Click Drop): ارسال مستقیم زیرنویس در چت ====================
+# ==================== تشخیص بدون کلیک (Zero-Click Drop): ارسال مستقیم زیرنویس یا ZIP چندقسمتی در چت ====================
 @router.message(StateFilter(None), F.document)
 async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSMContext):
-    """
-    وقتی ادمین بدون رفتن به هیچ منویی، مستقیماً یک فایل زیرنویس (.srt / .ass / .zip) را در ربات رها می‌کند:
-    ربات نام فیلم یا قسمت سریال (SxxEyy) را تشخیص داده و اتوماسیون هوشمند را بلافاصله پیشنهاد می‌دهد!
-    """
     if not is_admin(message.from_user.id):
         return
     fname = message.document.file_name or ""
@@ -689,31 +912,43 @@ async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSM
     saved_p = temp_dir / fname
     await message.bot.download(message.document, destination=saved_p)
 
+    sub_files: list[Path] = []
     if ext_low == ".zip":
         extracted = SubtitleService.extract_zip_archive(saved_p, temp_dir, remove_zip=True)
         sub_files = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
         if not sub_files:
             return await message.answer("❌ فایل ZIP اکسترکت شد اما زیرنویسی داخل آن نبود.")
-        saved_p = sub_files[0]
-    elif ext_low == ".srt":
-        SubtitleService.normalize_srt_utf8(saved_p)
+    else:
+        if ext_low == ".srt":
+            SubtitleService.normalize_srt_utf8(saved_p)
+        sub_files = [saved_p]
 
-    matched_dir, ep_tag = AutomationService.find_matching_workspace_folder_for_sub(saved_p.name)
+    matched_dir, matched_eps = AutomationService.find_matching_workspace_folder_for_sub(fname)
+    if not matched_dir and sub_files:
+        matched_dir, matched_eps = AutomationService.find_matching_workspace_folder_for_sub(sub_files[0].name)
+
     if matched_dir:
-        return await _init_smart_auto_plan(message, state, matched_dir, ep_tag, pre_uploaded_fa_sub=saved_p)
+        # اگر چند فایل زیرنویس داخل ZIP بوده، تمام قسمت‌های متناظرشان را پیدا کن
+        if len(sub_files) > 1:
+            zip_eps = sorted({
+                ep for sf in sub_files
+                if (ep := AutomationService.extract_episode_tag(sf.name))
+            })
+            if zip_eps:
+                matched_eps = zip_eps
+        return await _init_smart_auto_batch(message, state, matched_dir, matched_eps, pre_uploaded_subs=sub_files)
 
-    # اگر پوشه به صورت خودکار از نام زیرنویس پیدا نشد، مرورگر پوشه‌ها را باز کن تا با ۱ کلیک پوشه را انتخاب کند
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     await message.answer(
-        f"📥 زیرنویس `{saved_p.name}` دریافت شد!\n"
-        "لطفاً پوشه فیلم یا فصل سریال مربوط به این زیرنویس را از لیست زیر انتخاب کنید تا اتوماسیون کامل انجام شود:",
+        f"📥 تعداد `{len(sub_files)}` فایل زیرنویس دریافت شد!\n"
+        "لطفاً پوشه فیلم یا فصل سریال مربوطه را از لیست زیر انتخاب کنید تا اتوماسیون کامل انجام شود:",
         parse_mode="Markdown"
     )
     await _render_smart_auto_browser(message, state, workspace)
 
 
 # ==============================================================================
-# بخش دوم: حالت دستی سافت‌ساب / هاردساب (برای فایل‌های تکی یا خاص)
+# بخش دوم: حالت دستی سافت‌ساب / هاردساب
 # ==============================================================================
 
 def _build_numbered_stem(pattern: str, orig_vid: Path, index_1based: int, total_count: int) -> str:
@@ -1289,13 +1524,13 @@ async def handle_custom_output_name(message: Message, state: FSMContext):
 
 @router.callback_query(SubtitleStates.waiting_operation_mode, F.data.startswith("submode:"))
 async def cb_select_operation_mode(call: CallbackQuery, state: FSMContext):
-    mode = call.data.split(":")[1]
+    mode = call.data.split(":")[1]  # 'softsub' | 'hardsub' | 'encode_ass' | 'both'
     await state.update_data(operation_mode=mode)
 
-    if mode in ("hardsub", "both"):
+    if mode in ("hardsub", "encode_ass", "both"):
         await state.set_state(SubtitleStates.waiting_preset_choice)
         return await call.message.edit_text(
-            "🔥 لطفاً **پریست HandBrake** را از لیست زیر برای هاردساب انتخاب کنید:",
+            "🔥 لطفاً **پریست HandBrake** را از لیست زیر انتخاب کنید:",
             reply_markup=presets_kb(),
             parse_mode="Markdown"
         )
@@ -1459,8 +1694,48 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
             soft_dir = dirs["softsub"]
             hard_dir = dirs["hardsub"]
 
+        if mode == "encode_ass" and chosen_preset:
+            logo_ass = AutomationService.get_movie_ass_logo_path()
+            ep_tag = AutomationService.extract_episode_tag(vid.name) or ""
+            src_type = AutomationService.detect_source_type(vid.name)
+            q_tag = "1080p" if "1080" in chosen_preset["name"] else (
+                "720p" if "720" in chosen_preset["name"] else ("480p" if "480" in chosen_preset["name"] else "720p"))
+
+            if custom_output_dir:
+                enc_dir = Path(custom_output_dir)
+            else:
+                enc_dir = (vid.parent.parent / f"{q_tag}-EBTV") if ep_tag else vid.parent
+            enc_dir.mkdir(parents=True, exist_ok=True)
+
+            if custom_name == "1":
+                enc_filename = AutomationService.build_encode_ass_filename(
+                    vid.parent.parent.name if ep_tag else base_stem, ep_tag, q_tag, src_type
+                )
+            else:
+                ch_tag = ".6CH" if q_tag == "1080p" else ""
+                enc_filename = f"{base_stem}{ch_tag}.EBTV.mp4"
+
+            enc_out = enc_dir / enc_filename
+            t_enc = await queue_engine.add_task(
+                "handbrake",
+                f"Encode-ASS ({chosen_preset['name']}): {enc_out.name}",
+                HandBrakeService.encode_hardsub,
+                vid,
+                logo_ass,
+                enc_out,
+                chosen_preset["file"],
+                chosen_preset["name"],
+                en_sub,
+                "none",
+                0,
+                q_tag
+            )
+            scheduled_ids.append(f"🎬 Encode-ASS (`{enc_out.name}` در `{enc_dir.name}/`): `{t_enc.task_id}`")
+
         if mode in ("softsub", "both") and (fa_sub or en_sub):
-            soft_out = soft_dir / f"{base_stem}.SoftSub.EBTV.mkv"
+            # حفظ فرمت .mp4 در صورتی که ویدئوی اصلی .mp4 باشد
+            soft_ext = ".mp4" if vid.suffix.lower() == ".mp4" else ".mkv"
+            soft_out = soft_dir / f"{base_stem}.SoftSub.EBTV{soft_ext}"
             t_soft = await queue_engine.add_task(
                 "mkvtoolnix",
                 f"SoftSub: {soft_out.name}",
@@ -1475,27 +1750,6 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
                 sync_offset_ms
             )
             scheduled_ids.append(f"📎 SoftSub (`{soft_out.name}` در `{soft_dir.name}/`): `{t_soft.task_id}`")
-
-        if mode in ("hardsub", "both") and chosen_preset:
-            hard_out = hard_dir / f"{base_stem}.HardSub.EBTV.mp4"
-            primary_sub = fa_sub
-            is_fa_ass = bool(fa_sub and fa_sub.suffix.lower() in (".ass", ".ssa"))
-            secondary_sub = en_sub if is_fa_ass else None
-
-            t_hard = await queue_engine.add_task(
-                "handbrake",
-                f"HardSub ({chosen_preset['name']}): {hard_out.name}",
-                HandBrakeService.encode_hardsub,
-                vid,
-                primary_sub,
-                hard_out,
-                chosen_preset["file"],
-                chosen_preset["name"],
-                secondary_sub,
-                sync_mode,
-                sync_offset_ms
-            )
-            scheduled_ids.append(f"🔥 HardSub (`{hard_out.name}` در `{hard_dir.name}/`): `{t_hard.task_id}`")
 
     return scheduled_ids
 
@@ -1526,7 +1780,6 @@ async def _schedule_subtitle_jobs_from_msg(message: Message, state: FSMContext, 
     )
 
 
-# ==================== اکشن‌های زیرنویس از داخل فایل‌منیجر ====================
 @router.callback_query(F.data == "vact:extract_sub")
 async def cb_extract_sub_list(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -1570,7 +1823,7 @@ async def cb_single_or_batch_video_sub_flow(call: CallbackQuery, state: FSMConte
         vid = Path(data["selected_video"]).resolve()
         ep_tag = AutomationService.extract_episode_tag(vid.name)
         target_dir = vid.parent.parent if ep_tag and vid.parent.name.lower() != "workspace" else vid.parent
-        return await _init_smart_auto_plan(call, state, target_dir, ep_tag)
+        return await _init_smart_auto_batch(call, state, target_dir, [ep_tag] if ep_tag else [])
 
     mode_map = {
         "vact:softsub": "softsub",
