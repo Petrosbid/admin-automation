@@ -768,7 +768,7 @@ def file_browser_kb(
             ext_low = path.suffix.lower()
             if ext_low in [".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"]:
                 icon = "🎬"
-            elif ext_low == ".zip":
+            elif ext_low in (".zip", ".rar", ".7z"):
                 icon = "📦"
             else:
                 icon = "📄"
@@ -790,11 +790,13 @@ def file_browser_kb(
 
     sel_count = len(selected_files)
     if sel_count > 0:
-        zip_selected_count = sum(1 for p in selected_files if Path(p).suffix.lower() == ".zip")
-        if zip_selected_count > 0:
+        archive_selected_count = sum(
+            1 for p in selected_files if Path(p).suffix.lower() in (".zip", ".rar", ".7z")
+        )
+        if archive_selected_count > 0:
             builder.row(
                 InlineKeyboardButton(
-                    text=f"📦 اکسترکت {zip_selected_count} فایل ZIP در همین پوشه",
+                    text=f"📦 اکسترکت {archive_selected_count} فایل فشرده (ZIP/RAR) در همین پوشه",
                     callback_data="fact:extract_zip"
                 )
             )
@@ -863,7 +865,7 @@ def file_browser_kb(
             callback_data="fact:mkdir_here"
         ),
         InlineKeyboardButton(
-            text="📥 آپلود زیرنویس / ZIP",
+            text="📥 آپلود زیرنویس / ZIP / RAR",
             callback_data="fact:upload_sub_here"
         )
     )

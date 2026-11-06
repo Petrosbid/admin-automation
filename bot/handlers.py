@@ -1,5 +1,6 @@
 import re
 import shutil
+import asyncio
 from pathlib import Path
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -654,23 +655,85 @@ async def handle_target_folder_sub_file(message: Message, state: FSMContext):
     dest_path = dest_dir / file_name
     await message.bot.download(message.document, destination=dest_path)
 
-    if dest_path.suffix.lower() == ".srt":
-        SubtitleService.normalize_srt_utf8(dest_path)
+    extracted_msg = ""
+    if dest_path.suffix.lower() in SubtitleService.ARCHIVE_EXTENSIONS:
+        try:
+            extracted_files = await asyncio.to_thread(
+                SubtitleService.extract_archive, dest_path, dest_dir, True
+            )
+            ext_names = "\n".join([f"• `{p.name}`" for p in extracted_files[:15]])
+            extracted_msg = f"📦 فایل فشرده (`{file_name}`) با موفقیت اکسترکت شد (`{len(extracted_files)}` فایل):\n{ext_names}"
+        except Exception as e:
+            extracted_msg = f"❌ خطا در اکسترکت فایل فشرده:\n`{e}`"
+    else:
+        if dest_path.suffix.lower() == ".srt":
+            SubtitleService.normalize_srt_utf8(dest_path)
+        extracted_msg = f"✅ زیرنویس `{file_name}` با موفقیت در پوشه هدف ذخیره شد!"
 
     await state.clear()
     await state.update_data(target_sub_dir=str(dest_dir), current_dir=str(dest_dir))
 
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="➕ آپلود یک زیرنویس دیگر در همین پوشه", callback_data="qsub:now"))
+    kb.row(InlineKeyboardButton(text="➕ آپلود یک فایل دیگر در همین پوشه", callback_data="qsub:now"))
     kb.row(InlineKeyboardButton(text="📂 مشاهده در فایل‌منیجر", callback_data="menu:file_mgr"))
     kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
 
     await message.answer(
-        f"✅ زیرنویس `{file_name}` با موفقیت در پوشه هدف ذخیره شد!\n\n"
-        f"📂 مسیر فایل:\n`{dest_path}`",
+        f"{extracted_msg}\n\n📂 مسیر پوشه:\n`{dest_dir}`",
         reply_markup=kb.as_markup(),
         parse_mode="Markdown"
     )
+
+
+@router.callback_query(F.data == "fact:extract_zip")
+async def cb_extract_selected_zip_files(call: CallbackQuery, state: FSMContext):
+    import asyncio
+    data = await state.get_data()
+    sel_files = sorted(data.get("fm_selected_files", []), key=_natural_sort_key)
+    if not sel_files and data.get("selected_video"):
+        sel_files = [data["selected_video"]]
+
+    archive_targets = [
+        Path(p) for p in sel_files
+        if Path(p).exists() and Path(p).suffix.lower() in SubtitleService.ARCHIVE_EXTENSIONS
+    ]
+    if not archive_targets:
+        return await call.answer("⚠️ هیچ فایل فشرده‌ای (.zip / .rar / .7z) در انتخاب‌های شما وجود ندارد!", show_alert=True)
+
+    await call.answer("⏳ در حال اکسترکت فایل‌های فشرده...")
+    extracted_all: list[Path] = []
+    errors: list[str] = []
+
+    for arch_p in archive_targets:
+        try:
+            out_files = await asyncio.to_thread(
+                SubtitleService.extract_archive,
+                arch_p,
+                arch_p.parent,
+                False,
+                False
+            )
+            extracted_all.extend(out_files)
+        except Exception as e:
+            errors.append(f"{arch_p.name}: {e}")
+
+    await state.update_data(fm_selected_files=[])
+    curr_dir = Path(data.get("current_dir", archive_targets[0].parent))
+
+    if errors:
+        await call.message.answer(
+            "⚠️ **خطا در اکسترکت برخی فایل‌ها:**\n" + "\n".join([f"• `{err}`" for err in errors]),
+            parse_mode="Markdown"
+        )
+    else:
+        names_preview = "\n".join([f"• `{p.name}`" for p in extracted_all[:15]])
+        await call.message.answer(
+            f"📦 **اکسترکت با موفقیت انجام شد!**\n"
+            f"تعداد `{len(extracted_all)}` فایل در مسیر `{curr_dir.name}` استخراج گردید:\n{names_preview}",
+            parse_mode="Markdown"
+        )
+
+    await render_directory(call, state, curr_dir)
 
 
 # ==================== ۵. فایل‌منیجر سرور با قابلیت انتخاب چندفایلی و تغییر نام گروهی ====================

@@ -5,6 +5,7 @@ import traceback
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Coroutine
 from aiogram import Bot
 
@@ -31,6 +32,13 @@ class QueueTask:
 
 class QueueManager:
     QUEUE_TYPES = ("download", "mkvtoolnix", "handbrake", "upload")
+
+    QUEUE_LABELS = {
+        "mkvtoolnix": "🎬 سافت‌ساب (MKVToolNix)",
+        "handbrake": "🔥 هاردساب / انکود (HandBrake)",
+        "download": "📥 دانلود فایل",
+        "upload": "☁️ آپلود به سرور (CuteFTP)",
+    }
 
     def __init__(self):
         self.tasks: dict[str, QueueTask] = {}
@@ -76,10 +84,6 @@ class QueueManager:
         return task
 
     def move_pending_task(self, task_id: str, direction: str) -> bool:
-        """
-        جابجایی نوبت و اولویت پراسس‌های در انتظار:
-        direction: 'up' (یک پله بالاتر) | 'down' (یک پله پایین‌تر) | 'top' (انتقال به صدر صف)
-        """
         task = self.tasks.get(task_id)
         if not task or "انتظار" not in task.status:
             return False
@@ -102,7 +106,6 @@ class QueueManager:
         return False
 
     def get_pending_position(self, task_id: str) -> tuple[int, int]:
-        """برگرداندن (جایگاه فعلی در صف انتظار، کل تعداد در انتظار همان صف)"""
         task = self.tasks.get(task_id)
         if not task:
             return 0, 0
@@ -143,6 +146,53 @@ class QueueManager:
                 except Exception as e:
                     logging.error(f"Queue notification error: {e}")
 
+    async def _send_completion_notification(self, task: QueueTask, res: Any):
+        """ارسال نوتیفیکیشن اتمام کار برای تمام بخش‌ها (سافت‌ساب، هاردساب، دانلود و آپلود)"""
+        section_label = self.QUEUE_LABELS.get(task.queue_type, task.queue_type.upper())
+
+        if task.queue_type == "upload":
+            if isinstance(res, list) and res:
+                links_block = "\n".join([f"🔗 `{u}`" for u in res[:25]])
+                await self._notify_admins(
+                    f"☁️ **آپلود با موفقیت به پایان رسید!**\n"
+                    f"🆔 کد: `{task.task_id}`\n"
+                    f"📌 عنوان: `{task.title}`\n\n"
+                    f"📥 **لینک‌های مستقیم دانلود:**\n{links_block}"
+                )
+            else:
+                await self._notify_admins(
+                    f"☁️ **آپلود با موفقیت انجام شد!**\n"
+                    f"🆔 کد: `{task.task_id}`\n"
+                    f"📌 عنوان: `{task.title}`"
+                )
+            return
+
+        # برای سافت‌ساب، هاردساب و دانلود: نمایش نام فایل خروجی، مسیر و حجم آن
+        out_path: Path | None = None
+        if isinstance(res, Path):
+            out_path = res
+        elif isinstance(res, str) and Path(res).exists():
+            out_path = Path(res)
+
+        details = ""
+        if out_path and out_path.exists():
+            if out_path.is_file():
+                size_mb = out_path.stat().st_size / (1024 * 1024)
+                details = (
+                    f"\n📄 **فایل خروجی:**\n`{out_path.name}`\n"
+                    f"📂 **مسیر ذخیره:**\n`{out_path.parent}`\n"
+                    f"📦 **حجم نهایی:** `{size_mb:.2f} MB`"
+                )
+            else:
+                details = f"\n📂 **مسیر ذخیره:**\n`{out_path}`"
+
+        await self._notify_admins(
+            f"✅ **عملیات {section_label} تکمیل شد!**\n"
+            f"🆔 کد تسک: `{task.task_id}`\n"
+            f"📌 عنوان: `{task.title}`"
+            f"{details}"
+        )
+
     async def _worker_loop(self, queue_type: str, worker_idx: int):
         while True:
             task = await self._pop_next_pending(queue_type)
@@ -176,14 +226,8 @@ class QueueManager:
                 task.progress = "100%"
                 task.is_finished = True
 
-                # اگر تسک آپلود بوده و لینک‌های دانلود تولید کرده، لینک‌ها را در تلگرام بفرست
-                if queue_type == "upload" and isinstance(res, list) and res:
-                    links_block = "\n".join([f"🔗 `{u}`" for u in res[:25]])
-                    await self._notify_admins(
-                        f"☁️ **آپلود با موفقیت به پایان رسید!**\n"
-                        f"📌 عنوان: `{task.title}`\n\n"
-                        f"📥 **لینک‌های مستقیم دانلود:**\n{links_block}"
-                    )
+                # ارسال نوتیفیکیشن اتمام برای تمام تسک‌ها (سافت‌ساب، هاردساب، دانلود و آپلود)
+                await self._send_completion_notification(task, res)
 
             except asyncio.CancelledError:
                 task.status = "🛑 لغو شد"
@@ -213,7 +257,7 @@ class QueueManager:
             "handbrake": int(conc.get("handbrake_workers", 2)),
             "mkvtoolnix": int(conc.get("mkvtoolnix_workers", 1)),
             "download": int(conc.get("download_workers", 1)),
-            "upload": 1,  # همیشه ۱ ورکر برای CuteFTP تا آپلودها به صورت ترتیبی و بدون فریز شدن انجام شوند
+            "upload": 1,
         }
         for q_type, num in counts.items():
             for idx in range(1, max(1, num) + 1):

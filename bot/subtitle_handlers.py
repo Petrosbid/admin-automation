@@ -368,7 +368,7 @@ async def handle_sauto_fa_sub_upload(message: Message, state: FSMContext):
     await message.bot.download(message.document, destination=temp_dest)
 
     new_subs: list[Path] = []
-    if temp_dest.suffix.lower() == ".zip":
+    if temp_dest.suffix.lower() in SubtitleService.ARCHIVE_EXTENSIONS:
         extracted = SubtitleService.extract_zip_archive(temp_dest, fa_dir, remove_zip=True)
         new_subs = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
         if not new_subs:
@@ -686,7 +686,7 @@ async def handle_sauto_en_upload(message: Message, state: FSMContext):
     temp_dest = en_dir / (message.document.file_name or "subtitle.EN.srt")
     await message.bot.download(message.document, destination=temp_dest)
 
-    if temp_dest.suffix.lower() == ".zip":
+    if temp_dest.suffix.lower() in SubtitleService.ARCHIVE_EXTENSIONS:
         extracted = SubtitleService.extract_zip_archive(temp_dest, en_dir, remove_zip=True)
         en_cands = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
     else:
@@ -937,7 +937,7 @@ async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSM
         return
     fname = message.document.file_name or ""
     ext_low = Path(fname).suffix.lower()
-    if ext_low not in (".srt", ".ass", ".ssa", ".zip"):
+    if ext_low not in (".srt", ".ass", ".ssa", ".zip", ".rar", ".7z"):
         return
 
     temp_dir = Path(cfg.get("paths", "workspace_dir")) / "_incoming_subs"
@@ -1482,7 +1482,7 @@ async def handle_fa_sub_upload(message: Message, state: FSMContext):
     raw_dest = sub_dir / f"FA_{orig_name}"
     await message.bot.download(message.document, destination=raw_dest)
 
-    if raw_dest.suffix.lower() == ".zip":
+    if raw_dest.suffix.lower() in SubtitleService.ARCHIVE_EXTENSIONS:
         extracted = SubtitleService.extract_zip_archive(raw_dest, sub_dir, remove_zip=True)
         sub_files = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
         if not sub_files:
@@ -1544,7 +1544,7 @@ async def handle_en_sub_upload(message: Message, state: FSMContext):
     en_dest = sub_dir / f"EN_{orig_name}"
     await message.bot.download(message.document, destination=en_dest)
 
-    if en_dest.suffix.lower() == ".zip":
+    if en_dest.suffix.lower() in SubtitleService.ARCHIVE_EXTENSIONS:
         extracted = SubtitleService.extract_zip_archive(en_dest, sub_dir, remove_zip=True)
         sub_files = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
         if not sub_files:

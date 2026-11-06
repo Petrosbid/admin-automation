@@ -544,11 +544,12 @@ class AutomationService:
         for d in list(search_dirs):
             if not d or not d.exists():
                 continue
-            for zf in list(d.glob("*.zip")):
-                try:
-                    SubtitleService.extract_zip_archive(zf, fa_dest_dir, remove_zip=True)
-                except Exception:
-                    pass
+            for ext_pat in ("*.zip", "*.rar", "*.7z"):
+                for arch_f in list(d.glob(ext_pat)):
+                    try:
+                        SubtitleService.extract_archive(arch_f, fa_dest_dir, remove_archive=True)
+                    except Exception:
+                        pass
 
         found: list[Path] = []
         seen: set[str] = set()
