@@ -1,3 +1,4 @@
+import math
 import re
 import shutil
 import uuid
@@ -16,8 +17,8 @@ from services.downloader_service import DownloaderService
 from services.mkv_service import MKVService
 from services.automation_service import AutomationService
 from bot.keyboards import (
-    main_menu_kb, search_categories_kb, search_sites_kb,
-    search_results_kb, download_folder_tree_browser_kb,
+    BROWSER_PAGE_SIZE, main_menu_kb, search_categories_kb,
+    search_sites_kb, search_results_kb, download_folder_tree_browser_kb,
     extract_sub_entry_kb, local_extract_browser_kb
 )
 
@@ -59,13 +60,9 @@ def _extract_batch_links(raw_text: str) -> list[str]:
 async def _render_download_folder_browser(
     target_msg_or_call: Message | CallbackQuery,
     state: FSMContext,
-    current_dir: Path
+    current_dir: Path,
+    page: int = 0
 ):
-    """
-    مرورگر درختی کامل برای انتخاب پوشه مقصد دانلود:
-    کاربر می‌تواند وارد پوشه‌های Series / Anime / Movies و تمام زیرپوشه‌های داخلی آن‌ها (مثل S01/FullHD) شود
-    یا در هر سطحی پوشه جدید بسازد.
-    """
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     AutomationService.ensure_workspace_root_categories()
     current_dir = current_dir.resolve()
@@ -79,29 +76,40 @@ async def _render_download_folder_browser(
         key=lambda x: x.name.lower()
     )
 
+    total_folders = len(subfolders)
+    total_pages = max(1, math.ceil(total_folders / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
+
     data = await state.get_data()
     targets = data.get("pending_direct_targets", [])
 
     await state.set_state(DownloadStates.browsing_download_folder)
     await state.update_data(
         dl_browser_curr_dir=str(current_dir),
-        dl_browser_subfolders=[str(f.resolve()) for f in subfolders]
+        dl_browser_subfolders=[str(f.resolve()) for f in subfolders],
+        dl_browser_page=page
     )
 
     is_root = (current_dir == workspace)
-    folder_lines = "\n".join([f"`[{i+1}]` 📁 `{f.name}`" for i, f in enumerate(subfolders[:22])])
+    folder_lines = "\n".join([
+        f"`[{i+1}]` 📁 `{subfolders[i].name}`"
+        for i in range(start_idx, min(end_idx, total_folders))
+    ])
     list_block = folder_lines if folder_lines else "_(زیرپوشه‌ای در این مسیر وجود ندارد)_"
     batch_badge = f"📦 **تعداد لینک‌های آماده دانلود:** `{len(targets)}` مورد\n" if targets else ""
+    page_badge = f" (صفحه {page + 1} از {total_pages} - کل: {total_folders})" if total_pages > 1 else ""
 
     text = (
-        f"📂 **مرورگر انتخاب پوشه مقصد دانلود**\n"
+        f"📂 **مرورگر انتخاب پوشه مقصد دانلود{page_badge}**\n"
         f"{batch_badge}"
         f"📍 **مسیر فعلی باز شده:**\n`{current_dir}`\n\n"
-        f"📋 **زیرپوشه‌های این مسیر:**\n{list_block}\n\n"
+        f"📋 **زیرپوشه‌های این صفحه:**\n{list_block}\n\n"
         "• برای دانلود در همین پوشه فعلی، دکمه **«📥 دانلود در همین پوشه فعلی»** را بزنید.\n"
         "• برای ورود به زیرپوشه‌های بعدی، روی نام پوشه کلیک کنید و یا در همینجا پوشه جدید بسازید:"
     )
-    kb = download_folder_tree_browser_kb(subfolders, current_dir, is_root)
+    kb = download_folder_tree_browser_kb(subfolders, current_dir, is_root, page=page)
 
     if isinstance(target_msg_or_call, CallbackQuery):
         await target_msg_or_call.message.edit_text(text[:4000], reply_markup=kb, parse_mode="Markdown")
@@ -192,10 +200,10 @@ async def cb_click_search_result(call: CallbackQuery, state: FSMContext):
 
     await state.update_data(pending_direct_targets=[chosen["target"]])
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-    await _render_download_folder_browser(call, state, workspace)
+    await _render_download_folder_browser(call, state, workspace, page=0)
 
 
-# ==================== ۲. دانلود لینک مستقیم / تورنت / مگا / گوگل درایو (تکی و Batch با مرورگر درختی پوشه) ====================
+# ==================== ۲. دانلود لینک مستقیم / تورنت / مگا / گوگل درایو ====================
 @router.callback_query(F.data == "menu:direct_dl")
 async def cb_direct_dl(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -226,7 +234,15 @@ async def handle_direct_link_input(message: Message, state: FSMContext):
 
     await state.update_data(pending_direct_targets=targets)
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-    await _render_download_folder_browser(message, state, workspace)
+    await _render_download_folder_browser(message, state, workspace, page=0)
+
+
+@router.callback_query(DownloadStates.browsing_download_folder, F.data.startswith("dlnav:page:"))
+async def cb_dlnav_change_page(call: CallbackQuery, state: FSMContext):
+    page = int(call.data.split(":")[2])
+    data = await state.get_data()
+    curr = Path(data.get("dl_browser_curr_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    await _render_download_folder_browser(call, state, curr, page=page)
 
 
 @router.callback_query(DownloadStates.browsing_download_folder, F.data.startswith("dlnav:open:"))
@@ -235,7 +251,7 @@ async def cb_dlnav_open_subfolder(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     subfolders = data.get("dl_browser_subfolders", [])
     if idx < len(subfolders):
-        await _render_download_folder_browser(call, state, Path(subfolders[idx]))
+        await _render_download_folder_browser(call, state, Path(subfolders[idx]), page=0)
 
 
 @router.callback_query(DownloadStates.browsing_download_folder, F.data == "dlnav:up")
@@ -244,7 +260,7 @@ async def cb_dlnav_up(call: CallbackQuery, state: FSMContext):
     curr = Path(data.get("dl_browser_curr_dir", cfg.get("paths", "workspace_dir"))).resolve()
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     parent = curr.parent if curr != workspace else workspace
-    await _render_download_folder_browser(call, state, parent)
+    await _render_download_folder_browser(call, state, parent, page=0)
 
 
 @router.callback_query(DownloadStates.browsing_download_folder, F.data == "dlnav:select_here")
@@ -290,7 +306,7 @@ async def cb_dlnav_mkdir_here(call: CallbackQuery, state: FSMContext):
 async def cb_dlnav_resume(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     curr_dir = Path(data.get("dl_browser_curr_dir", cfg.get("paths", "workspace_dir")))
-    await _render_download_folder_browser(call, state, curr_dir)
+    await _render_download_folder_browser(call, state, curr_dir, page=data.get("dl_browser_page", 0))
 
 
 @router.message(DownloadStates.waiting_new_dl_subfolder_name)
@@ -304,19 +320,17 @@ async def handle_new_dl_subfolder_name(message: Message, state: FSMContext):
     new_dir = (curr_dir / raw_name).resolve()
     new_dir.mkdir(parents=True, exist_ok=True)
 
-    # اگر در شاخه Movies پوشه ساخته شده، زیرپوشه‌های استاندارد فیلم را هم بساز
     parts_low = [p.lower() for p in new_dir.parts]
     if ("movies" in parts_low or "movie" in parts_low) and new_dir.parent.name.lower() in ("movies", "movie"):
         AutomationService.create_movie_structure(new_dir)
-    # اگر پوشه فصل سریال است (مثل S01)، ساختار فصل را بساز
     elif AutomationService.SEASON_DIR_REGEX.match(new_dir.name):
         AutomationService.create_series_season_structure(new_dir)
 
     await message.answer(f"✅ پوشه `{new_dir.name}` ساخته شد و وارد آن شدید!", parse_mode="Markdown")
-    await _render_download_folder_browser(message, state, new_dir)
+    await _render_download_folder_browser(message, state, new_dir, page=0)
 
 
-# ==================== ۳. استخراج زیرنویس (از فایل موجود در دایرکتوری و از لینک تکی/Batch) ====================
+# ==================== ۳. استخراج زیرنویس (همراه با صفحه‌بندی دایرکتوری) ====================
 @router.callback_query(F.data == "menu:link_extract_sub")
 async def cb_link_extract_sub_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -330,8 +344,14 @@ async def cb_link_extract_sub_menu(call: CallbackQuery, state: FSMContext):
     )
 
 
-async def _render_local_extract_browser(call: CallbackQuery, state: FSMContext, browse_dir: Path):
+async def _render_local_extract_browser(
+    call: CallbackQuery,
+    state: FSMContext,
+    browse_dir: Path,
+    page: int = 0
+):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    AutomationService.ensure_workspace_root_categories()
     browse_dir = browse_dir.resolve()
     browse_dir.mkdir(parents=True, exist_ok=True)
 
@@ -341,34 +361,47 @@ async def _render_local_extract_browser(call: CallbackQuery, state: FSMContext, 
     )
     videos = DownloaderService.find_video_files(browse_dir, recursive=False)
 
+    combined: list[tuple[str, int, Path]] = (
+        [("dir", i, f) for i, f in enumerate(folders)]
+        + [("vid", i, v) for i, v in enumerate(videos)]
+    )
+    total_items = len(combined)
+    total_pages = max(1, math.ceil(total_items / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
+
     await state.set_state(DownloadStates.browsing_local_for_sub_extract)
     await state.update_data(
         ext_browse_dir=str(browse_dir),
         ext_dir_folders=[str(f.resolve()) for f in folders],
-        ext_dir_videos=[str(v.resolve()) for v in videos]
+        ext_dir_videos=[str(v.resolve()) for v in videos],
+        ext_browse_page=page
     )
 
     is_root = (browse_dir == workspace)
 
     full_lines = []
-    for idx, folder in enumerate(folders[:20]):
-        full_lines.append(f"`[{idx+1}]` 📁 `{folder.name}`")
-    for idx, vid in enumerate(videos[:25]):
-        size_mb = vid.stat().st_size / (1024 * 1024)
-        full_lines.append(f"`[F{idx+1}]` 🎬 `{vid.name}` _({size_mb:.1f} MB)_")
+    for kind, orig_idx, path_obj in combined[start_idx:end_idx]:
+        if kind == "dir":
+            full_lines.append(f"`[{orig_idx+1}]` 📁 `{path_obj.name}`")
+        else:
+            size_mb = path_obj.stat().st_size / (1024 * 1024)
+            full_lines.append(f"`[F{orig_idx+1}]` 🎬 `{path_obj.name}` _({size_mb:.1f} MB)_")
 
     details_block = "\n".join(full_lines) if full_lines else "_(در این مسیر پوشه یا فایل ویدئویی وجود ندارد)_"
+    page_badge = f" (صفحه {page + 1} از {total_pages} - کل: {total_items})" if total_pages > 1 else ""
 
     msg_text = (
-        f"📂 **استخراج زیرنویس از فایل موجود در دایرکتوری**\n"
+        f"📂 **استخراج زیرنویس از فایل موجود در دایرکتوری{page_badge}**\n"
         f"📍 مسیر فعلی:\n`{browse_dir}`\n\n"
-        f"📋 **لیست کامل پوشه‌ها و فیلم‌ها:**\n{details_block}\n\n"
+        f"📋 **لیست پوشه‌ها و فیلم‌های این صفحه:**\n{details_block}\n\n"
         "روی پوشه کلیک کنید تا باز شود، یا روی فیلم (`🎬`) کلیک کنید تا ترک‌های زیرنویس آن نمایش داده شود:"
     )
 
     await call.message.edit_text(
         msg_text[:4000],
-        reply_markup=local_extract_browser_kb(folders, videos, is_root),
+        reply_markup=local_extract_browser_kb(folders, videos, is_root, page=page),
         parse_mode="Markdown"
     )
 
@@ -376,7 +409,15 @@ async def _render_local_extract_browser(call: CallbackQuery, state: FSMContext, 
 @router.callback_query(F.data == "extmode:local")
 async def cb_extmode_local_start(call: CallbackQuery, state: FSMContext):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-    await _render_local_extract_browser(call, state, workspace)
+    await _render_local_extract_browser(call, state, workspace, page=0)
+
+
+@router.callback_query(DownloadStates.browsing_local_for_sub_extract, F.data.startswith("extnav:page:"))
+async def cb_extnav_change_page(call: CallbackQuery, state: FSMContext):
+    page = int(call.data.split(":")[2])
+    data = await state.get_data()
+    curr = Path(data.get("ext_browse_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    await _render_local_extract_browser(call, state, curr, page=page)
 
 
 @router.callback_query(DownloadStates.browsing_local_for_sub_extract, F.data.startswith("extnav:dir:"))
@@ -385,7 +426,7 @@ async def cb_extnav_open_dir(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     folders = data.get("ext_dir_folders", [])
     if idx < len(folders):
-        await _render_local_extract_browser(call, state, Path(folders[idx]))
+        await _render_local_extract_browser(call, state, Path(folders[idx]), page=0)
 
 
 @router.callback_query(DownloadStates.browsing_local_for_sub_extract, F.data == "extnav:up")
@@ -394,7 +435,7 @@ async def cb_extnav_up(call: CallbackQuery, state: FSMContext):
     curr = Path(data.get("ext_browse_dir", cfg.get("paths", "workspace_dir"))).resolve()
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     parent = curr.parent if curr != workspace else workspace
-    await _render_local_extract_browser(call, state, parent)
+    await _render_local_extract_browser(call, state, parent, page=0)
 
 
 @router.callback_query(DownloadStates.browsing_local_for_sub_extract, F.data.startswith("extnav:vid:"))
@@ -446,7 +487,7 @@ async def cb_extnav_select_video(call: CallbackQuery, state: FSMContext):
 async def cb_extnav_back_to_dir(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     curr = Path(data.get("ext_browse_dir", cfg.get("paths", "workspace_dir")))
-    await _render_local_extract_browser(call, state, curr)
+    await _render_local_extract_browser(call, state, curr, page=data.get("ext_browse_page", 0))
 
 
 @router.callback_query(F.data.startswith("exttrack_local:"))
@@ -478,7 +519,7 @@ async def cb_extract_single_local_track(call: CallbackQuery, state: FSMContext):
         parse_mode="Markdown"
     )
     curr = Path(data.get("ext_browse_dir", video_path.parent))
-    await _render_local_extract_browser(call, state, curr)
+    await _render_local_extract_browser(call, state, curr, page=data.get("ext_browse_page", 0))
 
 
 @router.callback_query(F.data == "extall_local")
@@ -504,7 +545,7 @@ async def cb_extract_all_local_tracks(call: CallbackQuery, state: FSMContext):
         )
 
     curr = Path(data.get("ext_browse_dir", video_path.parent))
-    await _render_local_extract_browser(call, state, curr)
+    await _render_local_extract_browser(call, state, curr, page=data.get("ext_browse_page", 0))
 
 
 async def _download_and_extract_subs_job(
@@ -611,7 +652,6 @@ async def handle_link_for_sub_extract(message: Message, state: FSMContext):
     )
 
 
-# ==================== دریافت مستقیم فایل .torrent یا لینک‌های Batch در حالت بدون استیت ====================
 @router.message(StateFilter(None), F.document)
 async def receive_download_torrent(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -624,7 +664,7 @@ async def receive_download_torrent(message: Message, state: FSMContext):
 
         await state.update_data(pending_direct_targets=[str(t_path.resolve())])
         workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-        await _render_download_folder_browser(message, state, workspace)
+        await _render_download_folder_browser(message, state, workspace, page=0)
 
 
 @router.message(StateFilter(None), F.text.regexp(r"(magnet:\?xt=|https?://)"))
@@ -636,4 +676,4 @@ async def catch_direct_links_in_chat(message: Message, state: FSMContext):
         return
     await state.update_data(pending_direct_targets=targets)
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-    await _render_download_folder_browser(message, state, workspace)
+    await _render_download_folder_browser(message, state, workspace, page=0)

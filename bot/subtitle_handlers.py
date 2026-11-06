@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 import shutil
 from pathlib import Path
@@ -16,20 +17,21 @@ from services.subtitle_service import SubtitleService
 from services.mkv_service import MKVService
 from services.handbrake_service import HandBrakeService
 from services.automation_service import AutomationService, AutomationPlan
+from services.cuteftp_service import CuteFTPService
 from bot.keyboards import (
-    main_menu_kb, subtitle_folder_browser_kb, subtitle_source_kb,
-    subtitle_file_found_kb, sync_options_kb, subtitle_mode_kb,
-    skip_or_cancel_kb, presets_kb, output_destination_choice_kb,
-    output_dest_tree_browser_kb, smart_auto_browser_kb,
-    smart_auto_sub_name_kb, smart_auto_missing_en_kb,
-    smart_auto_final_selection_kb, manual_encode_ass_qualities_kb
+    BROWSER_PAGE_SIZE, main_menu_kb, subtitle_folder_browser_kb,
+    subtitle_source_kb, subtitle_file_found_kb, sync_options_kb,
+    subtitle_mode_kb, skip_or_cancel_kb, presets_kb,
+    output_destination_choice_kb, output_dest_tree_browser_kb,
+    smart_auto_browser_kb, smart_auto_sub_name_kb,
+    smart_auto_missing_en_kb, smart_auto_final_selection_kb,
+    manual_encode_ass_qualities_kb
 )
 
 router = Router()
 
 
 class SubtitleStates(StatesGroup):
-    # استیت‌های اتوماسیون هوشمند (تک‌قسمتی، چندقسمتی و فیلم)
     sauto_browsing_dir = State()
     sauto_waiting_fa_sub = State()
     sauto_waiting_fa_sub_name = State()
@@ -37,7 +39,6 @@ class SubtitleStates(StatesGroup):
     sauto_waiting_en_upload = State()
     sauto_waiting_hb_qualities = State()
 
-    # استیت‌های حالت دستی (سافت‌ساب / هاردساب فارسی / انکود با movie.ass)
     selecting_target_videos = State()
     waiting_manual_initial_mode = State()
     waiting_manual_encode_ass_qualities = State()
@@ -63,11 +64,15 @@ def _natural_sort_key(path_str: str) -> list:
 
 
 # ==============================================================================
-# بخش اول: اتوماسیون کامل و هوشمند فیلم و چندقسمتی سریال
-# (بدون انکود movie.ass و مجهز به قابلیت انتخاب کیفیت‌های سافت‌ساب و هاردساب)
+# بخش اول: اتوماسیون کامل و هوشمند فیلم و چندقسمتی سریال (همراه با صفحه‌بندی پوشه‌ها)
 # ==============================================================================
 
-async def _render_smart_auto_browser(call_or_msg: CallbackQuery | Message, state: FSMContext, current_dir: Path):
+async def _render_smart_auto_browser(
+    call_or_msg: CallbackQuery | Message,
+    state: FSMContext,
+    current_dir: Path,
+    page: int = 0
+):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     AutomationService.ensure_workspace_root_categories()
     current_dir = current_dir.resolve()
@@ -88,6 +93,12 @@ async def _render_smart_auto_browser(call_or_msg: CallbackQuery | Message, state
     detected_eps = AutomationService.scan_available_episodes_in_season(current_dir)
     is_root = (current_dir == workspace)
 
+    total_folders = len(folders)
+    total_pages = max(1, math.ceil(total_folders / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
+
     data = await state.get_data()
     prev_dir = data.get("sauto_curr_dir")
     selected_eps = set(data.get("sauto_selected_eps", [])) if prev_dir == str(current_dir) else set()
@@ -98,10 +109,14 @@ async def _render_smart_auto_browser(call_or_msg: CallbackQuery | Message, state
         sauto_curr_dir=str(current_dir),
         sauto_subfolders=[str(f.resolve()) for f in folders],
         sauto_detected_eps=detected_eps,
-        sauto_selected_eps=sorted(list(selected_eps))
+        sauto_selected_eps=sorted(list(selected_eps)),
+        sauto_page=page
     )
 
-    folder_lines = [f"`[{i+1}]` 📁 `{f.name}`" for i, f in enumerate(folders[:22])]
+    folder_lines = [
+        f"`[{i+1}]` 📁 `{folders[i].name}`"
+        for i in range(start_idx, min(end_idx, total_folders))
+    ]
     list_block = "\n".join(folder_lines) if folder_lines else "_(زیرپوشه‌ای وجود ندارد)_"
 
     ep_badge = ""
@@ -112,16 +127,18 @@ async def _render_smart_auto_browser(call_or_msg: CallbackQuery | Message, state
             f"✅ **قسمت‌های انتخاب‌شده:** `{len(selected_eps)}` قسمت\n"
         )
 
+    page_badge = f" (صفحه {page + 1} از {total_pages} - کل: {total_folders})" if total_pages > 1 else ""
+
     text = (
-        "🚀 **اتوماسیون کامل و هوشمند (فیلم و چندقسمتی سریال)**\n"
+        f"🚀 **اتوماسیون کامل و هوشمند{page_badge}**\n"
         f"📂 مسیر فعلی:\n`{current_dir}`\n"
         f"{ep_badge}\n"
-        f"📋 **پوشه‌ها:**\n{list_block}\n\n"
+        f"📋 **پوشه‌های این صفحه:**\n{list_block}\n\n"
         "💡 **راهنما:**\n"
         "• برای **سریال / انیمه**: وارد پوشه فصل (مثلاً `Series/Name/S01`) شوید، قسمت‌های مورد نظر را تیک (`✅`) بزنید و دکمه **«🚀 شروع اتوماسیون»** را فشار دهید.\n"
         "• برای **فیلم**: وارد پوشه فیلم در `Movies/` شوید و دکمه اجرای اتوماسیون را بزنید."
     )
-    kb = smart_auto_browser_kb(folders, current_dir, is_root, detected_eps, selected_eps)
+    kb = smart_auto_browser_kb(folders, current_dir, is_root, detected_eps, selected_eps, page=page)
 
     if isinstance(call_or_msg, CallbackQuery):
         try:
@@ -136,7 +153,7 @@ async def _render_smart_auto_browser(call_or_msg: CallbackQuery | Message, state
 async def cb_smart_auto_start(call: CallbackQuery, state: FSMContext):
     await state.clear()
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-    await _render_smart_auto_browser(call, state, workspace)
+    await _render_smart_auto_browser(call, state, workspace, page=0)
 
 
 @router.callback_query(F.data == "fact:run_smart_auto_here")
@@ -144,7 +161,15 @@ async def cb_run_smart_auto_from_filemgr(call: CallbackQuery, state: FSMContext)
     data = await state.get_data()
     curr_dir = Path(data.get("current_dir", cfg.get("paths", "workspace_dir"))).resolve()
     await state.update_data(sauto_selected_eps=[])
-    await _render_smart_auto_browser(call, state, curr_dir)
+    await _render_smart_auto_browser(call, state, curr_dir, page=0)
+
+
+@router.callback_query(SubtitleStates.sauto_browsing_dir, F.data.startswith("sauto:page:"))
+async def cb_sauto_change_page(call: CallbackQuery, state: FSMContext):
+    page = int(call.data.split(":")[2])
+    data = await state.get_data()
+    curr_dir = Path(data.get("sauto_curr_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    await _render_smart_auto_browser(call, state, curr_dir, page=page)
 
 
 @router.callback_query(SubtitleStates.sauto_browsing_dir, F.data.startswith("sauto:open:"))
@@ -153,7 +178,7 @@ async def cb_sauto_open_dir(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     subfolders = data.get("sauto_subfolders", [])
     if idx < len(subfolders):
-        await _render_smart_auto_browser(call, state, Path(subfolders[idx]))
+        await _render_smart_auto_browser(call, state, Path(subfolders[idx]), page=0)
 
 
 @router.callback_query(SubtitleStates.sauto_browsing_dir, F.data == "sauto:up")
@@ -162,7 +187,7 @@ async def cb_sauto_up(call: CallbackQuery, state: FSMContext):
     curr = Path(data.get("sauto_curr_dir", cfg.get("paths", "workspace_dir"))).resolve()
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     parent = curr.parent if curr != workspace else workspace
-    await _render_smart_auto_browser(call, state, parent)
+    await _render_smart_auto_browser(call, state, parent, page=0)
 
 
 @router.callback_query(SubtitleStates.sauto_browsing_dir, F.data.startswith("sauto:ep_toggle:"))
@@ -176,7 +201,7 @@ async def cb_sauto_toggle_episode(call: CallbackQuery, state: FSMContext):
         selected.add(ep_tag)
     await state.update_data(sauto_selected_eps=sorted(list(selected)))
     curr_dir = Path(data["sauto_curr_dir"]).resolve()
-    await _render_smart_auto_browser(call, state, curr_dir)
+    await _render_smart_auto_browser(call, state, curr_dir, page=data.get("sauto_page", 0))
 
 
 @router.callback_query(SubtitleStates.sauto_browsing_dir, F.data == "sauto:ep_all")
@@ -190,7 +215,7 @@ async def cb_sauto_toggle_all_episodes(call: CallbackQuery, state: FSMContext):
         selected = set(detected)
     await state.update_data(sauto_selected_eps=sorted(list(selected)))
     curr_dir = Path(data["sauto_curr_dir"]).resolve()
-    await _render_smart_auto_browser(call, state, curr_dir)
+    await _render_smart_auto_browser(call, state, curr_dir, page=data.get("sauto_page", 0))
 
 
 @router.callback_query(SubtitleStates.sauto_browsing_dir, F.data == "sauto:ep_proceed")
@@ -315,13 +340,13 @@ async def _init_smart_auto_batch(
         f"📦 مجموع فایل‌های خام برای سافت‌ساب: **`{total_soft}` فایل**\n"
         f"🔥 سورس‌های آماده هاردساب (`FullHD`): **`{total_fhd}` فایل**\n\n"
         f"📋 **وضعیت زیرنویس فارسی در پوشه:**\n{ep_status_block}\n\n"
-        "📤 **لطفاً فایل زیرنویس فارسی (`.srt` / `.ass` / `.zip`) مربوط به این قسمت را در چت ارسال کنید:**"
+        "📤 **لطفاً فایل زیرنویس فارسی (`.srt` / `.ass` / `.zip` / `.rar`) مربوط به این قسمت را در چت ارسال کنید:**"
     )
 
     if isinstance(call_or_msg, CallbackQuery):
         await call_or_msg.message.edit_text(info_text[:4000], reply_markup=kb.as_markup(), parse_mode="Markdown")
     else:
-        await call_or_msg.answer(info_text[:4000], reply_markup=kb, parse_mode="Markdown")
+        await call_or_msg.answer(info_text[:4000], reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
 @router.callback_query(SubtitleStates.sauto_waiting_fa_sub, F.data == "sauto_fa:use_partial")
@@ -369,10 +394,10 @@ async def handle_sauto_fa_sub_upload(message: Message, state: FSMContext):
 
     new_subs: list[Path] = []
     if temp_dest.suffix.lower() in SubtitleService.ARCHIVE_EXTENSIONS:
-        extracted = SubtitleService.extract_zip_archive(temp_dest, fa_dir, remove_zip=True)
+        extracted = SubtitleService.extract_archive(temp_dest, fa_dir, remove_archive=True)
         new_subs = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
         if not new_subs:
-            return await message.answer("❌ هیچ فایل زیرنویسی داخل ZIP یافت نشد! لطفاً فایل دیگری بفرستید:")
+            return await message.answer("❌ هیچ فایل زیرنویسی داخل فایل فشرده یافت نشد! لطفاً فایل دیگری بفرستید:")
     else:
         if temp_dest.suffix.lower() == ".srt":
             SubtitleService.normalize_srt_utf8(temp_dest)
@@ -604,7 +629,7 @@ async def _check_english_sub_batch_step(call_or_msg: CallbackQuery | Message, st
     if has_embedded:
         lines.append("\nآیا می‌خواهید ربات زیرنویس انگلیسی قسمت‌های کسری را **به طور خودکار از فایل فیلم استخراج کرده و در پوشه `srt` قرار دهد**؟")
     else:
-        lines.append("\nمی‌توانید فایل زیرنویس انگلیسی (`.srt` / `.zip`) آپلود کنید یا ادامه دهید:")
+        lines.append("\nمی‌توانید فایل زیرنویس انگلیسی (`.srt` / `.zip` / `.rar`) آپلود کنید یا ادامه دهید:")
 
     kb = smart_auto_missing_en_kb(has_embedded)
     text = "\n".join(lines)
@@ -665,7 +690,7 @@ async def cb_sauto_auto_extract_en(call: CallbackQuery, state: FSMContext):
 async def cb_sauto_upload_en_ask(call: CallbackQuery, state: FSMContext):
     await state.set_state(SubtitleStates.sauto_waiting_en_upload)
     await call.message.edit_text(
-        "📤 لطفاً **فایل زیرنویس انگلیسی (`.srt` / `.ass` / `.zip`)** را ارسال کنید:",
+        "📤 لطفاً **فایل زیرنویس انگلیسی (`.srt` / `.ass` / `.zip` / `.rar`)** را ارسال کنید:",
         reply_markup=skip_or_cancel_kb("sauto_en:skip"),
         parse_mode="Markdown"
     )
@@ -687,7 +712,7 @@ async def handle_sauto_en_upload(message: Message, state: FSMContext):
     await message.bot.download(message.document, destination=temp_dest)
 
     if temp_dest.suffix.lower() in SubtitleService.ARCHIVE_EXTENSIONS:
-        extracted = SubtitleService.extract_zip_archive(temp_dest, en_dir, remove_zip=True)
+        extracted = SubtitleService.extract_archive(temp_dest, en_dir, remove_archive=True)
         en_cands = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
     else:
         en_cands = [temp_dest]
@@ -739,20 +764,13 @@ async def _prompt_final_automation_choices_step(
     plans: list[AutomationPlan],
     en_note: str = ""
 ):
-    """
-    نمایش پنل نهایی اتوماسیون:
-    ۱. لیست تیک‌دار تمام پوشه‌های کیفیت خام (بدون سافت‌ساب) برای انتخاب اینکه کدام‌ها سافت‌ساب شوند
-    ۲. انتخاب ۳ کیفیت هاردساب فارسی SRT
-    ۳. سوییچ آپلود خودکار بعد از اتمام
-    """
-    # استخراج نام یکتای تمام پوشه‌های کیفیت خام موجود در این فصل/فیلم
     avail_soft_quals = []
     for p in plans:
         for st in p.softsub_targets:
             if st.quality_folder_name not in avail_soft_quals:
                 avail_soft_quals.append(st.quality_folder_name)
 
-    default_selected_soft = list(avail_soft_quals)  # پیش‌فرض همه کیفیت‌های خام تیک دارند
+    default_selected_soft = list(avail_soft_quals)
     default_srt_hb = ["1080p", "720p"]
     default_auto_upload = True
 
@@ -874,7 +892,6 @@ async def _execute_smart_automation_batch(
                 r_dir_en = AutomationService.compute_server_remote_dir_for_local_path(en_sub)
                 await queue_engine.add_task("upload", f"AutoUpload Sub [{r_dir_en}]: {en_sub.name}", CuteFTPService.upload_path, en_sub, r_dir_en)
 
-        # ۱. صف‌بندی سافت‌ساب‌ها فقط برای کیفیت‌های خامی که کاربر تیک زده است
         for st in plan.softsub_targets:
             if st.quality_folder_name not in selected_soft_set:
                 continue
@@ -892,7 +909,6 @@ async def _execute_smart_automation_batch(
             )
             scheduled_soft_lines.append(f"📎 `{st.output_dir.name}/{st.output_file.name}` (`{t_soft.task_id}`)")
 
-        # ۲. صف‌بندی هاردساب‌های فارسی از روی پوشه FullHD
         hb_targets = AutomationService.build_hardsub_targets(plan, selected_hb_srt)
         for ht in hb_targets:
             ht.output_dir.mkdir(parents=True, exist_ok=True)
@@ -946,11 +962,11 @@ async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSM
     await message.bot.download(message.document, destination=saved_p)
 
     sub_files: list[Path] = []
-    if ext_low == ".zip":
-        extracted = SubtitleService.extract_zip_archive(saved_p, temp_dir, remove_zip=True)
+    if ext_low in SubtitleService.ARCHIVE_EXTENSIONS:
+        extracted = SubtitleService.extract_archive(saved_p, temp_dir, remove_archive=True)
         sub_files = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
         if not sub_files:
-            return await message.answer("❌ فایل ZIP اکسترکت شد اما زیرنویسی داخل آن نبود.")
+            return await message.answer("❌ فایل فشرده اکسترکت شد اما زیرنویسی داخل آن نبود.")
     else:
         if ext_low == ".srt":
             SubtitleService.normalize_srt_utf8(saved_p)
@@ -976,11 +992,11 @@ async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSM
         "لطفاً پوشه فیلم یا فصل سریال مربوطه را از لیست زیر انتخاب کنید تا اتوماسیون کامل انجام شود:",
         parse_mode="Markdown"
     )
-    await _render_smart_auto_browser(message, state, workspace)
+    await _render_smart_auto_browser(message, state, workspace, page=0)
 
 
 # ==============================================================================
-# بخش دوم: حالت دستی (ترکیب سافت‌ساب، هاردساب فارسی و انکود movie.ass بدون زیرنویس)
+# بخش دوم: حالت دستی (همراه با صفحه‌بندی کامل پوشه‌ها و فایل‌ها)
 # ==============================================================================
 
 def _build_numbered_stem(pattern: str, orig_vid: Path, index_1based: int, total_count: int) -> str:
@@ -1090,7 +1106,12 @@ def _format_current_filenames_prompt(data: dict) -> str:
     return f"{mono_info}{rule_hint}"
 
 
-async def _render_sub_folder_browser(call: CallbackQuery, state: FSMContext, browse_dir: Path):
+async def _render_sub_folder_browser(
+    call: CallbackQuery,
+    state: FSMContext,
+    browse_dir: Path,
+    page: int = 0
+):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     AutomationService.ensure_workspace_root_categories()
     browse_dir = browse_dir.resolve()
@@ -1102,6 +1123,16 @@ async def _render_sub_folder_browser(call: CallbackQuery, state: FSMContext, bro
     )
     videos = DownloaderService.find_video_files(browse_dir, recursive=False)
 
+    combined: list[tuple[str, int, Path]] = (
+        [("dir", i, f) for i, f in enumerate(folders)]
+        + [("vid", i, v) for i, v in enumerate(videos)]
+    )
+    total_items = len(combined)
+    total_pages = max(1, math.ceil(total_items / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
+
     data = await state.get_data()
     selected_paths = set(data.get("selected_video_paths", []))
 
@@ -1109,33 +1140,36 @@ async def _render_sub_folder_browser(call: CallbackQuery, state: FSMContext, bro
         sub_browse_dir=str(browse_dir),
         sub_dir_folders=[str(f.resolve()) for f in folders],
         sub_dir_videos=[str(v.resolve()) for v in videos],
-        selected_video_paths=list(selected_paths)
+        selected_video_paths=list(selected_paths),
+        sub_browse_page=page
     )
 
     is_root = (browse_dir == workspace)
 
     full_lines = []
-    for idx, folder in enumerate(folders[:20]):
-        full_lines.append(f"`[{idx+1}]` 📁 `{folder.name}`")
-    for idx, vid in enumerate(videos[:25]):
-        is_sel = str(vid.resolve()) in selected_paths
-        mark = "✅" if is_sel else "⬜"
-        size_mb = vid.stat().st_size / (1024 * 1024)
-        full_lines.append(f"{mark} `[F{idx+1}]` 🎬 `{vid.name}` _({size_mb:.1f} MB)_")
+    for kind, orig_idx, path_obj in combined[start_idx:end_idx]:
+        if kind == "dir":
+            full_lines.append(f"`[{orig_idx+1}]` 📁 `{path_obj.name}`")
+        else:
+            is_sel = str(path_obj.resolve()) in selected_paths
+            mark = "✅" if is_sel else "⬜"
+            size_mb = path_obj.stat().st_size / (1024 * 1024)
+            full_lines.append(f"{mark} `[F{orig_idx+1}]` 🎬 `{path_obj.name}` _({size_mb:.1f} MB)_")
 
     details_block = "\n".join(full_lines) if full_lines else "_(در این مسیر پوشه یا فایل ویدئویی وجود ندارد)_"
+    page_badge = f" (صفحه {page + 1} از {total_pages} - کل: {total_items})" if total_pages > 1 else ""
 
     msg_text = (
-        f"🎬 **انتخاب دستی فیلم‌ها (برای سافت‌ساب / هاردساب فارسی / انکود با `movie.ass`)**\n"
+        f"🎬 **انتخاب دستی فیلم‌ها (سافت‌ساب / هاردساب فارسی / انکود با `movie.ass`){page_badge}**\n"
         f"📂 مسیر فعلی:\n`{browse_dir}`\n"
         f"✅ کل فایل‌های انتخاب شده: `{len(selected_paths)}` فایل\n\n"
-        f"📋 **نام کامل پوشه‌ها و فایل‌های این مسیر:**\n{details_block}\n\n"
+        f"📋 **نام کامل پوشه‌ها و فایل‌های این صفحه:**\n{details_block}\n\n"
         "فایل‌های مورد نظر را تیک بزنید و سپس دکمه **«➡️ ادامه و انتخاب نوع عملیات»** را بزنید:"
     )
 
     await call.message.edit_text(
         msg_text[:4000],
-        reply_markup=subtitle_folder_browser_kb(folders, videos, selected_paths, is_root),
+        reply_markup=subtitle_folder_browser_kb(folders, videos, selected_paths, is_root, page=page),
         parse_mode="Markdown"
     )
 
@@ -1144,8 +1178,16 @@ async def _render_sub_folder_browser(call: CallbackQuery, state: FSMContext, bro
 async def cb_sub_to_files_start(call: CallbackQuery, state: FSMContext):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     await state.set_state(SubtitleStates.selecting_target_videos)
-    await state.update_data(selected_video_paths=[], operation_mode=None, custom_output_dir=None)
-    await _render_sub_folder_browser(call, state, workspace)
+    await state.update_data(selected_video_paths=[], operation_mode=None, custom_output_dir=None, sub_browse_page=0)
+    await _render_sub_folder_browser(call, state, workspace, page=0)
+
+
+@router.callback_query(SubtitleStates.selecting_target_videos, F.data.startswith("subnav:page:"))
+async def cb_subnav_change_page(call: CallbackQuery, state: FSMContext):
+    page = int(call.data.split(":")[2])
+    data = await state.get_data()
+    curr = Path(data.get("sub_browse_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    await _render_sub_folder_browser(call, state, curr, page=page)
 
 
 @router.callback_query(SubtitleStates.selecting_target_videos, F.data.startswith("subnav:dir:"))
@@ -1154,7 +1196,7 @@ async def cb_subnav_open_dir(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     folders = data.get("sub_dir_folders", [])
     if idx < len(folders):
-        await _render_sub_folder_browser(call, state, Path(folders[idx]))
+        await _render_sub_folder_browser(call, state, Path(folders[idx]), page=0)
 
 
 @router.callback_query(SubtitleStates.selecting_target_videos, F.data == "subnav:up")
@@ -1163,7 +1205,7 @@ async def cb_subnav_up(call: CallbackQuery, state: FSMContext):
     curr = Path(data.get("sub_browse_dir", cfg.get("paths", "workspace_dir"))).resolve()
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     parent = curr.parent if curr != workspace else workspace
-    await _render_sub_folder_browser(call, state, parent)
+    await _render_sub_folder_browser(call, state, parent, page=0)
 
 
 @router.callback_query(SubtitleStates.selecting_target_videos, F.data.startswith("subnav:vid:"))
@@ -1183,7 +1225,7 @@ async def cb_subnav_toggle_video(call: CallbackQuery, state: FSMContext):
 
     await state.update_data(selected_video_paths=list(selected_paths))
     curr = Path(data.get("sub_browse_dir", cfg.get("paths", "workspace_dir")))
-    await _render_sub_folder_browser(call, state, curr)
+    await _render_sub_folder_browser(call, state, curr, page=data.get("sub_browse_page", 0))
 
 
 @router.callback_query(SubtitleStates.selecting_target_videos, F.data == "subnav:sel_all")
@@ -1201,15 +1243,11 @@ async def cb_subnav_select_all_in_folder(call: CallbackQuery, state: FSMContext)
 
     await state.update_data(selected_video_paths=list(selected_paths))
     curr = Path(data.get("sub_browse_dir", cfg.get("paths", "workspace_dir")))
-    await _render_sub_folder_browser(call, state, curr)
+    await _render_sub_folder_browser(call, state, curr, page=data.get("sub_browse_page", 0))
 
 
 @router.callback_query(SubtitleStates.selecting_target_videos, F.data == "mvact:proceed")
 async def cb_proceed_to_subs(call: CallbackQuery, state: FSMContext):
-    """
-    پس از انتخاب فیلم‌ها در بخش دستی، ابتدا نوع عملیات را بپرس:
-    تا اگر کاربر «انکود با movie.ass» را می‌خواهد، دیگر اصلاً سوالی راجع به آپلود زیرنویس از او پرسیده نشود!
-    """
     data = await state.get_data()
     sel = sorted(data.get("selected_video_paths", []), key=_natural_sort_key)
     if not sel:
@@ -1228,7 +1266,7 @@ async def cb_proceed_to_subs(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(SubtitleStates.waiting_manual_initial_mode, F.data.startswith("submode:"))
 async def cb_manual_initial_mode_chosen(call: CallbackQuery, state: FSMContext):
-    mode = call.data.split(":")[1]  # 'encode_ass' | 'softsub' | 'hardsub' | 'both'
+    mode = call.data.split(":")[1]
     await state.update_data(operation_mode=mode)
 
     if mode == "encode_ass":
@@ -1238,7 +1276,6 @@ async def cb_manual_initial_mode_chosen(call: CallbackQuery, state: FSMContext):
 
 
 async def _prompt_manual_encode_ass_qualities(call: CallbackQuery, state: FSMContext):
-    """پنل انتخاب کیفیت‌های انکود با movie.ass (بدون نیاز به زیرنویس)"""
     data = await state.get_data()
     target_videos = [Path(p) for p in data["target_videos"]]
     default_quals = ["1080p", "720p", "480p"]
@@ -1365,7 +1402,7 @@ async def _prompt_fa_subtitle_step(msg_or_call: Message | CallbackQuery, state: 
         f"📄 اولین فایل: `{first_video.name}`\n"
         f"📂 زیرنویس‌های موجود در پوشه فیلم / `srt`: **`{len(local_subs)}` فایل**\n\n"
         "🇮🇷 **مرحله ۱: زیرنویس فارسی**\n"
-        "می‌توانید زیرنویس فارسی را از داخل پوشه انتخاب کنید، یا فایل جدید (`.srt` / `.ass` / `.zip`) آپلود نمایید:"
+        "می‌توانید زیرنویس فارسی را از داخل پوشه انتخاب کنید، یا فایل جدید (`.srt` / `.ass` / `.zip` / `.rar`) آپلود نمایید:"
     )
     kb = subtitle_source_kb("fa", len(local_subs))
     if isinstance(msg_or_call, CallbackQuery):
@@ -1384,7 +1421,7 @@ async def _prompt_en_subtitle_step(msg_or_call: Message | CallbackQuery, state: 
     text = (
         f"{prefix_note}"
         "🇬🇧 **مرحله ۲: زیرنویس انگلیسی**\n"
-        "می‌توانید زیرنویس انگلیسی را از داخل پوشه انتخاب کنید، فایل جدید (`.srt` / `.ass` / `.zip`) بفرستید و یا رد کنید:"
+        "می‌توانید زیرنویس انگلیسی را از داخل پوشه انتخاب کنید، فایل جدید (`.srt` / `.ass` / `.zip` / `.rar`) بفرستید و یا رد کنید:"
     )
     kb = subtitle_source_kb("en", len(local_subs))
     if isinstance(msg_or_call, CallbackQuery):
@@ -1453,14 +1490,14 @@ async def cb_ask_upload_sub(call: CallbackQuery, state: FSMContext):
     if lang == "fa":
         await state.set_state(SubtitleStates.waiting_fa_subtitle)
         await call.message.edit_text(
-            "📤 لطفاً **فایل زیرنویس فارسی (`.srt` یا `.ass` یا فایل فشرده `.zip`)** را در چت ارسال کنید:",
+            "📤 لطفاً **فایل زیرنویس فارسی (`.srt` یا `.ass` یا فایل فشرده `.zip`/`.rar`)** را در چت ارسال کنید:",
             reply_markup=skip_or_cancel_kb("skip:fa_sub"),
             parse_mode="Markdown"
         )
     else:
         await state.set_state(SubtitleStates.waiting_en_subtitle)
         await call.message.edit_text(
-            "📤 لطفاً **فایل زیرنویس انگلیسی (`.srt` یا `.ass` یا فایل فشرده `.zip`)** را در چت ارسال کنید:",
+            "📤 لطفاً **فایل زیرنویس انگلیسی (`.srt` یا `.ass` یا فایل فشرده `.zip`/`.rar`)** را در چت ارسال کنید:",
             reply_markup=skip_or_cancel_kb("skip:en_sub"),
             parse_mode="Markdown"
         )
@@ -1483,17 +1520,17 @@ async def handle_fa_sub_upload(message: Message, state: FSMContext):
     await message.bot.download(message.document, destination=raw_dest)
 
     if raw_dest.suffix.lower() in SubtitleService.ARCHIVE_EXTENSIONS:
-        extracted = SubtitleService.extract_zip_archive(raw_dest, sub_dir, remove_zip=True)
+        extracted = SubtitleService.extract_archive(raw_dest, sub_dir, remove_archive=True)
         sub_files = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
         if not sub_files:
-            return await message.answer("❌ فایل ZIP اکسترکت شد اما هیچ فایل زیرنویسی داخل آن نبود! لطفاً فایل دیگری بفرستید:")
+            return await message.answer("❌ فایل فشرده اکسترکت شد اما هیچ فایل زیرنویسی داخل آن نبود! لطفاً فایل دیگری بفرستید:")
         if len(sub_files) == 1:
             await _after_fa_subtitle_chosen(message, state, sub_files[0])
             return
         await state.update_data(local_sub_candidates=[str(p) for p in sub_files])
         sub_lines = [f"`[{i+1}]` 📄 `{p.name}`" for i, p in enumerate(sub_files[:20])]
         return await message.answer(
-            f"📦 فایل ZIP اکسترکت شد و **`{len(sub_files)}` فایل زیرنویس** در آن پیدا شد:\n"
+            f"📦 فایل فشرده اکسترکت شد و **`{len(sub_files)}` فایل زیرنویس** در آن پیدا شد:\n"
             + "\n".join(sub_lines)
             + "\n\nکدام فایل به عنوان **زیرنویس فارسی** استفاده شود؟",
             reply_markup=subtitle_file_found_kb("fa", sub_files),
@@ -1545,15 +1582,15 @@ async def handle_en_sub_upload(message: Message, state: FSMContext):
     await message.bot.download(message.document, destination=en_dest)
 
     if en_dest.suffix.lower() in SubtitleService.ARCHIVE_EXTENSIONS:
-        extracted = SubtitleService.extract_zip_archive(en_dest, sub_dir, remove_zip=True)
+        extracted = SubtitleService.extract_archive(en_dest, sub_dir, remove_archive=True)
         sub_files = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
         if not sub_files:
-            return await message.answer("❌ فایل ZIP اکسترکت شد اما هیچ فایل زیرنویسی داخل آن نبود! دوباره بفرستید:")
+            return await message.answer("❌ فایل فشرده اکسترکت شد اما هیچ فایل زیرنویسی داخل آن نبود! دوباره بفرستید:")
         if len(sub_files) > 1:
             await state.update_data(local_sub_candidates=[str(p) for p in sub_files])
             sub_lines = [f"`[{i+1}]` 📄 `{p.name}`" for i, p in enumerate(sub_files[:20])]
             return await message.answer(
-                f"📦 فایل ZIP اکسترکت شد و **`{len(sub_files)}` فایل زیرنویس** در آن پیدا شد:\n"
+                f"📦 فایل فشرده اکسترکت شد و **`{len(sub_files)}` فایل زیرنویس** در آن پیدا شد:\n"
                 + "\n".join(sub_lines)
                 + "\n\nکدام فایل به عنوان **زیرنویس انگلیسی** استفاده شود؟",
                 reply_markup=subtitle_file_found_kb("en", sub_files),
@@ -1687,7 +1724,12 @@ async def cb_select_preset_for_jobs(call: CallbackQuery, state: FSMContext):
     await _ask_output_destination_choice(call, state)
 
 
-async def _render_output_dest_browser(call_or_msg: CallbackQuery | Message, state: FSMContext, current_dir: Path):
+async def _render_output_dest_browser(
+    call_or_msg: CallbackQuery | Message,
+    state: FSMContext,
+    current_dir: Path,
+    page: int = 0
+):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     current_dir = current_dir.resolve()
     current_dir.mkdir(parents=True, exist_ok=True)
@@ -1696,24 +1738,35 @@ async def _render_output_dest_browser(call_or_msg: CallbackQuery | Message, stat
         [p for p in current_dir.iterdir() if p.is_dir() and not p.name.startswith("_") and p.name != "browser_profile"],
         key=lambda x: x.name.lower()
     )
+    total_folders = len(subfolders)
+    total_pages = max(1, math.ceil(total_folders / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
+
     await state.set_state(SubtitleStates.browsing_output_dest_dir)
     await state.update_data(
         dest_browser_curr_dir=str(current_dir),
-        dest_browser_subfolders=[str(f.resolve()) for f in subfolders]
+        dest_browser_subfolders=[str(f.resolve()) for f in subfolders],
+        dest_browser_page=page
     )
 
     is_root = (current_dir == workspace)
-    folder_lines = [f"`[{i+1}]` 📁 `{f.name}`" for i, f in enumerate(subfolders[:22])]
+    folder_lines = [
+        f"`[{i+1}]` 📁 `{subfolders[i].name}`"
+        for i in range(start_idx, min(end_idx, total_folders))
+    ]
     folders_block = "\n".join(folder_lines) if folder_lines else "_(زیرپوشه‌ای در این مسیر وجود ندارد)_"
+    page_badge = f" (صفحه {page + 1} از {total_pages})" if total_pages > 1 else ""
 
     text = (
-        "📁 **انتخاب پوشه مقصد خروجی (مرورگر پوشه و زیرپوشه)**\n\n"
+        f"📁 **انتخاب پوشه مقصد خروجی{page_badge}**\n\n"
         f"📍 **مسیر فعلی باز شده:**\n`{current_dir}`\n\n"
-        f"📂 **زیرپوشه‌های موجود در این مسیر:**\n{folders_block}\n\n"
+        f"📂 **زیرپوشه‌های این صفحه:**\n{folders_block}\n\n"
         "• برای ذخیره در همین مسیر فعلی، دکمه **«✅ ذخیره در همین پوشه»** را بزنید.\n"
         "• برای رفتن به زیرپوشه‌های بعدی، روی نام زیرپوشه کلیک کنید و یا در همینجا پوشه جدید بسازید:"
     )
-    kb = output_dest_tree_browser_kb(subfolders, current_dir, is_root)
+    kb = output_dest_tree_browser_kb(subfolders, current_dir, is_root, page=page)
 
     if isinstance(call_or_msg, CallbackQuery):
         await call_or_msg.message.edit_text(text[:4000], reply_markup=kb, parse_mode="Markdown")
@@ -1739,7 +1792,15 @@ async def cb_outdest_same_dir(call: CallbackQuery, state: FSMContext):
 @router.callback_query(SubtitleStates.waiting_output_dest_choice, F.data == "outdest:browse")
 async def cb_outdest_start_browse(call: CallbackQuery, state: FSMContext):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-    await _render_output_dest_browser(call, state, workspace)
+    await _render_output_dest_browser(call, state, workspace, page=0)
+
+
+@router.callback_query(SubtitleStates.browsing_output_dest_dir, F.data.startswith("destnav:page:"))
+async def cb_destnav_change_page(call: CallbackQuery, state: FSMContext):
+    page = int(call.data.split(":")[2])
+    data = await state.get_data()
+    curr = Path(data.get("dest_browser_curr_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    await _render_output_dest_browser(call, state, curr, page=page)
 
 
 @router.callback_query(SubtitleStates.browsing_output_dest_dir, F.data.startswith("destnav:open:"))
@@ -1748,7 +1809,7 @@ async def cb_destnav_open_subfolder(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     subfolders = data.get("dest_browser_subfolders", [])
     if idx < len(subfolders):
-        await _render_output_dest_browser(call, state, Path(subfolders[idx]))
+        await _render_output_dest_browser(call, state, Path(subfolders[idx]), page=0)
 
 
 @router.callback_query(SubtitleStates.browsing_output_dest_dir, F.data == "destnav:up")
@@ -1757,7 +1818,7 @@ async def cb_destnav_up(call: CallbackQuery, state: FSMContext):
     curr = Path(data.get("dest_browser_curr_dir", cfg.get("paths", "workspace_dir"))).resolve()
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     parent = curr.parent if curr != workspace else workspace
-    await _render_output_dest_browser(call, state, parent)
+    await _render_output_dest_browser(call, state, parent, page=0)
 
 
 @router.callback_query(SubtitleStates.browsing_output_dest_dir, F.data == "destnav:select_here")
@@ -1788,7 +1849,7 @@ async def cb_destnav_mkdir_here(call: CallbackQuery, state: FSMContext):
 async def cb_outdest_browse_resume(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     curr_dir = Path(data.get("dest_browser_curr_dir", cfg.get("paths", "workspace_dir")))
-    await _render_output_dest_browser(call, state, curr_dir)
+    await _render_output_dest_browser(call, state, curr_dir, page=data.get("dest_browser_page", 0))
 
 
 @router.message(SubtitleStates.waiting_new_dest_subfolder_name)
@@ -1803,7 +1864,7 @@ async def handle_new_dest_subfolder_name(message: Message, state: FSMContext):
     new_dir.mkdir(parents=True, exist_ok=True)
 
     await message.answer(f"✅ پوشه `{new_dir.name}` ساخته شد و وارد آن شدید!", parse_mode="Markdown")
-    await _render_output_dest_browser(message, state, new_dir)
+    await _render_output_dest_browser(message, state, new_dir, page=0)
 
 
 async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> list[str]:

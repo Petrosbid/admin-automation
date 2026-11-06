@@ -1,6 +1,7 @@
+import asyncio
+import math
 import re
 import shutil
-import asyncio
 from pathlib import Path
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -15,9 +16,11 @@ from services.downloader_service import DownloaderService
 from services.subtitle_service import SubtitleService
 from services.cuteftp_service import CuteFTPService
 from services.monitor_service import monitor_service
+from services.automation_service import AutomationService
 from bot.keyboards import (
-    main_menu_kb, monitor_menu_kb, folder_structure_choice_kb,
-    target_folders_kb, file_browser_kb, cuteftp_destination_kb
+    BROWSER_PAGE_SIZE, main_menu_kb, monitor_menu_kb,
+    folder_structure_choice_kb, target_folders_kb,
+    file_browser_kb, cuteftp_destination_kb
 )
 
 router = Router()
@@ -57,14 +60,8 @@ def _natural_sort_key(path_str: str) -> list:
 
 
 def _build_renamed_filename(pattern: str, orig_path: Path, index_1based: int, total_count: int) -> str:
-    """
-    قانون تغییر نام تکی و گروهی فایل‌ها:
-    - اگر کاربر در الگو علامت '*' گذاشته باشد -> جایگزینی '*' با 01, 02, 03, ...
-    - اگر چند فایل باشد و کاربر '*' نگذارد -> قرار دادن 01, 02, 03 در انتهای نام دقیقاً قبل از پسوند فایل
-    - حفظ خودکار پسوند اصلی فایل
-    """
-    orig_ext = orig_path.suffix  # مثلاً .mkv یا .srt
-    clean_pat = re.sub(r'[<>:"/\\|?]', "", pattern).strip()  # حفظ کاراکتر '*'
+    orig_ext = orig_path.suffix
+    clean_pat = re.sub(r'[<>:"/\\|?]', "", pattern).strip()
 
     if orig_ext and clean_pat.lower().endswith(orig_ext.lower()):
         stem_pat = clean_pat[:-len(orig_ext)]
@@ -93,6 +90,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         f"🎬 **پنل اتوماسیون مدیا و آپلودر ({brand})**\n\n"
         f"🔥 ظرفیت هاردساب همزمان HandBrake: **`{hb_workers}` پردازش موازی**\n"
+        "📦 پشتیبانی کامل از اکسترکت فایل‌های `.zip` و `.rar` و صفحه‌بندی دایرکتوری‌ها\n"
         "⚙️ برای تغییر مستقیم تنظیمات از دستور `/settings` استفاده کنید.",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
@@ -140,6 +138,24 @@ def _section_keys_kb(section: str) -> InlineKeyboardMarkup:
                     callback_data=f"cfgkey:{section}:{k}"
                 )
             )
+
+    if section == "monitor":
+        sites_cfg = monitor_service.get_all_sites_config()
+        for s_key, s_info in sites_cfg.items():
+            status_icon = "🟢 فعال" if s_info["enabled"] else "🔴 غیرفعال"
+            short_url = s_info["url"].replace("https://", "").replace("http://", "").rstrip("/")
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"{status_icon} | {s_info['title']}",
+                    callback_data=f"monsite:toggle:{s_key}"
+                ),
+                InlineKeyboardButton(
+                    text=f"🔗 تغییر لینک ({short_url[:18]})",
+                    callback_data=f"monsite:url:{s_key}"
+                )
+            )
+        builder.row(InlineKeyboardButton(text="📡 بازگشت به پنل مانیتورینگ", callback_data="menu:monitor"))
+
     builder.row(InlineKeyboardButton(text="🔙 بازگشت به دسته‌بندی تنظیمات", callback_data="menu:settings"))
     return builder.as_markup()
 
@@ -195,145 +211,13 @@ async def cb_open_config_section(call: CallbackQuery, state: FSMContext):
                 continue
             lines.append(f"• `{k}` = `{v}`")
 
-    lines.append("\n👇 برای تغییر هر مورد، روی دکمه آن کلیک کنید:")
-    await call.message.edit_text(
-        "\n".join(lines),
-        reply_markup=_section_keys_kb(section),
-        parse_mode="Markdown"
-    )
-
-
-@router.callback_query(F.data.startswith("cfgkey:"))
-async def cb_edit_config_key(call: CallbackQuery, state: FSMContext):
-    _, section, key = call.data.split(":", 2)
-    current_val = cfg.get(section, key)
-
-    if isinstance(current_val, bool):
-        new_val = not current_val
-        cfg.set_value(section, key, new_val)
-        await call.answer(f"✅ مقدار {key} به {new_val} تغییر یافت!")
-        return await cb_open_config_section(call, state)
-
-    await state.update_data(cfg_section=section, cfg_key=key)
-    await state.set_state(MainStates.waiting_new_config_value)
-
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="🔙 انصراف و بازگشت", callback_data=f"cfgsec:{section}"))
-
-    await call.message.edit_text(
-        f"✏️ **ویرایش تنظیمات `{section}.{key}`**\n\n"
-        f"🔹 مقدار فعلی (برای کپی لمس کنید):\n`{current_val}`\n\n"
-        "لطفاً **مقدار جدید** را در چت ارسال کنید:",
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown"
-    )
-
-
-@router.message(MainStates.waiting_new_config_value)
-async def handle_new_config_value(message: Message, state: FSMContext):
-    data = await state.get_data()
-    section = data["cfg_section"]
-    key = data["cfg_key"]
-    old_val = cfg.get(section, key)
-
-    try:
-        new_val = _parse_typed_value(message.text or "", old_val)
-    except ValueError:
-        return await message.answer(
-            f"⚠️ فرمت مقدار وارد شده صحیح نیست! مقدار قبلی (`{old_val}`) عددی بوده است. لطفاً یک عدد معتبر بفرستید:",
-            parse_mode="Markdown"
-        )
-
-    cfg.set_value(section, key, new_val)
-    await state.clear()
-
-    await message.answer(
-        f"✅ مقدار `{section}.{key}` با موفقیت به:\n`{new_val}`\nتغییر یافت و در `config.yaml` ذخیره شد!",
-        reply_markup=_section_keys_kb(section),
-        parse_mode="Markdown"
-    )
-
-
-# ==================== بخش مانیتورینگ ۵ دقیقه‌ای سایت‌ها و حل کپچا ====================
-class MainStates(StatesGroup):
-    waiting_new_folder_name = State()
-    waiting_new_folder_type = State()
-    waiting_target_folder_sub_file = State()
-    waiting_custom_cuteftp_path = State()
-    waiting_new_fav_cuteftp_path = State()
-    waiting_batch_rename_pattern = State()
-    waiting_rename_dir = State()
-    waiting_new_config_value = State()
-    waiting_new_site_url = State()
-
-
-# ==================== بخش تنظیمات تعاملی (/settings) + مدیریت لینک و وضعیت تک‌تک سایت‌ها ====================
-def _sections_kb() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    for sec_key, label in SECTION_LABELS.items():
-        if sec_key in cfg.data:
-            builder.row(InlineKeyboardButton(text=label, callback_data=f"cfgsec:{sec_key}"))
-    builder.row(InlineKeyboardButton(text="🔙 بازگشت به منوی اصلی", callback_data="menu:home"))
-    return builder.as_markup()
-
-
-def _section_keys_kb(section: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    sec_data = cfg.get(section) or {}
-    if isinstance(sec_data, dict):
-        for k, v in sec_data.items():
-            if isinstance(v, (dict, list)):
-                continue
-            val_preview = "🟢 True" if v is True else ("🔴 False" if v is False else str(v)[:28])
-            builder.row(
-                InlineKeyboardButton(
-                    text=f"✏️ {k}: {val_preview}",
-                    callback_data=f"cfgkey:{section}:{k}"
-                )
-            )
-
-    # اگر بخش مانیتورینگ انتخاب شده است، دکمه‌های فعال/غیرفعال کردن و تغییر لینک تک‌تک سایت‌ها را اضافه کن
-    if section == "monitor":
-        sites_cfg = monitor_service.get_all_sites_config()
-        for s_key, s_info in sites_cfg.items():
-            status_icon = "🟢 فعال" if s_info["enabled"] else "🔴 غیرفعال"
-            short_url = s_info["url"].replace("https://", "").replace("http://", "").rstrip("/")
-            builder.row(
-                InlineKeyboardButton(
-                    text=f"{status_icon} | {s_info['title']}",
-                    callback_data=f"monsite:toggle:{s_key}"
-                ),
-                InlineKeyboardButton(
-                    text=f"🔗 تغییر لینک ({short_url[:18]})",
-                    callback_data=f"monsite:url:{s_key}"
-                )
-            )
-        builder.row(InlineKeyboardButton(text="📡 بازگشت به پنل مانیتورینگ", callback_data="menu:monitor"))
-
-    builder.row(InlineKeyboardButton(text="🔙 بازگشت به دسته‌بندی تنظیمات", callback_data="menu:settings"))
-    return builder.as_markup()
-
-
-@router.callback_query(F.data.startswith("cfgsec:"))
-async def cb_open_config_section(call: CallbackQuery, state: FSMContext):
-    section = call.data.split(":", 1)[1]
-    sec_data = cfg.get(section) or {}
-    label = SECTION_LABELS.get(section, section)
-
-    lines = [f"⚙️ **بخش: {label}**\n"]
-    if isinstance(sec_data, dict):
-        for k, v in sec_data.items():
-            if isinstance(v, (dict, list)):
-                continue
-            lines.append(f"• `{k}` = `{v}`")
-
     if section == "monitor":
         lines.append("\n🌐 **وضعیت و آدرس فعلی تک‌تک سایت‌های مانیتورینگ:**")
         sites_cfg = monitor_service.get_all_sites_config()
         for s_key, s_info in sites_cfg.items():
             st_badge = "🟢 فعال" if s_info["enabled"] else "🔴 غیرفعال"
             lines.append(f"• **{s_info['title']}** ({st_badge}):\n  `{s_info['url']}`")
-        lines.append("\n👇 برای **فعال/غیرفعال کردن هر سایت** یا **وارد کردن لینک جدید** (مثلاً آدرس جدید دیجی‌موویز)، روی دکمه مربوطه کلیک کنید:")
+        lines.append("\n👇 برای **فعال/غیرفعال کردن هر سایت** یا **وارد کردن لینک جدید**، روی دکمه مربوطه کلیک کنید:")
     else:
         lines.append("\n👇 برای تغییر هر مورد، روی دکمه آن کلیک کنید:")
 
@@ -398,6 +282,59 @@ async def handle_new_site_url_input(message: Message, state: FSMContext):
     )
 
 
+@router.callback_query(F.data.startswith("cfgkey:"))
+async def cb_edit_config_key(call: CallbackQuery, state: FSMContext):
+    _, section, key = call.data.split(":", 2)
+    current_val = cfg.get(section, key)
+
+    if isinstance(current_val, bool):
+        new_val = not current_val
+        cfg.set_value(section, key, new_val)
+        await call.answer(f"✅ مقدار {key} به {new_val} تغییر یافت!")
+        call.data = f"cfgsec:{section}"
+        return await cb_open_config_section(call, state)
+
+    await state.update_data(cfg_section=section, cfg_key=key)
+    await state.set_state(MainStates.waiting_new_config_value)
+
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔙 انصراف و بازگشت", callback_data=f"cfgsec:{section}"))
+
+    await call.message.edit_text(
+        f"✏️ **ویرایش تنظیمات `{section}.{key}`**\n\n"
+        f"🔹 مقدار فعلی (برای کپی لمس کنید):\n`{current_val}`\n\n"
+        "لطفاً **مقدار جدید** را در چت ارسال کنید:",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+
+
+@router.message(MainStates.waiting_new_config_value)
+async def handle_new_config_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    section = data["cfg_section"]
+    key = data["cfg_key"]
+    old_val = cfg.get(section, key)
+
+    try:
+        new_val = _parse_typed_value(message.text or "", old_val)
+    except ValueError:
+        return await message.answer(
+            f"⚠️ فرمت مقدار وارد شده صحیح نیست! مقدار قبلی (`{old_val}`) عددی بوده است. لطفاً یک عدد معتبر بفرستید:",
+            parse_mode="Markdown"
+        )
+
+    cfg.set_value(section, key, new_val)
+    await state.clear()
+
+    await message.answer(
+        f"✅ مقدار `{section}.{key}` با موفقیت به:\n`{new_val}`\nتغییر یافت و در `config.yaml` ذخیره شد!",
+        reply_markup=_section_keys_kb(section),
+        parse_mode="Markdown"
+    )
+
+
+# ==================== بخش مانیتورینگ ۵ دقیقه‌ای سایت‌ها ====================
 @router.callback_query(F.data == "menu:monitor")
 async def cb_monitor_menu(call: CallbackQuery):
     enabled = bool(cfg.get("monitor", "enabled", True))
@@ -415,10 +352,11 @@ async def cb_monitor_menu(call: CallbackQuery):
         f"🌐 **سایت‌های تحت رصد:**\n{sites_block}\n\n"
         f"⏱ بازه رفرش خودکار: هر `{interval // 60}` دقیقه یک‌بار\n"
         f"📊 وضعیت کلی مانیتورینگ: {'🟢 فعال' if enabled else '🔴 غیرفعال'}\n\n"
-        "💡 برای تغییر آدرس سایت‌ها (مثل لینک جدید دیجی‌موویز) یا خاموش/روشن کردن هر سایت، دکمه **«⚙️ مدیریت لینک...»** را بزنید.",
+        "💡 برای تغییر آدرس سایت‌ها یا خاموش/روشن کردن هر سایت، دکمه **«⚙️ مدیریت لینک...»** را بزنید.",
         reply_markup=monitor_menu_kb(enabled),
         parse_mode="Markdown"
     )
+
 
 @router.callback_query(F.data == "mon:toggle")
 async def cb_monitor_toggle(call: CallbackQuery):
@@ -431,7 +369,7 @@ async def cb_monitor_toggle(call: CallbackQuery):
 @router.callback_query(F.data == "mon:open_captcha")
 async def cb_monitor_open_captcha(call: CallbackQuery):
     await call.message.edit_text(
-        "⏳ در حال باز کردن پنجره مرورگر روی دسکتاپ ویندوز سرور برای هر ۵ سایت...",
+        "⏳ در حال باز کردن پنجره مرورگر روی دسکتاپ ویندوز سرور...",
         parse_mode="Markdown"
     )
     msg = await monitor_service.open_captcha_tabs_for_admin()
@@ -441,15 +379,15 @@ async def cb_monitor_open_captcha(call: CallbackQuery):
 
 @router.callback_query(F.data == "mon:check_now")
 async def cb_monitor_check_now(call: CallbackQuery):
-    await call.message.edit_text("⏳ در حال رفرش و بررسی فوری هر ۵ سایت...", parse_mode="Markdown")
+    await call.message.edit_text("⏳ در حال رفرش و بررسی فوری سایت‌های فعال...", parse_mode="Markdown")
     counts = await monitor_service.check_all_sites_once(call.bot, notify_on_first_seed=True)
     total_new = sum(counts.values())
     enabled = bool(cfg.get("monitor", "enabled", True))
     await call.message.edit_text(
         f"✅ **بررسی فوری انجام شد!**\n\n"
-        f"🔹 Pahe.ink: `{counts.get('pahe', 0)}`\n"
-        f"🔹 PSA.wf: `{counts.get('psa', 0)}`\n"
-        f"🔹 YTS.gg: `{counts.get('yts', 0)}`\n"
+        f"🔹 Pahe: `{counts.get('pahe', 0)}`\n"
+        f"🔹 PSA: `{counts.get('psa', 0)}`\n"
+        f"🔹 YTS: `{counts.get('yts', 0)}`\n"
         f"🔹 Digimoviez: `{counts.get('digimovie', 0)}`\n"
         f"🔹 AvaMovie: `{counts.get('avamovie', 0)}`\n\n"
         f"مجموع پست‌های جدید ارسال شده: `{total_new}`",
@@ -474,20 +412,21 @@ async def cb_monitor_latest_site(call: CallbackQuery):
             parse_mode="Markdown"
         )
     except Exception as e:
-        await monitor_service.send_error_notification(call.bot, site_key, str(e))
+        await monitor_service.send_error_notification(call.bot, site_key, str(e), force=True)
         await call.message.edit_text(f"❌ خطا در ارتباط با سایت:\n`{e}`", reply_markup=monitor_menu_kb(True), parse_mode="Markdown")
 
 
-# ==================== ساخت پوشه جدید در Workspace بدون دادن لینک ====================
+# ==================== ساخت پوشه جدید در Workspace ====================
 @router.callback_query(F.data == "menu:create_folder")
 async def cb_create_folder_menu(call: CallbackQuery, state: FSMContext):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    AutomationService.ensure_workspace_root_categories()
     await state.update_data(mkdir_parent=str(workspace))
     await state.set_state(MainStates.waiting_new_folder_name)
     await call.message.edit_text(
-        f"📁 **ساخت پوشه جدید در Workspace (بدون لینک دانلود)**\n"
+        f"📁 **ساخت پوشه جدید در Workspace**\n"
         f"مسیر پایه: `{workspace}`\n\n"
-        "✏️ لطفاً **نام پوشه جدید** (نام فیلم یا سریال) را ارسال کنید:",
+        "✏️ لطفاً **نام فیلم، سریال یا انیمه** را ارسال کنید:",
         parse_mode="Markdown"
     )
 
@@ -512,12 +451,12 @@ async def cb_quick_mkdir_from_monitor(call: CallbackQuery, state: FSMContext):
     await state.update_data(target_sub_dir=str(folders["sub"]), target_base_dir=str(folders["base"]))
 
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="📥 آپلود زیرنویس در همین پوشه", callback_data="qsub:now"))
+    kb.row(InlineKeyboardButton(text="📥 آپلود زیرنویس / ZIP / RAR در همین پوشه", callback_data="qsub:now"))
     kb.row(InlineKeyboardButton(text="📂 باز کردن در فایل‌منیجر", callback_data="menu:file_mgr"))
     kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
 
     await call.message.answer(
-        f"✅ پوشه `{folders['base'].name}` به همراه زیرپوشه‌های `softsub`، `hardsub` و `sub` در Workspace ساخته شد!\n\n"
+        f"✅ پوشه `{folders['base'].name}` در Workspace ساخته شد!\n\n"
         f"📂 مسیر: `{folders['base']}`",
         reply_markup=kb.as_markup(),
         parse_mode="Markdown"
@@ -528,7 +467,7 @@ async def cb_quick_mkdir_from_monitor(call: CallbackQuery, state: FSMContext):
 @router.message(MainStates.waiting_new_folder_name)
 async def handle_new_folder_name(message: Message, state: FSMContext):
     raw_name = (message.text or "").strip()
-    safe_name = re.sub(r'[<>:"/\\|?*]', "", raw_name).strip().replace(" ", "_")
+    safe_name = re.sub(r'[<>:"/\\|?*]', "", raw_name).strip().replace(" ", ".")
     if not safe_name:
         return await message.answer("⚠️ نام پوشه معتبر نیست. دوباره ارسال کنید:")
 
@@ -544,16 +483,15 @@ async def handle_new_folder_name(message: Message, state: FSMContext):
 
 @router.callback_query(MainStates.waiting_new_folder_type, F.data.startswith("mktype:"))
 async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
-    mk_type = call.data.split(":")[1]  # movie | series | anime | empty
+    mk_type = call.data.split(":")[1]
     data = await state.get_data()
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     parent_dir = Path(data.get("mkdir_parent", str(workspace))).resolve()
     folder_name = data["new_folder_name"].replace("_", ".")
 
-    from services.automation_service import AutomationService
     cats = AutomationService.ensure_workspace_root_categories()
 
-    if mk_type == "movie":
+    if mk_type in ("movie", "standard"):
         base_parent = cats["Movies"] if parent_dir == workspace else parent_dir
         new_dir = base_parent / folder_name
         AutomationService.create_movie_structure(new_dir)
@@ -578,7 +516,7 @@ async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
 
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="🚀 اجرای اتوماسیون هوشمند در این پوشه", callback_data="fact:run_smart_auto_here"))
-    kb.row(InlineKeyboardButton(text="📥 آپلود زیرنویس / ZIP در این پوشه", callback_data="qsub:now"))
+    kb.row(InlineKeyboardButton(text="📥 آپلود زیرنویس / ZIP / RAR در این پوشه", callback_data="qsub:now"))
     kb.row(InlineKeyboardButton(text="📂 مشاهده پوشه در فایل‌منیجر", callback_data="menu:file_mgr"))
     kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
 
@@ -590,25 +528,46 @@ async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
         parse_mode="Markdown"
     )
 
-# ==================== آپلود زیرنویس در پوشه هدف ====================
-@router.callback_query(F.data == "menu:upload_sub_target")
-async def cb_upload_sub_select_folder(call: CallbackQuery, state: FSMContext):
+
+# ==================== آپلود زیرنویس یا فایل فشرده در پوشه هدف (مجهز به صفحه‌بندی) ====================
+async def _render_target_sub_folders_page(call: CallbackQuery, state: FSMContext, page: int = 0):
     workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
     folders = DownloaderService.list_workspace_folders()
-
     if not folders:
-        return await call.answer("⚠️ هنوز هیچ پوشه‌ای در Workspace وجود ندارد! ابتدا یک پوشه بسازید.", show_alert=True)
+        return await call.answer("⚠️ هنوز هیچ پوشه‌ای در Workspace وجود ندارد!", show_alert=True)
 
-    await state.update_data(available_target_folders=[str(f) for f in folders])
-    full_list_text = "\n".join([f"`[{i+1}]` 📁 `{f.name}`" for i, f in enumerate(folders[:25])])
+    total_folders = len(folders)
+    total_pages = max(1, math.ceil(total_folders / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
+
+    await state.update_data(available_target_folders=[str(f) for f in folders], tsub_page=page)
+    full_list_text = "\n".join([
+        f"`[{i+1}]` 📁 `{folders[i].name}`"
+        for i in range(start_idx, min(end_idx, total_folders))
+    ])
+    page_badge = f" (صفحه {page + 1} از {total_pages})" if total_pages > 1 else ""
+
     await call.message.edit_text(
-        "📥 **آپلود زیرنویس در پوشه هدف**\n\n"
-        "📋 **نام کامل پوشه‌ها:**\n"
+        f"📥 **آپلود زیرنویس یا فایل فشرده در پوشه هدف{page_badge}**\n\n"
+        "📋 **نام کامل پوشه‌های این صفحه:**\n"
         f"{full_list_text}\n\n"
         "پوشه مورد نظر را بر اساس شماره انتخاب کنید:",
-        reply_markup=target_folders_kb(folders, workspace),
+        reply_markup=target_folders_kb(folders, workspace, page=page),
         parse_mode="Markdown"
     )
+
+
+@router.callback_query(F.data == "menu:upload_sub_target")
+async def cb_upload_sub_select_folder(call: CallbackQuery, state: FSMContext):
+    await _render_target_sub_folders_page(call, state, page=0)
+
+
+@router.callback_query(F.data.startswith("tsubpage:"))
+async def cb_upload_sub_change_page(call: CallbackQuery, state: FSMContext):
+    page = int(call.data.split(":")[1])
+    await _render_target_sub_folders_page(call, state, page=page)
 
 
 @router.callback_query(F.data.startswith("tsubdir:"))
@@ -617,12 +576,15 @@ async def cb_target_folder_chosen(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     chosen_folder = Path(data["available_target_folders"][idx])
 
-    dest_dir = (chosen_folder / "sub") if (chosen_folder / "sub").exists() else chosen_folder
+    dest_dir = (chosen_folder / "srt") if (chosen_folder / "srt").exists() else (
+        (chosen_folder / "sub") if (chosen_folder / "sub").exists() else chosen_folder
+    )
     await state.update_data(target_sub_dir=str(dest_dir))
     await state.set_state(MainStates.waiting_target_folder_sub_file)
     await call.message.edit_text(
         f"📂 پوشه هدف انتخاب شد:\n`{dest_dir}`\n\n"
-        "📎 لطفاً **فایل زیرنویس (`.srt` یا `.ass`)** را ارسال کنید تا در پوشه هدف ذخیره شود:",
+        "📎 لطفاً **فایل زیرنویس (`.srt` / `.ass`) یا فایل فشرده (`.zip` / `.rar` / `.7z`)** را ارسال کنید\n"
+        "*(فایل‌های فشرده به صورت خودکار در همین پوشه اکسترکت می‌شوند)*:",
         parse_mode="Markdown"
     )
 
@@ -634,13 +596,13 @@ async def cb_upload_sub_in_active_dir(call: CallbackQuery, state: FSMContext):
         dest_dir = Path(data["target_sub_dir"])
     else:
         curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
-        dest_dir = (curr / "sub") if (curr / "sub").exists() else curr
+        dest_dir = (curr / "srt") if (curr / "srt").exists() else curr
 
     await state.update_data(target_sub_dir=str(dest_dir))
     await state.set_state(MainStates.waiting_target_folder_sub_file)
     await call.message.edit_text(
         f"📂 مسیر ذخیره زیرنویس:\n`{dest_dir}`\n\n"
-        "📎 لطفاً **فایل زیرنویس (`.srt` یا `.ass`)** را ارسال کنید تا در این پوشه ذخیره شود:",
+        "📎 لطفاً **فایل زیرنویس (`.srt` / `.ass`) یا فایل فشرده (`.zip` / `.rar` / `.7z`)** را ارسال کنید:",
         parse_mode="Markdown"
     )
 
@@ -685,9 +647,157 @@ async def handle_target_folder_sub_file(message: Message, state: FSMContext):
     )
 
 
+# ==================== ۵. فایل‌منیجر سرور (مجهز به صفحه‌بندی کامل) ====================
+async def render_directory(
+    call_or_msg: CallbackQuery | Message,
+    state: FSMContext,
+    current_dir: Path,
+    page: int = 0
+):
+    root_dir = Path(cfg.get("paths", "workspace_dir")).resolve()
+    AutomationService.ensure_workspace_root_categories()
+    current_dir = current_dir.resolve()
+    current_dir.mkdir(parents=True, exist_ok=True)
+    items = sorted(
+        [p for p in current_dir.iterdir() if p.name != "browser_profile" and not p.name.startswith("_")],
+        key=lambda p: (not p.is_dir(), p.name.lower())
+    )
+
+    total_items = len(items)
+    total_pages = max(1, math.ceil(total_items / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
+
+    data = await state.get_data()
+    selected_files = {p for p in data.get("fm_selected_files", []) if Path(p).exists()}
+
+    await state.update_data(
+        current_dir=str(current_dir),
+        dir_items=[str(p.resolve()) for p in items],
+        fm_selected_files=list(selected_files),
+        fm_page=page
+    )
+    is_root = (current_dir == root_dir)
+
+    item_lines = []
+    for idx in range(start_idx, min(end_idx, total_items)):
+        p = items[idx]
+        if p.is_dir():
+            item_lines.append(f"`[{idx+1}]` 📁 `{p.name}`")
+        else:
+            is_sel = str(p.resolve()) in selected_files
+            mark = "✅ " if is_sel else ""
+            size_mb = p.stat().st_size / (1024 * 1024)
+            ext_low = p.suffix.lower()
+            icon = "🎬" if ext_low in [".mkv", ".mp4", ".avi", ".ts"] else ("📦" if ext_low in (".zip", ".rar", ".7z") else "📄")
+            item_lines.append(f"{mark}`[{idx+1}]` {icon} `{p.name}` _({size_mb:.1f} MB)_")
+
+    listing_block = "\n".join(item_lines) if item_lines else "_(این پوشه خالی است)_"
+    page_badge = f" (صفحه {page + 1} از {total_pages} - کل: {total_items})" if total_pages > 1 else ""
+
+    msg_text = (
+        f"📂 **فایل‌منیجر{page_badge}**\n"
+        f"📍 مسیر فعلی:\n`{current_dir}`\n"
+        f"✅ **فایل‌های انتخاب‌شده:** `{len(selected_files)}` فایل\n\n"
+        f"📋 **لیست محتویات این صفحه (برای کپی نام لمس کنید):**\n{listing_block}\n\n"
+        "💡 _روی پوشه‌ها کلیک کنید تا باز شوند؛ روی فایل‌ها کلیک کنید تا تیک (`✅`) بخورند:_"
+    )
+
+    kb = file_browser_kb(items, is_root, selected_files, page=page)
+    if isinstance(call_or_msg, CallbackQuery):
+        try:
+            await call_or_msg.message.edit_text(msg_text[:4000], reply_markup=kb, parse_mode="Markdown")
+        except Exception:
+            await call_or_msg.answer()
+    else:
+        await call_or_msg.answer(msg_text[:4000], reply_markup=kb, parse_mode="Markdown")
+
+
+@router.callback_query(F.data == "menu:file_mgr")
+async def cb_file_mgr(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    start_dir = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
+    if not start_dir.exists():
+        start_dir = Path(cfg.get("paths", "workspace_dir"))
+    await render_directory(call, state, start_dir, page=0)
+
+
+@router.callback_query(F.data.startswith("fpage:"))
+async def cb_file_mgr_change_page(call: CallbackQuery, state: FSMContext):
+    page = int(call.data.split(":")[1])
+    data = await state.get_data()
+    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    await render_directory(call, state, curr, page=page)
+
+
+@router.callback_query(F.data == "fnav:up")
+async def cb_file_up(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir"))).resolve()
+    root_dir = Path(cfg.get("paths", "workspace_dir")).resolve()
+    parent = curr.parent if curr != root_dir else root_dir
+    await render_directory(call, state, parent, page=0)
+
+
+@router.callback_query(F.data.startswith("fitem:"))
+async def cb_file_item(call: CallbackQuery, state: FSMContext):
+    idx = int(call.data.split(":")[1])
+    data = await state.get_data()
+    dir_items = data.get("dir_items", [])
+    if idx >= len(dir_items):
+        return await call.answer("⚠️ آیتم یافت نشد.")
+
+    selected_path = Path(dir_items[idx]).resolve()
+
+    if selected_path.is_dir():
+        return await render_directory(call, state, selected_path, page=0)
+
+    selected_files = set(data.get("fm_selected_files", []))
+    f_str = str(selected_path)
+    if f_str in selected_files:
+        selected_files.remove(f_str)
+    else:
+        selected_files.add(f_str)
+
+    await state.update_data(
+        fm_selected_files=list(selected_files),
+        selected_video=f_str,
+        target_videos=sorted(list(selected_files), key=_natural_sort_key)
+    )
+    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
+    await render_directory(call, state, curr, page=data.get("fm_page", 0))
+
+
+@router.callback_query(F.data == "fact:select_all_files")
+async def cb_select_all_files_in_dir(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    dir_items = [Path(p).resolve() for p in data.get("dir_items", [])]
+    files_in_dir = [str(p) for p in dir_items if p.is_file()]
+    selected_files = set(data.get("fm_selected_files", []))
+
+    if files_in_dir and all(f in selected_files for f in files_in_dir):
+        for f in files_in_dir:
+            selected_files.discard(f)
+    else:
+        for f in files_in_dir:
+            selected_files.add(f)
+
+    await state.update_data(fm_selected_files=list(selected_files))
+    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
+    await render_directory(call, state, curr, page=data.get("fm_page", 0))
+
+
+@router.callback_query(F.data == "fact:clear_selection")
+async def cb_clear_file_selection(call: CallbackQuery, state: FSMContext):
+    await state.update_data(fm_selected_files=[])
+    data = await state.get_data()
+    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
+    await render_directory(call, state, curr, page=data.get("fm_page", 0))
+
+
 @router.callback_query(F.data == "fact:extract_zip")
 async def cb_extract_selected_zip_files(call: CallbackQuery, state: FSMContext):
-    import asyncio
     data = await state.get_data()
     sel_files = sorted(data.get("fm_selected_files", []), key=_natural_sort_key)
     if not sel_files and data.get("selected_video"):
@@ -733,137 +843,9 @@ async def cb_extract_selected_zip_files(call: CallbackQuery, state: FSMContext):
             parse_mode="Markdown"
         )
 
-    await render_directory(call, state, curr_dir)
+    await render_directory(call, state, curr_dir, page=data.get("fm_page", 0))
 
 
-# ==================== ۵. فایل‌منیجر سرور با قابلیت انتخاب چندفایلی و تغییر نام گروهی ====================
-async def render_directory(call_or_msg: CallbackQuery | Message, state: FSMContext, current_dir: Path):
-    root_dir = Path(cfg.get("paths", "workspace_dir")).resolve()
-    current_dir = current_dir.resolve()
-    current_dir.mkdir(parents=True, exist_ok=True)
-    items = sorted(
-        [p for p in current_dir.iterdir() if p.name != "browser_profile" and not p.name.startswith("_")],
-        key=lambda p: (not p.is_dir(), p.name.lower())
-    )
-
-    data = await state.get_data()
-    # حذف فایل‌هایی که دیگر وجود ندارند از لیست انتخاب‌شده‌ها
-    selected_files = {p for p in data.get("fm_selected_files", []) if Path(p).exists()}
-
-    await state.update_data(
-        current_dir=str(current_dir),
-        dir_items=[str(p.resolve()) for p in items],
-        fm_selected_files=list(selected_files)
-    )
-    is_root = (current_dir == root_dir)
-
-    item_lines = []
-    for idx, p in enumerate(items[:25]):
-        if p.is_dir():
-            item_lines.append(f"`[{idx+1}]` 📁 `{p.name}`")
-        else:
-            is_sel = str(p.resolve()) in selected_files
-            mark = "✅ " if is_sel else ""
-            size_mb = p.stat().st_size / (1024 * 1024)
-            icon = "🎬" if p.suffix.lower() in [".mkv", ".mp4", ".avi", ".ts"] else "📄"
-            item_lines.append(f"{mark}`[{idx+1}]` {icon} `{p.name}` _({size_mb:.1f} MB)_")
-
-    listing_block = "\n".join(item_lines) if item_lines else "_(این پوشه خالی است)_"
-
-    msg_text = (
-        f"📂 **مسیر فعلی:**\n`{current_dir}`\n"
-        f"✅ **فایل‌های انتخاب‌شده:** `{len(selected_files)}` فایل\n\n"
-        f"📋 **لیست کامل محتویات (برای کپی نام لمس کنید):**\n{listing_block}\n\n"
-        "💡 _روی پوشه‌ها کلیک کنید تا باز شوند؛ روی فایل‌ها کلیک کنید تا تیک (`✅`) بخورند:_"
-    )
-
-    kb = file_browser_kb(items, is_root, selected_files)
-    if isinstance(call_or_msg, CallbackQuery):
-        try:
-            await call_or_msg.message.edit_text(msg_text[:4000], reply_markup=kb, parse_mode="Markdown")
-        except Exception:
-            await call_or_msg.answer()
-    else:
-        await call_or_msg.answer(msg_text[:4000], reply_markup=kb, parse_mode="Markdown")
-
-
-@router.callback_query(F.data == "menu:file_mgr")
-async def cb_file_mgr(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    start_dir = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
-    if not start_dir.exists():
-        start_dir = Path(cfg.get("paths", "workspace_dir"))
-    await render_directory(call, state, start_dir)
-
-
-@router.callback_query(F.data == "fnav:up")
-async def cb_file_up(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir"))).resolve()
-    root_dir = Path(cfg.get("paths", "workspace_dir")).resolve()
-    parent = curr.parent if curr != root_dir else root_dir
-    await render_directory(call, state, parent)
-
-
-@router.callback_query(F.data.startswith("fitem:"))
-async def cb_file_item(call: CallbackQuery, state: FSMContext):
-    idx = int(call.data.split(":")[1])
-    data = await state.get_data()
-    dir_items = data.get("dir_items", [])
-    if idx >= len(dir_items):
-        return await call.answer("⚠️ آیتم یافت نشد.")
-
-    selected_path = Path(dir_items[idx]).resolve()
-
-    # اگر پوشه است، وارد پوشه شو
-    if selected_path.is_dir():
-        return await render_directory(call, state, selected_path)
-
-    # اگر فایل است، وضعیت تیک خوردن (انتخاب چندتایی) آن را تغییر بده
-    selected_files = set(data.get("fm_selected_files", []))
-    f_str = str(selected_path)
-    if f_str in selected_files:
-        selected_files.remove(f_str)
-    else:
-        selected_files.add(f_str)
-
-    await state.update_data(
-        fm_selected_files=list(selected_files),
-        selected_video=f_str,
-        target_videos=sorted(list(selected_files), key=_natural_sort_key)
-    )
-    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
-    await render_directory(call, state, curr)
-
-
-@router.callback_query(F.data == "fact:select_all_files")
-async def cb_select_all_files_in_dir(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    dir_items = [Path(p).resolve() for p in data.get("dir_items", [])]
-    files_in_dir = [str(p) for p in dir_items if p.is_file()]
-    selected_files = set(data.get("fm_selected_files", []))
-
-    if files_in_dir and all(f in selected_files for f in files_in_dir):
-        for f in files_in_dir:
-            selected_files.discard(f)
-    else:
-        for f in files_in_dir:
-            selected_files.add(f)
-
-    await state.update_data(fm_selected_files=list(selected_files))
-    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
-    await render_directory(call, state, curr)
-
-
-@router.callback_query(F.data == "fact:clear_selection")
-async def cb_clear_file_selection(call: CallbackQuery, state: FSMContext):
-    await state.update_data(fm_selected_files=[])
-    data = await state.get_data()
-    curr = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
-    await render_directory(call, state, curr)
-
-
-# ==================== تغییر نام تکی و گروهی فایل‌ها (پشتیبانی از * و شماره‌گذاری 01) ====================
 @router.callback_query(F.data.in_({"fact:batch_rename", "vact:rename_file"}))
 async def cb_batch_rename_start(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -897,8 +879,7 @@ async def cb_batch_rename_start(call: CallbackQuery, state: FSMContext):
             f"🔹 نمونه نام اولین فایل:\n`{first_stem}`\n\n"
             "💡 **راهنمای الگوی نام‌گذاری:**\n"
             "1️⃣ **با علامت `*`:** هر کجای نام که علامت `*` بگذارید، به ترتیب با `01`، `02`، `03` و... جایگزین می‌شود.\n"
-            "   مثال: `Severance.S02E*.1080p` ⬅️ `Severance.S02E01.1080p.mkv`\n"
-            "2️⃣ **بدون علامت `*`:** اگر `*` نگذارید، شماره‌های `01`، `02` و... به صورت خودکار در انتهای نام (قبل از پسوند فایل) اضافه می‌شوند.\n\n"
+            "2️⃣ **بدون علامت `*`:** شماره‌های `01`، `02` و... در انتهای نام اضافه می‌شوند.\n\n"
             "لطفاً نام یا الگوی جدید را ارسال کنید:"
         )
 
@@ -918,10 +899,9 @@ async def handle_batch_rename_submit(message: Message, state: FSMContext):
         return await message.answer("⚠️ فایل‌های انتخاب شده یافت نشدند.")
 
     total = len(targets)
-    renamed_Preview = []
+    renamed_preview = []
     new_selected = []
 
-    # مرحله ۱: تغییر نام به نام موقت برای جلوگیری از تداخل احتمالی نام‌ها
     temp_pairs: list[tuple[Path, Path]] = []
     try:
         for idx, old_p in enumerate(targets, start=1):
@@ -934,23 +914,22 @@ async def handle_batch_rename_submit(message: Message, state: FSMContext):
         for temp_p, final_p in temp_pairs:
             temp_p.rename(final_p)
             new_selected.append(str(final_p.resolve()))
-            renamed_Preview.append(f"✅ `{final_p.name}`")
+            renamed_preview.append(f"✅ `{final_p.name}`")
     except Exception as e:
         return await message.answer(f"❌ خطا در تغییر نام:\n`{e}`", parse_mode="Markdown")
 
     await state.set_state(None)
     await state.update_data(fm_selected_files=new_selected)
 
-    preview_block = "\n".join(renamed_Preview[:15])
+    preview_block = "\n".join(renamed_preview[:15])
     await message.answer(
         f"🎉 **تغییر نام `{len(new_selected)}` فایل با موفقیت انجام شد!**\n\n{preview_block}",
         parse_mode="Markdown"
     )
     curr_dir = Path(data.get("current_dir", targets[0].parent))
-    await render_directory(message, state, curr_dir)
+    await render_directory(message, state, curr_dir, page=data.get("fm_page", 0))
 
 
-# ==================== حذف تکی و گروهی فایل‌ها در فایل‌منیجر ====================
 @router.callback_query(F.data.in_({"fact:batch_delete", "vact:delete_file"}))
 async def cb_batch_delete_ask(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -993,10 +972,9 @@ async def cb_batch_delete_confirm(call: CallbackQuery, state: FSMContext):
     await state.update_data(fm_selected_files=[], delete_targets=[])
     await call.answer(f"🗑 تعداد {deleted_count} فایل با موفقیت حذف شد!", show_alert=True)
     curr_dir = Path(data.get("current_dir", cfg.get("paths", "workspace_dir")))
-    await render_directory(call, state, curr_dir)
+    await render_directory(call, state, curr_dir, page=data.get("fm_page", 0))
 
 
-# ==================== تغییر نام و حذف پوشه در فایل‌منیجر ====================
 @router.callback_query(F.data == "fact:rename_dir")
 async def cb_rename_dir_start(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -1035,7 +1013,7 @@ async def handle_rename_dir_submit(message: Message, state: FSMContext):
     await state.set_state(None)
     await state.update_data(current_dir=str(new_dir), fm_selected_files=[])
     await message.answer(f"✅ نام پوشه با موفقیت به `{new_dir.name}` تغییر یافت!", parse_mode="Markdown")
-    await render_directory(message, state, new_dir)
+    await render_directory(message, state, new_dir, page=0)
 
 
 @router.callback_query(F.data == "fact:delete_dir")
@@ -1073,10 +1051,10 @@ async def cb_delete_dir_confirm(call: CallbackQuery, state: FSMContext):
 
     await state.update_data(current_dir=str(parent_dir), fm_selected_files=[])
     await call.answer(f"🗑 پوشه {dir_name} به طور کامل حذف شد!", show_alert=True)
-    await render_directory(call, state, parent_dir)
+    await render_directory(call, state, parent_dir, page=0)
 
 
-# ==================== انتخاب مسیر مقصد در هاست دانلود برای CuteFTP 9 (تکی، چندفایلی و پوشه‌ای) ====================
+# ==================== انتخاب مسیر مقصد در هاست دانلود برای CuteFTP 9 ====================
 @router.callback_query(F.data.in_({"fact:upload_current_dir", "fact:upload_selected_files", "vact:upload_file"}))
 async def cb_cuteftp_choose_destination(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()

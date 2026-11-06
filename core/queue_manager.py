@@ -1,4 +1,5 @@
 import asyncio
+import html
 import inspect
 import logging
 import traceback
@@ -47,9 +48,33 @@ class QueueManager:
         self._locks: dict[str, asyncio.Lock] = {q: asyncio.Lock() for q in self.QUEUE_TYPES}
         self._workers: list[asyncio.Task] = []
         self._bot: Bot | None = None
+        self._known_chats: set[int] = set()
 
     def set_bot(self, bot: Bot):
         self._bot = bot
+
+    def register_chat(self, chat_id: int):
+        """ثبت خودکار چت ادمین برای اطمینان ۱۰۰٪ از ارسال نوتیفیکیشن‌ها"""
+        if chat_id:
+            self._known_chats.add(int(chat_id))
+
+    def _get_target_chat_ids(self) -> list[int]:
+        raw_admins = cfg.get("telegram", "admin_ids", [])
+        chat_ids: set[int] = set(self._known_chats)
+
+        if isinstance(raw_admins, (int, str)):
+            try:
+                chat_ids.add(int(str(raw_admins).strip()))
+            except ValueError:
+                pass
+        elif isinstance(raw_admins, list):
+            for item in raw_admins:
+                try:
+                    chat_ids.add(int(str(item).strip()))
+                except ValueError:
+                    pass
+
+        return list(chat_ids)
 
     async def add_task(
         self,
@@ -125,71 +150,125 @@ class QueueManager:
                 self._events[queue_type].clear()
             await self._events[queue_type].wait()
 
-    async def _notify_admins(self, text: str):
+    async def _notify_admins_html(self, html_text: str):
+        """ارسال ایمن پیام با فرمت HTML به تمام ادمین‌ها بدون خطای کاراکترهای Markdown"""
         if not self._bot:
+            logging.warning("QueueManager._bot is None! Cannot send notification.")
             return
-        for admin_id in cfg.get("telegram", "admin_ids", []):
+
+        target_ids = self._get_target_chat_ids()
+        if not target_ids:
+            logging.warning("No admin_ids found in config.yaml to send notification.")
+            return
+
+        for admin_id in target_ids:
             try:
                 await self._bot.send_message(
                     chat_id=admin_id,
-                    text=text[:4000],
-                    parse_mode="Markdown",
+                    text=html_text[:4000],
+                    parse_mode="HTML",
                     disable_web_page_preview=True
                 )
-            except Exception:
+            except Exception as e:
+                logging.error(f"HTML notify error for {admin_id}: {e}")
                 try:
+                    import re
+                    plain = re.sub(r"<[^>]+>", "", html_text)
                     await self._bot.send_message(
                         chat_id=admin_id,
-                        text=text.replace("`", "").replace("*", "")[:4000],
+                        text=plain[:4000],
                         disable_web_page_preview=True
                     )
-                except Exception as e:
-                    logging.error(f"Queue notification error: {e}")
+                except Exception as e2:
+                    logging.error(f"Plain notify error for {admin_id}: {e2}")
 
     async def _send_completion_notification(self, task: QueueTask, res: Any):
-        """ارسال نوتیفیکیشن اتمام کار برای تمام بخش‌ها (سافت‌ساب، هاردساب، دانلود و آپلود)"""
-        section_label = self.QUEUE_LABELS.get(task.queue_type, task.queue_type.upper())
+        """ارسال نوتیفیکیشن دقیق پس از اتمام دانلود، سافت‌ساب، هاردساب و آپلود"""
+        section_label = html.escape(self.QUEUE_LABELS.get(task.queue_type, task.queue_type.upper()))
+        safe_title = html.escape(str(task.title))
+        safe_id = html.escape(str(task.task_id))
 
+        # ۱. نوتیفیکیشن آپلود
         if task.queue_type == "upload":
             if isinstance(res, list) and res:
-                links_block = "\n".join([f"🔗 `{u}`" for u in res[:25]])
-                await self._notify_admins(
-                    f"☁️ **آپلود با موفقیت به پایان رسید!**\n"
-                    f"🆔 کد: `{task.task_id}`\n"
-                    f"📌 عنوان: `{task.title}`\n\n"
-                    f"📥 **لینک‌های مستقیم دانلود:**\n{links_block}"
+                links_block = "\n".join([f"🔗 <code>{html.escape(str(u))}</code>" for u in res[:25]])
+                await self._notify_admins_html(
+                    f"☁️ <b>آپلود با موفقیت به پایان رسید!</b>\n"
+                    f"🆔 کد: <code>{safe_id}</code>\n"
+                    f"📌 عنوان: <code>{safe_title}</code>\n\n"
+                    f"📥 <b>لینک‌های مستقیم دانلود:</b>\n{links_block}"
                 )
             else:
-                await self._notify_admins(
-                    f"☁️ **آپلود با موفقیت انجام شد!**\n"
-                    f"🆔 کد: `{task.task_id}`\n"
-                    f"📌 عنوان: `{task.title}`"
+                await self._notify_admins_html(
+                    f"☁️ <b>آپلود با موفقیت انجام شد!</b>\n"
+                    f"🆔 کد: <code>{safe_id}</code>\n"
+                    f"📌 عنوان: <code>{safe_title}</code>"
                 )
             return
 
-        # برای سافت‌ساب، هاردساب و دانلود: نمایش نام فایل خروجی، مسیر و حجم آن
+        # ۲. پیدا کردن فایل یا پوشه خروجی برای دانلود، سافت‌ساب و هاردساب
         out_path: Path | None = None
         if isinstance(res, Path):
             out_path = res
-        elif isinstance(res, str) and Path(res).exists():
-            out_path = Path(res)
+        elif isinstance(res, str) and res.strip():
+            try:
+                if Path(res).exists():
+                    out_path = Path(res)
+            except Exception:
+                pass
+        elif isinstance(res, list) and len(res) > 0:
+            try:
+                first_item = Path(str(res[0]))
+                if first_item.exists():
+                    out_path = first_item
+            except Exception:
+                pass
+
+        # اگر متد دانلود چیزی برنگردانده یا پوشه مقصد در args بوده، پوشه مقصد را از args استخراج کن
+        if out_path is None and task.args:
+            for arg in reversed(task.args):
+                if isinstance(arg, Path) and arg.exists():
+                    out_path = arg
+                    break
 
         details = ""
         if out_path and out_path.exists():
             if out_path.is_file():
                 size_mb = out_path.stat().st_size / (1024 * 1024)
                 details = (
-                    f"\n📄 **فایل خروجی:**\n`{out_path.name}`\n"
-                    f"📂 **مسیر ذخیره:**\n`{out_path.parent}`\n"
-                    f"📦 **حجم نهایی:** `{size_mb:.2f} MB`"
+                    f"\n📄 <b>فایل نهایی:</b>\n<code>{html.escape(out_path.name)}</code>\n"
+                    f"📂 <b>مسیر ذخیره:</b>\n<code>{html.escape(str(out_path.parent))}</code>\n"
+                    f"📦 <b>حجم فایل:</b> <code>{size_mb:.2f} MB</code>"
                 )
-            else:
-                details = f"\n📂 **مسیر ذخیره:**\n`{out_path}`"
+            elif out_path.is_dir():
+                # اگر خروجی دانلود یک پوشه است، جدیدترین فایل‌های دانلودشده داخل آن را پیدا کن و نمایش بده
+                files_in_dir = sorted(
+                    [
+                        f for f in out_path.rglob("*")
+                        if f.is_file() and not f.name.startswith("_") and not f.name.endswith(".aria2")
+                    ],
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True
+                )
+                if files_in_dir:
+                    newest = files_in_dir[0]
+                    size_mb = newest.stat().st_size / (1024 * 1024)
+                    extra_count = f" (+ {len(files_in_dir) - 1} فایل دیگر)" if len(files_in_dir) > 1 else ""
+                    details = (
+                        f"\n📄 <b>فایل دانلود شده:</b>\n<code>{html.escape(newest.name)}</code>{extra_count}\n"
+                        f"📂 <b>مسیر پوشه:</b>\n<code>{html.escape(str(out_path))}</code>\n"
+                        f"📦 <b>حجم فایل:</b> <code>{size_mb:.2f} MB</code>"
+                    )
+                else:
+                    details = f"\n📂 <b>مسیر پوشه:</b>\n<code>{html.escape(str(out_path))}</code>"
 
-        await self._notify_admins(
-            f"✅ **عملیات {section_label} تکمیل شد!**\n"
-            f"🆔 کد تسک: `{task.task_id}`\n"
-            f"📌 عنوان: `{task.title}`"
+        icon = "📥" if task.queue_type == "download" else "✅"
+        header_txt = "دانلود فایل با موفقیت به پایان رسید!" if task.queue_type == "download" else f"عملیات {section_label} تکمیل شد!"
+
+        await self._notify_admins_html(
+            f"{icon} <b>{header_txt}</b>\n"
+            f"🆔 کد تسک: <code>{safe_id}</code>\n"
+            f"📌 عنوان: <code>{safe_title}</code>"
             f"{details}"
         )
 
@@ -226,8 +305,8 @@ class QueueManager:
                 task.progress = "100%"
                 task.is_finished = True
 
-                # ارسال نوتیفیکیشن اتمام برای تمام تسک‌ها (سافت‌ساب، هاردساب، دانلود و آپلود)
-                await self._send_completion_notification(task, res)
+                # فراخوانی از روی کلاس تا حتی در صورت Hot-Reload با کلید R نیز نسخه جدید متد اجرا شود!
+                await self.__class__._send_completion_notification(self, task, res)
 
             except asyncio.CancelledError:
                 task.status = "🛑 لغو شد"
@@ -239,12 +318,13 @@ class QueueManager:
                 task.status = "❌ خطا"
                 task.progress = "متوقف شده به دلیل خطا"
                 task.is_finished = True
-                await self._notify_admins(
-                    f"❌ **خطا در پردازش!**\n"
-                    f"🆔 کد: `{task.task_id}`\n"
-                    f"⚙️ بخش: `{task.queue_type.upper()}`\n"
-                    f"📌 عنوان: `{task.title}`\n"
-                    f"⚠️ جزئیات خطا:\n`{str(e)[:400]}`"
+                await self.__class__._notify_admins_html(
+                    self,
+                    f"❌ <b>خطا در پردازش!</b>\n"
+                    f"🆔 کد: <code>{html.escape(str(task.task_id))}</code>\n"
+                    f"⚙️ بخش: <code>{html.escape(task.queue_type.upper())}</code>\n"
+                    f"📌 عنوان: <code>{html.escape(str(task.title))}</code>\n"
+                    f"⚠️ جزئیات خطا:\n<code>{html.escape(str(e)[:400])}</code>"
                 )
             finally:
                 task.running_asyncio_task = None
@@ -299,4 +379,13 @@ class QueueManager:
         return len(to_del)
 
 
-queue_engine = QueueManager()
+# اگر از قبل نمونه queue_engine در حافظه وجود دارد (هنگام Hot-Reload با کلید R)،
+# متدهای کلاس آن را به کلاس جدید ارتقا بده بدون اینکه صف و پراسس‌های فعال پاک شوند!
+if "queue_engine" in globals() and globals()["queue_engine"] is not None:
+    _existing_engine = globals()["queue_engine"]
+    _existing_engine.__class__ = QueueManager
+    if not hasattr(_existing_engine, "_known_chats"):
+        _existing_engine._known_chats = set()
+    queue_engine = _existing_engine
+else:
+    queue_engine = QueueManager()

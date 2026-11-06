@@ -1,6 +1,5 @@
 import ssl
 
-# غیرفعال‌سازی سراسری بررسی گواهی Self-Signed SSL در ابتدای برنامه
 _orig_create_default_context = ssl.create_default_context
 
 
@@ -22,18 +21,18 @@ import sys
 import traceback
 import urllib3
 from aiohttp import TCPConnector
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, Router, BaseMiddleware
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, TelegramObject
 
 from core.config_loader import cfg
 from core.proxy_manager import ProxyManager
+import core.queue_manager as queue_mod
 from core.queue_manager import queue_engine
 
 import services.monitor_service as monitor_mod
 
-# ایمپورت ماژول‌های روتر برای قابلیت Reload زنده
 import bot.queue_handlers as queue_handlers_mod
 import bot.download_handlers as download_handlers_mod
 import bot.subtitle_handlers as subtitle_handlers_mod
@@ -46,10 +45,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-# لیست ترتیبی ماژول‌هایی که هنگام زدن کلید R باید از روی دیسک آپدیت شوند
-# (توجه: core.queue_manager در این لیست نیست تا صف و پراسس‌های در حال اجرا حفظ شوند)
+# لیست ماژول‌های قابل ریلود زنده با کلید R (اکنون شامل core.queue_manager و services.automation_service)
 RELOADABLE_MODULES_ORDER = [
     "core.proxy_manager",
+    "core.queue_manager",
     "services.process_utils",
     "services.subtitle_service",
     "services.mkv_service",
@@ -67,8 +66,16 @@ RELOADABLE_MODULES_ORDER = [
     "bot.handlers",
 ]
 
-# روتر ثابت سیستمی برای دستور /reload از داخل تلگرام
 system_router = Router()
+
+
+class RegisterAdminChatMiddleware(BaseMiddleware):
+    """ثبت خودکار آیدی چت ادمین در QueueManager با هر کلیک یا پیام برای تضمین ارسال نوتیفیکیشن‌ها"""
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        user = data.get("event_from_user")
+        if user and user.id in (cfg.get("telegram", "admin_ids", []) or []):
+            queue_mod.queue_engine.register_chat(user.id)
+        return await handler(event, data)
 
 
 def create_bot_session(proxy_url: str | None) -> AiohttpSession:
@@ -80,10 +87,8 @@ def create_bot_session(proxy_url: str | None) -> AiohttpSession:
 
 
 def _attach_all_routers(dp: Dispatcher):
-    """جدا کردن روترهای قبلی و اتصال نسخه جدید روترها به Dispatcher"""
     dp.sub_routers.clear()
 
-    # پاکسازی انتساب والد قبلی در صورت وجود
     for r in (
         system_router,
         queue_handlers_mod.router,
@@ -101,31 +106,30 @@ def _attach_all_routers(dp: Dispatcher):
 
 
 async def hot_reload_code(dp: Dispatcher, bot: Bot) -> tuple[bool, str]:
-    """
-    بازخوانی زنده تمامی فایل‌های کد و config.yaml بدون قطع شدن پراسس‌های در حال اجرا
-    """
     logging.info("🔄 [HOT-RELOAD] در حال بروزرسانی کدها و تنظیمات بدون توقف پراسس‌ها...")
     try:
         importlib.invalidate_caches()
-
-        # ۱. بازخوانی فایل config.yaml
         cfg.reload()
 
-        # ۲. توقف موقت لوپ مانیتورینگ قبلی قبل از ریلود شدن ماژول آن
         if hasattr(monitor_mod, "monitor_service"):
             monitor_mod.monitor_service.stop()
 
-        # ۳. بازخوانی ترتیبی تمام سرویس‌ها، کیبوردها و هندلرها
+        # حفظ نمونه فعلی queue_engine قبل از ریلود ماژول آن
+        active_engine = queue_mod.queue_engine
+
         reloaded_count = 0
         for mod_name in RELOADABLE_MODULES_ORDER:
             if mod_name in sys.modules:
                 importlib.reload(sys.modules[mod_name])
                 reloaded_count += 1
 
-        # ۴. جایگزینی روترهای جدید در Dispatcher تلگرام
+        # ارتقای کلاس نمونه در حال اجرا به کدهای جدید بدون از دست رفتن تسک‌ها و ورکرها
+        active_engine.__class__ = queue_mod.QueueManager
+        active_engine.set_bot(bot)
+        queue_mod.queue_engine = active_engine
+
         _attach_all_routers(dp)
 
-        # ۵. راه‌اندازی مجدد مانیتورینگ با کدهای جدید
         if hasattr(monitor_mod, "monitor_service"):
             monitor_mod.monitor_service.start(bot)
 
@@ -141,7 +145,6 @@ async def hot_reload_code(dp: Dispatcher, bot: Bot) -> tuple[bool, str]:
 
 @system_router.message(Command("reload"))
 async def cmd_telegram_hot_reload(message: Message, dispatcher: Dispatcher):
-    """قابلیت آپدیت کدها از داخل خود تلگرام با دستور /reload"""
     admin_ids = cfg.get("telegram", "admin_ids", [])
     if message.from_user.id not in admin_ids:
         return
@@ -150,20 +153,14 @@ async def cmd_telegram_hot_reload(message: Message, dispatcher: Dispatcher):
 
 
 async def console_key_listener(dp: Dispatcher, bot: Bot):
-    """
-    گوش دادن دائمی به کیبورد در پنجره کنسول ویندوز:
-    با فشردن کلید R (یا r / ق) کدها درجا آپدیت می‌شوند.
-    """
     logging.info("⌨️  [HOT-RELOAD READY] هر زمان کدها را تغییر دادید، کلید 'R' را در همین کنسول فشار دهید.")
     while True:
         try:
             if msvcrt.kbhit():
                 ch = msvcrt.getwch()
-                # پشتیبانی از R، r و کلید هم‌ردیف در کیبورد فارسی ('ق')
                 if ch in ("r", "R", "ق"):
                     await hot_reload_code(dp, bot)
                 elif ch in ("\x00", "\xe0"):
-                    # رد کردن کد دوم کلیدهای جهتی/تابعی ویندوز
                     msvcrt.getwch()
         except Exception as e:
             logging.debug(f"Console key listener warning: {e}")
@@ -184,8 +181,8 @@ async def main():
     session = create_bot_session(proxy_url)
     bot = Bot(token=bot_token, session=session)
     dp = Dispatcher()
+    dp.update.outer_middleware(RegisterAdminChatMiddleware())
 
-    # اتصال اولیه تمام روترها
     _attach_all_routers(dp)
     logging.info("Telegram routers registered successfully.")
 
@@ -196,15 +193,13 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=True)
         logging.info("Telegram connection established.")
 
-        if hasattr(queue_engine, "set_bot"):
-            queue_engine.set_bot(bot)
+        queue_engine.set_bot(bot)
         queue_engine.start_workers()
         logging.info("Queue workers started.")
 
         monitor_mod.monitor_service.start(bot)
         logging.info("Monitor service started.")
 
-        # شروع شنونده کلید R در کنسول ویندوز
         console_task = asyncio.create_task(console_key_listener(dp, bot))
 
         logging.info("Telegram Bot Polling Started...")

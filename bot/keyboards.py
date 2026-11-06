@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from typing import Any
 from aiogram.types import (
@@ -10,6 +11,8 @@ from services.scraper_service import ScraperService
 from services.handbrake_service import HandBrakeService
 from services.cuteftp_service import CuteFTPService
 
+BROWSER_PAGE_SIZE = 15  # تعداد پوشه‌ها/فایل‌ها در هر صفحه
+
 
 def smart_middle_truncate(text: str, max_len: int = 40) -> str:
     text = str(text).strip()
@@ -18,6 +21,30 @@ def smart_middle_truncate(text: str, max_len: int = 40) -> str:
     head_len = (max_len - 1) // 2 + 2
     tail_len = max_len - head_len - 1
     return f"{text[:head_len]}…{text[-tail_len:]}"
+
+
+def _append_pagination_row(
+    builder: InlineKeyboardBuilder,
+    prefix: str,
+    page: int,
+    total_pages: int
+):
+    """افزودن ردیف دکمه‌های ورق زدن صفحه (⬅️ قبلی | 📄 صفحه X از Y | بعدی ➡️)"""
+    if total_pages <= 1:
+        return
+    nav_btns = []
+    if page > 0:
+        nav_btns.append(
+            InlineKeyboardButton(text="⬅️ قبلی", callback_data=f"{prefix}:{page - 1}")
+        )
+    nav_btns.append(
+        InlineKeyboardButton(text=f"📄 صفحه {page + 1} از {total_pages}", callback_data="qnoop")
+    )
+    if page < total_pages - 1:
+        nav_btns.append(
+            InlineKeyboardButton(text="بعدی ➡️", callback_data=f"{prefix}:{page + 1}")
+        )
+    builder.row(*nav_btns)
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -100,7 +127,8 @@ def smart_auto_browser_kb(
     current_dir: Path,
     is_root: bool,
     detected_episodes: list[str],
-    selected_episodes: set[str] | None = None
+    selected_episodes: set[str] | None = None,
+    page: int = 0
 ) -> InlineKeyboardMarkup:
     selected_episodes = selected_episodes or set()
     builder = InlineKeyboardBuilder()
@@ -108,7 +136,7 @@ def smart_auto_browser_kb(
     if not is_root:
         if detected_episodes:
             ep_buttons = []
-            for ep in detected_episodes[:24]:
+            for ep in detected_episodes[:30]:
                 mark = "✅" if ep in selected_episodes else "⬜"
                 ep_buttons.append(
                     InlineKeyboardButton(
@@ -142,13 +170,22 @@ def smart_auto_browser_kb(
                 )
             )
 
-    for idx, folder in enumerate(folders[:22]):
+    total_folders = len(folders)
+    total_pages = max(1, math.ceil(total_folders / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
+
+    for idx in range(start_idx, min(end_idx, total_folders)):
+        folder = folders[idx]
         builder.row(
             InlineKeyboardButton(
                 text=f"📁 [{idx+1}] {smart_middle_truncate(folder.name, 38)}",
                 callback_data=f"sauto:open:{idx}"
             )
         )
+
+    _append_pagination_row(builder, "sauto:page", page, total_pages)
 
     if not is_root:
         builder.row(
@@ -226,15 +263,8 @@ def smart_auto_final_selection_kb(
     selected_hardsub_srt: set[str],
     auto_upload: bool = True
 ) -> InlineKeyboardMarkup:
-    """
-    پنل نهایی اتوماسیون (بدون انکود movie.ass):
-    ۱. انتخاب تکی یا کلی پوشه‌های کیفیت خام (بدون سافت‌ساب) که باید سافت‌ساب شوند
-    ۲. انتخاب چندگزینه‌ای ۳ کیفیت هاردساب فارسی SRT (1080p-HardSub, 720p-HardSub, 480p-HardSub)
-    ۳. سوییچ آپلود خودکار بعد از اتمام
-    """
     builder = InlineKeyboardBuilder()
 
-    # بخش ۱: انتخاب کیفیت‌های خام برای سافت‌ساب کردن
     if available_softsub_qualities:
         builder.row(
             InlineKeyboardButton(
@@ -243,7 +273,7 @@ def smart_auto_final_selection_kb(
             )
         )
         soft_btns = []
-        for idx, q_name in enumerate(available_softsub_qualities[:20]):
+        for idx, q_name in enumerate(available_softsub_qualities[:24]):
             mark = "✅" if q_name in selected_softsub_qualities else "⬜"
             soft_btns.append(
                 InlineKeyboardButton(
@@ -261,7 +291,6 @@ def smart_auto_final_selection_kb(
             )
         )
 
-    # بخش ۲: انتخاب ۳ کیفیت اصلی هاردساب فارسی SRT (از پوشه FullHD)
     builder.row(
         InlineKeyboardButton(
             text="━━ 🔥 ۲. انتخاب کیفیت‌های HardSub (از FullHD) ━━",
@@ -290,7 +319,6 @@ def smart_auto_final_selection_kb(
         )
     )
 
-    # بخش ۳: سوییچ آپلود خودکار پس از اتمام هر فایل
     up_mark = "🟢 فعال" if auto_upload else "🔴 غیرفعال"
     builder.row(
         InlineKeyboardButton(
@@ -318,10 +346,6 @@ def manual_encode_ass_qualities_kb(
     selected_qualities: set[str],
     auto_upload: bool = True
 ) -> InlineKeyboardMarkup:
-    """
-    کیبورد اختصاصی انکود دستی با movie.ass (ترکیب‌شده با هاردساب دستی و بدون نیاز به آپلود زیرنویس):
-    ذخیره در پوشه‌های 1080p-EBTV, 720p-EBTV, 480p-EBTV
-    """
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
@@ -373,14 +397,9 @@ def manual_encode_ass_qualities_kb(
 def download_folder_tree_browser_kb(
     subfolders: list[Path],
     current_dir: Path,
-    is_root: bool
+    is_root: bool,
+    page: int = 0
 ) -> InlineKeyboardMarkup:
-    """
-    مرورگر درختی کامل برای انتخاب پوشه مقصد دانلود (رفع محدودیت انتخاب فقط پوشه‌های اصلی):
-    - امکان ورود به زیرپوشه‌های تودرتو (Series -> نام سریال -> S01 -> FullHD و غیره)
-    - امکان ساخت پوشه جدید در هر سطح
-    - دکمه تایید دانلود در همان پوشه فعلی
-    """
     builder = InlineKeyboardBuilder()
 
     builder.row(
@@ -390,13 +409,22 @@ def download_folder_tree_browser_kb(
         )
     )
 
-    for idx, folder in enumerate(subfolders[:22]):
+    total_folders = len(subfolders)
+    total_pages = max(1, math.ceil(total_folders / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
+
+    for idx in range(start_idx, min(end_idx, total_folders)):
+        folder = subfolders[idx]
         builder.row(
             InlineKeyboardButton(
                 text=f"📁 [{idx+1}] باز کردن: {smart_middle_truncate(folder.name, 34)}",
                 callback_data=f"dlnav:open:{idx}"
             )
         )
+
+    _append_pagination_row(builder, "dlnav:page", page, total_pages)
 
     builder.row(
         InlineKeyboardButton(
@@ -448,25 +476,38 @@ def extract_sub_entry_kb() -> InlineKeyboardMarkup:
 def local_extract_browser_kb(
     folders: list[Path],
     videos: list[Path],
-    is_root: bool
+    is_root: bool,
+    page: int = 0
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
-    for idx, folder in enumerate(folders[:20]):
-        builder.row(
-            InlineKeyboardButton(
-                text=f"📁 [{idx+1}] {smart_middle_truncate(folder.name, 38)}",
-                callback_data=f"extnav:dir:{idx}"
-            )
-        )
+    combined: list[tuple[str, int, Path]] = (
+        [("dir", i, f) for i, f in enumerate(folders)]
+        + [("vid", i, v) for i, v in enumerate(videos)]
+    )
+    total_items = len(combined)
+    total_pages = max(1, math.ceil(total_items / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
 
-    for idx, vid in enumerate(videos[:25]):
-        builder.row(
-            InlineKeyboardButton(
-                text=f"🎬 [F{idx+1}] {smart_middle_truncate(vid.name, 36)}",
-                callback_data=f"extnav:vid:{idx}"
+    for kind, orig_idx, path_obj in combined[start_idx:end_idx]:
+        if kind == "dir":
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"📁 [{orig_idx+1}] {smart_middle_truncate(path_obj.name, 38)}",
+                    callback_data=f"extnav:dir:{orig_idx}"
+                )
             )
-        )
+        else:
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"🎬 [F{orig_idx+1}] {smart_middle_truncate(path_obj.name, 36)}",
+                    callback_data=f"extnav:vid:{orig_idx}"
+                )
+            )
+
+    _append_pagination_row(builder, "extnav:page", page, total_pages)
 
     if not is_root:
         builder.row(
@@ -585,11 +626,19 @@ def folder_structure_choice_kb() -> InlineKeyboardMarkup:
 
 def target_folders_kb(
     folders: list[Path],
-    base_workspace: Path
+    base_workspace: Path,
+    page: int = 0
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
-    for idx, folder in enumerate(folders[:25]):
+    total_folders = len(folders)
+    total_pages = max(1, math.ceil(total_folders / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
+
+    for idx in range(start_idx, min(end_idx, total_folders)):
+        folder = folders[idx]
         try:
             rel_name = folder.relative_to(base_workspace).as_posix()
         except ValueError:
@@ -601,6 +650,8 @@ def target_folders_kb(
                 callback_data=f"tsubdir:{idx}"
             )
         )
+
+    _append_pagination_row(builder, "tsubpage", page, total_pages)
 
     builder.row(
         InlineKeyboardButton(
@@ -738,12 +789,13 @@ def search_results_kb(
 def file_browser_kb(
     items: list[Path],
     is_root: bool,
-    selected_files: set[str] | None = None
+    selected_files: set[str] | None = None,
+    page: int = 0
 ) -> InlineKeyboardMarkup:
     selected_files = selected_files or set()
     builder = InlineKeyboardBuilder()
 
-    has_files_in_dir = False
+    has_files_in_dir = any(p.is_file() for p in items)
 
     if not is_root:
         builder.row(
@@ -753,7 +805,14 @@ def file_browser_kb(
             )
         )
 
-    for idx, path in enumerate(items[:25]):
+    total_items = len(items)
+    total_pages = max(1, math.ceil(total_items / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
+
+    for idx in range(start_idx, min(end_idx, total_items)):
+        path = items[idx]
         if path.is_dir():
             builder.row(
                 InlineKeyboardButton(
@@ -762,7 +821,6 @@ def file_browser_kb(
                 )
             )
         else:
-            has_files_in_dir = True
             is_sel = str(path.resolve()) in selected_files
             mark = "✅" if is_sel else "⬜"
             ext_low = path.suffix.lower()
@@ -779,6 +837,8 @@ def file_browser_kb(
                     callback_data=f"fitem:{idx}"
                 )
             )
+
+    _append_pagination_row(builder, "fpage", page, total_pages)
 
     if has_files_in_dir:
         builder.row(
@@ -891,27 +951,40 @@ def subtitle_folder_browser_kb(
     folders: list[Path],
     videos: list[Path],
     selected_paths: set[str],
-    is_root: bool
+    is_root: bool,
+    page: int = 0
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
-    for idx, folder in enumerate(folders[:20]):
-        builder.row(
-            InlineKeyboardButton(
-                text=f"📁 [{idx+1}] {smart_middle_truncate(folder.name, 38)}",
-                callback_data=f"subnav:dir:{idx}"
-            )
-        )
+    combined: list[tuple[str, int, Path]] = (
+        [("dir", i, f) for i, f in enumerate(folders)]
+        + [("vid", i, v) for i, v in enumerate(videos)]
+    )
+    total_items = len(combined)
+    total_pages = max(1, math.ceil(total_items / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
 
-    for idx, vid in enumerate(videos[:25]):
-        is_sel = str(vid.resolve()) in selected_paths
-        mark = "✅" if is_sel else "⬜"
-        builder.row(
-            InlineKeyboardButton(
-                text=f"{mark} 🎬 [F{idx+1}] {smart_middle_truncate(vid.name, 35)}",
-                callback_data=f"subnav:vid:{idx}"
+    for kind, orig_idx, path_obj in combined[start_idx:end_idx]:
+        if kind == "dir":
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"📁 [{orig_idx+1}] {smart_middle_truncate(path_obj.name, 38)}",
+                    callback_data=f"subnav:dir:{orig_idx}"
+                )
             )
-        )
+        else:
+            is_sel = str(path_obj.resolve()) in selected_paths
+            mark = "✅" if is_sel else "⬜"
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"{mark} 🎬 [F{orig_idx+1}] {smart_middle_truncate(path_obj.name, 35)}",
+                    callback_data=f"subnav:vid:{orig_idx}"
+                )
+            )
+
+    _append_pagination_row(builder, "subnav:page", page, total_pages)
 
     if videos:
         builder.row(
@@ -1047,7 +1120,7 @@ def subtitle_source_kb(
 
     builder.row(
         InlineKeyboardButton(
-            text=f"📤 آپلود فایل زیرنویس {language_name} جدید (.srt / .ass / .zip)",
+            text=f"📤 آپلود فایل زیرنویس {language_name} جدید (.srt / .ass / .zip / .rar)",
             callback_data=f"subupload:{language}"
         )
     )
@@ -1086,7 +1159,7 @@ def subtitle_file_found_kb(
 
     builder.row(
         InlineKeyboardButton(
-            text="📤 آپلود یک فایل زیرنویس دیگر (.srt / .ass / .zip)",
+            text="📤 آپلود یک فایل زیرنویس دیگر (.srt / .ass / .zip / .rar)",
             callback_data=f"subupload:{language}"
         )
     )
@@ -1136,7 +1209,6 @@ def sync_options_kb() -> InlineKeyboardMarkup:
 
 
 def subtitle_mode_kb() -> InlineKeyboardMarkup:
-    """منوی انتخاب نوع عملیات در بخش دستی (ترکیب سافت‌ساب، هاردساب فارسی و انکود movie.ass بدون زیرنویس)"""
     builder = InlineKeyboardBuilder()
 
     builder.row(
@@ -1212,7 +1284,8 @@ hardsub_destination_choice_kb = output_destination_choice_kb
 def output_dest_tree_browser_kb(
     subfolders: list[Path],
     current_dir: Path,
-    is_root: bool
+    is_root: bool,
+    page: int = 0
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
@@ -1223,13 +1296,22 @@ def output_dest_tree_browser_kb(
         )
     )
 
-    for idx, folder in enumerate(subfolders[:22]):
+    total_folders = len(subfolders)
+    total_pages = max(1, math.ceil(total_folders / BROWSER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * BROWSER_PAGE_SIZE
+    end_idx = start_idx + BROWSER_PAGE_SIZE
+
+    for idx in range(start_idx, min(end_idx, total_folders)):
+        folder = subfolders[idx]
         builder.row(
             InlineKeyboardButton(
                 text=f"📁 [{idx+1}] باز کردن: {smart_middle_truncate(folder.name, 34)}",
                 callback_data=f"destnav:open:{idx}"
             )
         )
+
+    _append_pagination_row(builder, "destnav:page", page, total_pages)
 
     builder.row(
         InlineKeyboardButton(
@@ -1283,7 +1365,7 @@ def video_actions_kb(is_video: bool = True, is_zip: bool = False) -> InlineKeybo
     if is_zip:
         builder.row(
             InlineKeyboardButton(
-                text="📦 اکسترکت این فایل ZIP در همین پوشه",
+                text="📦 اکسترکت این فایل فشرده در همین پوشه",
                 callback_data="fact:extract_zip"
             )
         )
