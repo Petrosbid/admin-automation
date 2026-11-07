@@ -239,7 +239,6 @@ async def _smart_download_pipeline_job(
             )
 
         if copied_server_name:
-            # نام از روی قسمت‌های قبلی سرور کپی شد -> تغییر نام خودکار بدون نیاز به سوال از کاربر!
             final_path = vid.with_name(copied_server_name)
             if vid.resolve() != final_path.resolve():
                 if final_path.exists():
@@ -266,6 +265,16 @@ async def _smart_download_pipeline_job(
                     ),
                     parse_mode="Markdown"
                 )
+
+            # بررسی وجود زیرنویس در پوشه و پرسش از کاربر برای ساخت سافت‌ساب و آپلود آن
+            await _check_and_prompt_auto_softsub_for_new_quality(
+                bot=bot,
+                chat_id=chat_id,
+                vid_path=vid,
+                is_series=is_series,
+                season_or_movie_dir=season_or_movie_dir,
+                ep_tag=ep_tag
+            )
         else:
             # اولویت دوم: در سرور اصلی قسمت قبلی برای کپی کردن نام وجود نداشت (یا فیلم سینمایی است)
             # -> ساخت نام استاندارد بر اساس پوشه و پرسش از کاربر برای تایید یا ویرایش نام قبل از آپلود!
@@ -313,6 +322,171 @@ async def _send_fullhd_e01_prompt(bot: Bot, chat_id: int, vid_path: Path, remote
         parse_mode="Markdown"
     )
 
+async def _check_and_prompt_auto_softsub_for_new_quality(
+    bot: Bot,
+    chat_id: int,
+    vid_path: Path,
+    is_series: bool,
+    season_or_movie_dir: Path,
+    ep_tag: str
+):
+    """
+    بررسی وجود زیرنویس فارسی در پوشه زیرنویس پس از دانلود یک کیفیت جدید:
+    اگر برای این قسمت (یا فیلم) زیرنویس فارسی موجود باشد، از کاربر تاییدیه می‌گیرد
+    تا نسخه سافت‌ساب این کیفیت جدید را هم بسازد و به سرور آپلود کند.
+    """
+    if not vid_path.exists():
+        return
+
+    # اگر خودِ پوشه از نوع SoftSub یا HardSub است، نیازی به سافت‌ساب مجدد نیست
+    parent_low = vid_path.parent.name.lower()
+    if parent_low in ("softsub", "hardsub", "srt", "sub") or parent_low.endswith(("-softsub", "-hardsub")):
+        return
+
+    plan = await AutomationService.analyze_and_build_plan(
+        season_or_movie_dir,
+        ep_tag if is_series else None
+    )
+
+    # جستجوی دقیق زیرنویس فارسی مربوط به همین قسمت در پوشه srt/FA یا srt
+    fa_candidates = AutomationService.find_local_fa_subtitles(plan)
+    matched_map = AutomationService.match_subtitles_to_episodes([plan], fa_candidates)
+    key = plan.season_ep_tag if (is_series and plan.season_ep_tag) else "MOVIE"
+    fa_sub = matched_map.get(key)
+
+    if not fa_sub or not fa_sub.exists():
+        return
+
+    en_sub = plan.existing_en_sub if (plan.existing_en_sub and plan.existing_en_sub.exists()) else None
+
+    if is_series:
+        soft_out_dir = season_or_movie_dir / f"{vid_path.parent.name}-SoftSub"
+    else:
+        soft_out_dir = season_or_movie_dir / "SoftSub"
+
+    soft_out_file = soft_out_dir / AutomationService.build_softsub_filename(vid_path)
+    remote_soft_dir = AutomationService.compute_server_remote_dir_for_local_path(soft_out_file)
+
+    token = uuid.uuid4().hex[:6]
+    PENDING_POST_DL_ITEMS[token] = {
+        "type": "new_quality_softsub",
+        "raw_video": str(vid_path.resolve()),
+        "output_file": str(soft_out_file.resolve()),
+        "fa_sub": str(fa_sub.resolve()),
+        "en_sub": str(en_sub.resolve()) if en_sub else None,
+        "quality_folder": vid_path.parent.name,
+        "remote_soft_dir": remote_soft_dir,
+    }
+
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text="✅ بله، سافت‌ساب کن و در سرور آپلود کن",
+            callback_data=f"pdl:softyes:{token}"
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="📎 فقط سافت‌ساب کن (بدون آپلود)",
+            callback_data=f"pdl:softlocal:{token}"
+        ),
+        InlineKeyboardButton(
+            text="❌ خیر، نیازی نیست",
+            callback_data=f"pdl:softno:{token}"
+        )
+    )
+
+    en_badge = f"`{en_sub.name}`" if en_sub else "`داخلی فیلم / ندارد`"
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"🎬 **زیرنویس فارسی برای این کیفیت جدید در پوشه موجود است!**\n\n"
+            f"📥 **کیفیت دانلودشده:** `{vid_path.parent.name}/{vid_path.name}`\n"
+            f"🇮🇷 **زیرنویس فارسی یافت‌شده:** `{fa_sub.name}`\n"
+            f"🇬🇧 **زیرنویس انگلیسی:** {en_badge}\n"
+            f"📂 **مسیر سافت‌ساب خروجی:** `{soft_out_dir.name}/{soft_out_file.name}`\n"
+            f"☁️ **مسیر آپلود در سرور:** `{remote_soft_dir}`\n\n"
+            "آیا می‌خواهید این کیفیت جدید به صورت خودکار **سافت‌ساب شده و به سرور آپلود گردد**؟"
+        ),
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("pdl:softyes:"))
+async def cb_pdl_new_quality_softsub_yes(call: CallbackQuery):
+    token = call.data.split(":")[2]
+    info = PENDING_POST_DL_ITEMS.pop(token, None)
+    if not info:
+        return await call.answer("⚠️ این آیتم منقضی شده است.", show_alert=True)
+
+    raw_vid = Path(info["raw_video"])
+    out_file = Path(info["output_file"])
+    fa_sub = Path(info["fa_sub"])
+    en_sub = Path(info["en_sub"]) if info.get("en_sub") else None
+    brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    task = await queue_engine.add_task(
+        "mkvtoolnix",
+        f"SoftSub [{info['quality_folder']}]: {out_file.name}",
+        AutomationService.run_softsub_and_optional_upload,
+        raw_vid,
+        out_file,
+        fa_sub,
+        en_sub,
+        brand,
+        True  # آپلود خودکار به سرور پس از اتمام سافت‌ساب
+    )
+
+    await call.message.edit_text(
+        f"✅ **سافت‌ساب و آپلود خودکار در صف قرار گرفت!**\n\n"
+        f"📎 فایل خروجی: `{out_file.parent.name}/{out_file.name}`\n"
+        f"☁️ مقصد آپلود پس از اتمام: `{info['remote_soft_dir']}`\n"
+        f"🆔 کد تسک: `{task.task_id}`",
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("pdl:softlocal:"))
+async def cb_pdl_new_quality_softsub_local_only(call: CallbackQuery):
+    token = call.data.split(":")[2]
+    info = PENDING_POST_DL_ITEMS.pop(token, None)
+    if not info:
+        return await call.answer("⚠️ این آیتم منقضی شده است.", show_alert=True)
+
+    raw_vid = Path(info["raw_video"])
+    out_file = Path(info["output_file"])
+    fa_sub = Path(info["fa_sub"])
+    en_sub = Path(info["en_sub"]) if info.get("en_sub") else None
+    brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    task = await queue_engine.add_task(
+        "mkvtoolnix",
+        f"SoftSub [{info['quality_folder']}]: {out_file.name}",
+        AutomationService.run_softsub_and_optional_upload,
+        raw_vid,
+        out_file,
+        fa_sub,
+        en_sub,
+        brand,
+        False  # بدون آپلود به سرور
+    )
+
+    await call.message.edit_text(
+        f"✅ **سافت‌ساب (بدون آپلود) در صف قرار گرفت!**\n"
+        f"📎 فایل خروجی: `{out_file.parent.name}/{out_file.name}`\n"
+        f"🆔 کد تسک: `{task.task_id}`",
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("pdl:softno:"))
+async def cb_pdl_new_quality_softsub_no(call: CallbackQuery):
+    token = call.data.split(":")[2]
+    PENDING_POST_DL_ITEMS.pop(token, None)
+    await call.message.edit_text("⏭ ساخت سافت‌ساب برای این کیفیت رد شد.")
 
 async def _send_standard_name_confirmation_prompt(
     bot: Bot,
@@ -474,6 +648,23 @@ async def _finalize_post_dl_rename_and_upload(
         await msg_or_call.message.edit_text(done_txt, parse_mode="Markdown")
     else:
         await msg_or_call.answer(done_txt, parse_mode="Markdown")
+
+    if isinstance(msg_or_call, CallbackQuery):
+        await msg_or_call.message.edit_text(done_txt, parse_mode="Markdown")
+    else:
+        await msg_or_call.answer(done_txt, parse_mode="Markdown")
+
+        # پس از نهایی شدن نام فایل خام، بررسی کن آیا زیرنویس فارسی برای این قسمت در پوشه هست تا سافت‌ساب شود؟
+    is_ser, season_or_movie_dir, _ = _resolve_series_or_movie_context(vid_path.parent)
+    ep_tag = AutomationService.extract_episode_tag(vid_path.name) or ""
+    await _check_and_prompt_auto_softsub_for_new_quality(
+        bot=bot,
+        chat_id=chat_id,
+        vid_path=vid_path,
+        is_series=is_ser,
+        season_or_movie_dir=season_or_movie_dir,
+        ep_tag=ep_tag
+    )
 
 
 @router.callback_query(F.data.startswith("pdl:stdok:"))

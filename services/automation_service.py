@@ -60,6 +60,8 @@ class AutomationService:
         "720p-EBTV",
         "1080p-x265-PSA",
         "720p-x265-PSA",
+        "1080p-Pahe",
+        "720p-Pahe",
         "480p-RMTeam",
     )
 
@@ -223,6 +225,10 @@ class AutomationService:
                 return f"{clean_name}.{ep_tag}.1080p.10bit.{src_type}.{ch_tag}.x265.PSA.EBTV.mkv"
             if "720p-x265-psa" in f_low:
                 return f"{clean_name}.{ep_tag}.720p.10bit.{src_type}.2CH.x265.PSA.EBTV.mkv"
+            if "1080p-pahe" in f_low:
+                return f"{clean_name}.{ep_tag}.1080p.{src_type}.6CH.Pahe.EBTV.mkv"
+            if "720p-pahe" in f_low:
+                return f"{clean_name}.{ep_tag}.720p.{src_type}.Pahe.EBTV.mkv"
             if "480p-rmteam" in f_low or "480p-rmt" in f_low:
                 return f"{clean_name}.{ep_tag}.480p.{src_type}.RMTeam.EBTV.mkv"
             if f_low == "fullhd":

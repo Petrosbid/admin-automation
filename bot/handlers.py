@@ -1193,3 +1193,64 @@ async def handle_new_fav_cuteftp_path(message: Message, state: FSMContext):
         reply_markup=cuteftp_destination_kb(active_gui_path),
         parse_mode="Markdown"
     )
+
+# ==================== هندلرهای دکمه‌های شیشه‌ای زیر نوتیفیکیشن‌ها ====================
+@router.callback_query(F.data == "ntf:del_msg")
+async def cb_notif_delete_message(call: CallbackQuery):
+    """حذف پیام نوتیفیکیشن از صفحه چت تلگرام برای جلوگیری از شلوغی چت"""
+    try:
+        await call.message.delete()
+    except Exception:
+        await call.answer("⚠️ امکان حذف این پیام وجود ندارد.")
+
+
+@router.callback_query(F.data.startswith("ntf:open:"))
+async def cb_notif_open_folder_in_filemgr(call: CallbackQuery, state: FSMContext):
+    """پرش مستقیم از روی نوتیفیکیشن به داخل همان پوشه در فایل‌منیجر"""
+    from core.queue_manager import NOTIF_PATH_REGISTRY
+    token = call.data.split(":")[2]
+    path_str = NOTIF_PATH_REGISTRY.get(token)
+    if not path_str or not Path(path_str).exists():
+        return await call.answer("⚠️ این پوشه دیگر وجود ندارد یا جابجا شده است.", show_alert=True)
+
+    target_p = Path(path_str)
+    folder_p = target_p if target_p.is_dir() else target_p.parent
+    await state.update_data(current_dir=str(folder_p), fm_selected_files=[])
+    await render_directory(call, state, folder_p, page=0)
+
+
+@router.callback_query(F.data.startswith("ntf:sauto:"))
+async def cb_notif_run_smart_auto_on_folder(call: CallbackQuery, state: FSMContext):
+    """شروع مستقیم اتوماسیون هوشمند روی پوشه دانلودشده از روی دکمه نوتیفیکیشن"""
+    from core.queue_manager import NOTIF_PATH_REGISTRY
+    from bot.subtitle_handlers import _render_smart_auto_browser
+    token = call.data.split(":")[2]
+    path_str = NOTIF_PATH_REGISTRY.get(token)
+    if not path_str or not Path(path_str).exists():
+        return await call.answer("⚠️ مسیر مورد نظر یافت نشد.", show_alert=True)
+
+    target_p = Path(path_str)
+    folder_p = target_p if target_p.is_dir() else target_p.parent
+    await state.update_data(sauto_selected_eps=[])
+    await _render_smart_auto_browser(call, state, folder_p, page=0)
+
+
+@router.callback_query(F.data.startswith("ntf:up:"))
+async def cb_notif_quick_upload_file(call: CallbackQuery):
+    """آپلود سریع فایل تولیدشده به مسیر متناظر سرور با ۱ کلیک از روی نوتیفیکیشن"""
+    from core.queue_manager import NOTIF_PATH_REGISTRY
+    token = call.data.split(":")[2]
+    path_str = NOTIF_PATH_REGISTRY.get(token)
+    if not path_str or not Path(path_str).exists():
+        return await call.answer("⚠️ فایل مورد نظر یافت نشد.", show_alert=True)
+
+    file_p = Path(path_str).resolve()
+    remote_dir = AutomationService.compute_server_remote_dir_for_local_path(file_p)
+    task = await queue_engine.add_task(
+        "upload",
+        f"QuickUpload [{remote_dir}]: {file_p.name}",
+        CuteFTPService.upload_path,
+        file_p,
+        remote_dir
+    )
+    await call.answer(f"☁️ آپلود فایل در مسیر {remote_dir} به صف اضافه شد! (#{task.task_id})", show_alert=True)

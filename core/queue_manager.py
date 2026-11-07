@@ -3,6 +3,7 @@ import html
 import inspect
 import logging
 import re
+import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
@@ -10,8 +11,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.config_loader import cfg
+
+# کش موقت مسیرها برای دکمه‌های شیشه‌ای نوتیفیکیشن‌ها (جلوگیری از محدودیت ۶۴ بایت callback_data در تلگرام)
+NOTIF_PATH_REGISTRY: dict[str, str] = {}
+
+
+def register_notif_path(path_obj: Path | str) -> str:
+    token = uuid.uuid4().hex[:8]
+    NOTIF_PATH_REGISTRY[token] = str(Path(path_obj).resolve())
+    # نگه داشتن حداکثر ۵۰۰ مسیر اخیر در حافظه
+    if len(NOTIF_PATH_REGISTRY) > 500:
+        oldest_key = next(iter(NOTIF_PATH_REGISTRY))
+        NOTIF_PATH_REGISTRY.pop(oldest_key, None)
+    return token
 
 
 @dataclass
@@ -25,11 +41,25 @@ class QueueTask:
     status: str = "⏳ در انتظار"
     progress: str = "0%"
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%H:%M:%S"))
+    started_ts: float = 0.0
+    finished_ts: float = 0.0
     error: str | None = None
     result: Any = None
     is_finished: bool = False
     is_cancelled: bool = False
     running_asyncio_task: asyncio.Task | None = None
+
+    @property
+    def elapsed_str(self) -> str:
+        if self.started_ts <= 0:
+            return "00:00"
+        end_t = self.finished_ts if self.finished_ts > 0 else time.time()
+        total_sec = max(0, int(end_t - self.started_ts))
+        m, s = divmod(total_sec, 60)
+        h, m = divmod(m, 60)
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
 
 
 class QueueManager:
@@ -39,7 +69,7 @@ class QueueManager:
         "mkvtoolnix": "🎬 سافت‌ساب (MKVToolNix)",
         "handbrake": "🔥 هاردساب / انکود (HandBrake)",
         "download": "📥 دانلود فایل",
-        "upload": "☁️ آپلود به سرور (CuteFTP)",
+        "upload": "☁️ آپلود به سرور (FTP)",
     }
 
     def __init__(self):
@@ -150,11 +180,77 @@ class QueueManager:
                 self._events[queue_type].clear()
             await self._events[queue_type].wait()
 
-    async def _notify_admins(self, html_text: str):
-        """ارسال تضمینی نوتیفیکیشن به تلگرام برای تمام انواع پراسس‌ها"""
+    @staticmethod
+    def _build_notification_kb(
+        queue_type: str,
+        target_file: Path | None = None,
+        target_dir: Path | None = None
+    ) -> InlineKeyboardMarkup:
+        """
+        ساخت دکمه‌های عملیاتی هوشمند زیر هر نوتیفیکیشن:
+        - 📂 رفتن به پوشه در فایل‌منیجر
+        - 🚀 اجرای اتوماسیون روی این پوشه (مخصوص بعد از دانلود)
+        - ☁️ آپلود سریع به سرور (مخصوص بعد از سافت‌ساب/هاردساب دستی)
+        - 📊 مشاهده صف
+        - 🗑 حذف این پیام از تلگرام (برای جلوگیری از شلوغی چت)
+        """
+        builder = InlineKeyboardBuilder()
+
+        folder_to_open = target_dir
+        if folder_to_open is None and target_file is not None:
+            folder_to_open = target_file.parent if target_file.is_file() else target_file
+
+        if folder_to_open and folder_to_open.exists():
+            dir_token = register_notif_path(folder_to_open)
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"📂 باز کردن پوشه ({folder_to_open.name[:22]})",
+                    callback_data=f"ntf:open:{dir_token}"
+                )
+            )
+            if queue_type == "download":
+                # اگر پوشه فصل سریال است یا زیرپوشه کیفیت، پوشه فصل را برای اتوماسیون هدف بگیر
+                auto_dir = folder_to_open.parent if re.match(r"^[Ss]\d{1,2}$", folder_to_open.parent.name) else folder_to_open
+                auto_token = register_notif_path(auto_dir)
+                builder.row(
+                    InlineKeyboardButton(
+                        text="🚀 اتوماسیون هوشمند روی این پوشه",
+                        callback_data=f"ntf:sauto:{auto_token}"
+                    )
+                )
+
+        if queue_type in ("mkvtoolnix", "handbrake") and target_file and target_file.is_file():
+            file_token = register_notif_path(target_file)
+            builder.row(
+                InlineKeyboardButton(
+                    text="☁️ آپلود سریع این فایل به سرور",
+                    callback_data=f"ntf:up:{file_token}"
+                )
+            )
+
+        builder.row(
+            InlineKeyboardButton(
+                text="📊 وضعیت صف‌ها",
+                callback_data="menu:queues"
+            ),
+            InlineKeyboardButton(
+                text="🗑 حذف این پیام",
+                callback_data="ntf:del_msg"
+            )
+        )
+        return builder.as_markup()
+
+    async def _notify_admins(self, html_text: str, reply_markup: InlineKeyboardMarkup | None = None):
         if not self._bot:
-            logging.error("QueueManager._bot is None!")
             return
+
+        if reply_markup is None:
+            kb = InlineKeyboardBuilder()
+            kb.row(
+                InlineKeyboardButton(text="📊 وضعیت صف‌ها", callback_data="menu:queues"),
+                InlineKeyboardButton(text="🗑 حذف این پیام", callback_data="ntf:del_msg"),
+            )
+            reply_markup = kb.as_markup()
 
         target_ids = self._get_target_chat_ids()
         for admin_id in target_ids:
@@ -163,6 +259,7 @@ class QueueManager:
                     chat_id=admin_id,
                     text=html_text[:4000],
                     parse_mode="HTML",
+                    reply_markup=reply_markup,
                     disable_web_page_preview=True
                 )
             except Exception as e:
@@ -172,36 +269,52 @@ class QueueManager:
                     await self._bot.send_message(
                         chat_id=admin_id,
                         text=plain[:4000],
+                        reply_markup=reply_markup,
                         disable_web_page_preview=True
                     )
                 except Exception as e2:
                     logging.error(f"Failed to send notification to {admin_id}: {e2}")
 
     async def _send_completion_notification(self, task: QueueTask, res: Any):
-        """ساخت و ارسال پیام تکمیل شدن برای دانلود، سافت‌ساب، هاردساب/انکود و آپلود"""
         section_label = html.escape(self.QUEUE_LABELS.get(task.queue_type, task.queue_type.upper()))
         safe_title = html.escape(str(task.title))
         safe_id = html.escape(str(task.task_id))
+        elapsed = task.elapsed_str
 
-        # ۱. اگر پراسس آپلود بود:
+        # استخراج مسیر فایل یا پوشه محلی از آرگومان‌های تسک برای دکمه «رفتن به پوشه»
+        local_ref_path: Path | None = None
+        for arg in task.args:
+            if isinstance(arg, Path) and arg.exists():
+                local_ref_path = arg
+            elif isinstance(arg, list) and arg and isinstance(arg[0], Path) and arg[0].exists():
+                local_ref_path = arg[0]
+
+        # ۱. نوتیفیکیشن آپلود
         if task.queue_type == "upload":
+            target_dir = local_ref_path.parent if (local_ref_path and local_ref_path.is_file()) else local_ref_path
+            kb = self._build_notification_kb("upload", target_file=local_ref_path, target_dir=target_dir)
+
             if isinstance(res, list) and res:
-                links_block = "\n".join([f"🔗 <code>{html.escape(str(u))}</code>" for u in res[:25]])
+                links_block = "\n".join([f"🔗 <code>{html.escape(str(u))}</code>" for u in res[:20]])
+                extra = f"\n<i>... و {len(res) - 20} لینک دیگر</i>" if len(res) > 20 else ""
                 await self._notify_admins(
-                    f"☁️ <b>آپلود با موفقیت به پایان رسید!</b>\n"
-                    f"🆔 کد: <code>{safe_id}</code>\n"
+                    f"☁️ <b>آپلود به سرور با موفقیت تکمیل شد!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🆔 کد تسک: <code>{safe_id}</code>  ▏  ⏱ زمان: <code>{elapsed}</code>\n"
                     f"📌 عنوان: <code>{safe_title}</code>\n\n"
-                    f"📥 <b>لینک‌های مستقیم دانلود:</b>\n{links_block}"
+                    f"📥 <b>لینک‌های مستقیم دانلود ({len(res)} فایل):</b>\n{links_block}{extra}",
+                    reply_markup=kb
                 )
             else:
                 await self._notify_admins(
                     f"☁️ <b>آپلود با موفقیت انجام شد!</b>\n"
-                    f"🆔 کد: <code>{safe_id}</code>\n"
-                    f"📌 عنوان: <code>{safe_title}</code>"
+                    f"🆔 کد: <code>{safe_id}</code>  ▏  ⏱ زمان: <code>{elapsed}</code>\n"
+                    f"📌 عنوان: <code>{safe_title}</code>",
+                    reply_markup=kb
                 )
             return
 
-        # ۲. برای دانلود، سافت‌ساب (mkvtoolnix) و هاردساب/انکود (handbrake):
+        # ۲. نوتیفیکیشن دانلود، سافت‌ساب و هاردساب/انکود
         out_path: Path | None = None
         if isinstance(res, Path):
             out_path = res
@@ -220,22 +333,25 @@ class QueueManager:
             except Exception:
                 pass
 
-        if out_path is None and task.args:
-            for arg in reversed(task.args):
-                if isinstance(arg, Path) and arg.exists():
-                    out_path = arg
-                    break
+        if out_path is None:
+            out_path = local_ref_path
 
+        target_file_for_kb: Path | None = None
+        target_dir_for_kb: Path | None = None
         details = ""
+
         if out_path and out_path.exists():
             if out_path.is_file():
+                target_file_for_kb = out_path
+                target_dir_for_kb = out_path.parent
                 size_mb = out_path.stat().st_size / (1024 * 1024)
                 details = (
-                    f"\n📄 <b>فایل خروجی:</b>\n<code>{html.escape(out_path.name)}</code>\n"
-                    f"📂 <b>مسیر ذخیره:</b>\n<code>{html.escape(str(out_path.parent))}</code>\n"
-                    f"📦 <b>حجم فایل:</b> <code>{size_mb:.2f} MB</code>"
+                    f"\n📄 <b>نام فایل:</b>\n<code>{html.escape(out_path.name)}</code>\n"
+                    f"📂 <b>محل ذخیره:</b>\n<code>{html.escape(str(out_path.parent))}</code>\n"
+                    f"📦 <b>حجم نهایی:</b> <code>{size_mb:.2f} MB</code>"
                 )
             elif out_path.is_dir():
+                target_dir_for_kb = out_path
                 files_in_dir = sorted(
                     [
                         f for f in out_path.rglob("*")
@@ -246,15 +362,16 @@ class QueueManager:
                 )
                 if files_in_dir:
                     newest = files_in_dir[0]
+                    target_file_for_kb = newest
                     size_mb = newest.stat().st_size / (1024 * 1024)
                     extra_count = f" (+ {len(files_in_dir) - 1} فایل دیگر)" if len(files_in_dir) > 1 else ""
                     details = (
                         f"\n📄 <b>فایل دانلود شده:</b>\n<code>{html.escape(newest.name)}</code>{extra_count}\n"
-                        f"📂 <b>مسیر پوشه:</b>\n<code>{html.escape(str(out_path))}</code>\n"
+                        f"📂 <b>پوشه مقصد:</b>\n<code>{html.escape(str(out_path))}</code>\n"
                         f"📦 <b>حجم فایل:</b> <code>{size_mb:.2f} MB</code>"
                     )
                 else:
-                    details = f"\n📂 <b>مسیر پوشه:</b>\n<code>{html.escape(str(out_path))}</code>"
+                    details = f"\n📂 <b>پوشه مقصد:</b>\n<code>{html.escape(str(out_path))}</code>"
 
         if task.queue_type == "download":
             header = "📥 <b>دانلود فایل با موفقیت به پایان رسید!</b>"
@@ -265,14 +382,19 @@ class QueueManager:
         else:
             header = f"✅ <b>عملیات {section_label} تکمیل شد!</b>"
 
+        kb = self._build_notification_kb(
+            task.queue_type,
+            target_file=target_file_for_kb,
+            target_dir=target_dir_for_kb
+        )
         msg = (
             f"{header}\n"
-            f"🆔 کد تسک: <code>{safe_id}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 کد تسک: <code>{safe_id}</code>  ▏  ⏱ زمان کل: <code>{elapsed}</code>\n"
             f"📌 عنوان: <code>{safe_title}</code>"
             f"{details}"
         )
-        logging.info(f"🔔 Sending completion notification for task #{task.task_id} ({task.queue_type})")
-        await self._notify_admins(msg)
+        await self._notify_admins(msg, reply_markup=kb)
 
     async def _worker_loop(self, queue_type: str, worker_idx: int):
         while True:
@@ -280,6 +402,7 @@ class QueueManager:
             if not task:
                 continue
 
+            task.started_ts = time.time()
             task.status = f"⚙️ در حال اجرا (W{worker_idx})"
             task.progress = "شروع پردازش..."
 
@@ -302,6 +425,7 @@ class QueueManager:
                 task.running_asyncio_task = run_task
                 res = await run_task
 
+                task.finished_ts = time.time()
                 task.result = res
                 task.status = "✅ تکمیل شد"
                 task.progress = "100%"
@@ -310,10 +434,12 @@ class QueueManager:
                 await self._send_completion_notification(task, res)
 
             except asyncio.CancelledError:
+                task.finished_ts = time.time()
                 task.status = "🛑 لغو شد"
                 task.progress = "متوقف شده توسط کاربر"
                 task.is_finished = True
             except Exception as e:
+                task.finished_ts = time.time()
                 logging.error(f"Task {task.task_id} failed:\n{traceback.format_exc()}")
                 task.error = str(e)
                 task.status = "❌ خطا"
@@ -321,7 +447,8 @@ class QueueManager:
                 task.is_finished = True
                 await self._notify_admins(
                     f"❌ <b>خطا در پردازش!</b>\n"
-                    f"🆔 کد: <code>{html.escape(str(task.task_id))}</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🆔 کد: <code>{html.escape(str(task.task_id))}</code>  ▏  ⏱ زمان: <code>{task.elapsed_str}</code>\n"
                     f"⚙️ بخش: <code>{html.escape(task.queue_type.upper())}</code>\n"
                     f"📌 عنوان: <code>{html.escape(str(task.title))}</code>\n"
                     f"⚠️ جزئیات خطا:\n<code>{html.escape(str(e)[:400])}</code>"
@@ -345,10 +472,6 @@ class QueueManager:
                 self._workers.append(w)
 
     def restart_workers_for_hot_reload(self):
-        """
-        جایگزینی تسک‌های _worker_loop قدیمی با کد جدید هنگام زدن کلید R:
-        اگر تسکی در این لحظه در حال اجرا نباشد، ورکرهای قدیمی را بسته و ورکرهای جدید را با کد آپدیت‌شده استارت می‌زند.
-        """
         any_running = any(
             t.running_asyncio_task is not None and not t.running_asyncio_task.done()
             for t in self.tasks.values()
