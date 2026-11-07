@@ -140,6 +140,45 @@ async def _check_and_notify_missing_local_folders(bot: Bot, chat_id: int, season
         )
 
 
+async def _send_missing_remote_folder_upload_prompt(
+    bot: Bot,
+    chat_id: int,
+    vid_path: Path,
+    remote_folder_path: str
+):
+    """وقتی بعد از دانلود می‌خواهد فایلی را آپلود کند اما پوشه‌اش روی سرور نیست، از کاربر سوال می‌پرسد"""
+    token = uuid.uuid4().hex[:6]
+    PENDING_POST_DL_ITEMS[token] = {
+        "type": "fullhd_e01",
+        "vid_path": str(vid_path.resolve()),
+        "remote_dir": remote_folder_path,
+    }
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text=f"✅ بله، پوشه {vid_path.parent.name} در سرور ساخته و آپلود شود",
+            callback_data=f"pdl:fhdyes:{token}"
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="❌ خیر، فقط در لوکال بماند (آپلود نشود)",
+            callback_data=f"pdl:fhdno:{token}"
+        )
+    )
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"❓ **پوشه مقصد روی سرور وجود ندارد!**\n\n"
+            f"📄 فایل دانلودشده:\n`{vid_path.name}`\n"
+            f"📂 پوشه محلی: `{vid_path.parent.name}`\n"
+            f"☁️ مسیر سرور: `{remote_folder_path}`\n\n"
+            "این پوشه در حال حاضر روی سرور مقصد وجود ندارد. آیا می‌خواهید پوشه ساخته شده و فایل آپلود شود؟"
+        ),
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+
 async def _smart_download_pipeline_job(
     bot: Bot,
     chat_id: int,
@@ -214,24 +253,15 @@ async def _smart_download_pipeline_job(
     server_files_in_folder = remote_folder_info.get("files", [])
     remote_folder_exists = bool(remote_folder_info.get("exists", False))
 
+    auto_upload_cfg = bool(cfg.get("cuteftp", "auto_upload_after_download", True))
+
     for vid in new_videos:
         ep_tag = AutomationService.extract_episode_tag(vid.name) or ""
-        ep_num = AutomationService.extract_episode_number_only(vid.name)
-        is_fullhd_folder = (dest_dir.name.lower() == "fullhd")
 
-        # تعیین وضعیت آپلود برای پوشه FullHD طبق دستور شما
-        should_auto_upload = True
-        ask_fullhd_e01_question = False
+        # اگر تنظیمات آپلود خودکار بعد از دانلود روشن است ولی پوشه روی سرور وجود ندارد -> از کاربر بپرس!
+        ask_missing_folder_question = (auto_upload_cfg and not remote_folder_exists)
+        should_auto_upload = (auto_upload_cfg and remote_folder_exists)
 
-        if is_series and is_fullhd_folder and not remote_folder_exists:
-            if ep_num == 1 or ep_tag.endswith("E01"):
-                ask_fullhd_e01_question = True
-                should_auto_upload = False
-            else:
-                # در سرور اصلی پوشه FullHD وجود ندارد و قسمت اول هم نیست -> نیازی به آپلود FullHD نیست
-                should_auto_upload = False
-
-        # اولویت اول نام‌گذاری: کپی کردن الگوی نام از قسمت‌های قبلی همین پوشه در سرور اصلی (با حفظ Eyy جدید)
         copied_server_name = None
         if is_series and ep_tag and server_files_in_folder:
             copied_server_name = AutomationService.match_filename_from_server_siblings(
@@ -246,8 +276,8 @@ async def _smart_download_pipeline_job(
                 vid.rename(final_path)
                 vid = final_path
 
-            if ask_fullhd_e01_question:
-                await _send_fullhd_e01_prompt(bot, chat_id, vid, remote_folder_path)
+            if ask_missing_folder_question:
+                await _send_missing_remote_folder_upload_prompt(bot, chat_id, vid, remote_folder_path)
             elif should_auto_upload:
                 await queue_engine.add_task(
                     "upload",
@@ -256,17 +286,7 @@ async def _smart_download_pipeline_job(
                     vid,
                     remote_folder_path
                 )
-            else:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"✅ فایل `FullHD` دانلود و به نام استاندارد تغییر یافت:\n`{vid.name}`\n"
-                        f"ℹ️ *(چون پوشه `FullHD` روی سرور اصلی وجود ندارد و قسمت اول نیست، به سرور آپلود نشد)*"
-                    ),
-                    parse_mode="Markdown"
-                )
 
-            # بررسی وجود زیرنویس در پوشه و پرسش از کاربر برای ساخت سافت‌ساب و آپلود آن
             await _check_and_prompt_auto_softsub_for_new_quality(
                 bot=bot,
                 chat_id=chat_id,
@@ -276,8 +296,6 @@ async def _smart_download_pipeline_job(
                 ep_tag=ep_tag
             )
         else:
-            # اولویت دوم: در سرور اصلی قسمت قبلی برای کپی کردن نام وجود نداشت (یا فیلم سینمایی است)
-            # -> ساخت نام استاندارد بر اساس پوشه و پرسش از کاربر برای تایید یا ویرایش نام قبل از آپلود!
             suggested_std_name = await AutomationService.build_standard_raw_filename_for_folder(
                 video_path=vid,
                 folder_name=dest_dir.name,
@@ -292,7 +310,7 @@ async def _smart_download_pipeline_job(
                 suggested_name=suggested_std_name,
                 remote_folder_path=remote_folder_path,
                 should_auto_upload=should_auto_upload,
-                ask_fullhd_e01_question=ask_fullhd_e01_question
+                ask_fullhd_e01_question=ask_missing_folder_question
             )
 
     return new_videos[0]
@@ -995,7 +1013,10 @@ async def handle_new_dl_subfolder_name(message: Message, state: FSMContext):
     if ("movies" in parts_low or "movie" in parts_low) and new_dir.parent.name.lower() in ("movies", "movie"):
         AutomationService.create_movie_structure(new_dir)
     elif AutomationService.SEASON_DIR_REGEX.match(new_dir.name):
-        AutomationService.create_series_season_structure(new_dir)
+        if "anime" in parts_low:
+            AutomationService.create_anime_season_structure(new_dir)
+        else:
+            AutomationService.create_series_season_structure(new_dir)
 
     await message.answer(f"✅ پوشه `{new_dir.name}` ساخته شد و وارد آن شدید!", parse_mode="Markdown")
     await _render_download_folder_browser(message, state, new_dir, page=0)

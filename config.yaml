@@ -82,3 +82,4 @@ ftp:
   retry_delay_sec: 5                # فاصله پایه بین تلاش‌های مجدد (Exponential Backoff)
   root_remote_dir: "/"              # پوشه ریشه در سرور FTP
   public_base_url: "https://dl15.cdnzed.sbs"  # دامنه عمومی برای تولید لینک مستقیم دانلود
+  auto_upload_after_download: true

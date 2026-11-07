@@ -1,4 +1,5 @@
 import asyncio
+import html
 import re
 import shutil
 import subprocess
@@ -19,30 +20,178 @@ class SubtitleService:
 
     @staticmethod
     def read_subtitle_safe(sub_path: Path) -> str:
+        """خواندن ایمن فایل زیرنویس با تشخیص خودکار انکودینگ و حذف بایت‌های مخرب"""
         raw_bytes = sub_path.read_bytes()
-        detected = chardet.detect(raw_bytes)
-        encoding = detected.get("encoding") or "utf-8"
-        if encoding.lower() in ["ascii", "windows-1252", "iso-8859-1"]:
-            encoding = "cp1256"
-        try:
-            return raw_bytes.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            return raw_bytes.decode(encoding, errors="replace")
+        # حذف کاراکترهای Null که باعث خراب شدن فایل در پلیرها و نوت‌پد ویندوز می‌شوند
+        raw_bytes = raw_bytes.replace(b"\x00", b"")
+
+        # بررسی BOM های استاندارد
+        if raw_bytes.startswith(b"\xef\xbb\xbf"):
+            text = raw_bytes.decode("utf-8-sig", errors="replace")
+        elif raw_bytes.startswith(b"\xff\xfe") or raw_bytes.startswith(b"\xfe\xff"):
+            text = raw_bytes.decode("utf-16", errors="replace")
+        else:
+            try:
+                text = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                detected = chardet.detect(raw_bytes)
+                encoding = (detected.get("encoding") or "cp1256").lower()
+                if encoding in ("ascii", "windows-1252", "iso-8859-1", "macroman"):
+                    encoding = "cp1256"
+                try:
+                    text = raw_bytes.decode(encoding, errors="replace")
+                except Exception:
+                    text = raw_bytes.decode("cp1256", errors="replace")
+
+        # پاکسازی کاراکترهای کنترلی غیرمجاز و یکسان‌سازی پایان خطوط
+        text = text.lstrip("\ufeff")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        return text
 
     @classmethod
-    def normalize_srt_utf8(cls, sub_path: Path) -> Path:
+    def normalize_subtitle_file(cls, sub_path: Path) -> Path:
+        """
+        نرمال‌سازی کامل فایل زیرنویس (.srt, .ass, .ssa) به فرمت استاندارد ویندوز (CRLF + UTF-8-BOM)
+        تا بدون نیاز به باز کردن و Save As دستی، در تمام پلیرها و نرم‌افزارها به درستی باز شود.
+        """
+        sub_path = Path(sub_path)
+        if not sub_path.exists() or sub_path.suffix.lower() not in cls.SUB_EXTENSIONS:
+            return sub_path
+
         content = cls.read_subtitle_safe(sub_path)
-        sub_path.write_text(content, encoding="utf-8-sig")
+        ext_low = sub_path.suffix.lower()
+
+        if ext_low == ".srt":
+            # بازسازی ساختار بلوک‌های SRT برای رفع به هم ریختگی شماره‌ها یا خطوط خالی
+            blocks = re.split(r"\n\s*\n", content.strip())
+            clean_blocks = []
+            counter = 1
+            for b in blocks:
+                lines = [ln.strip() for ln in b.split("\n") if ln.strip()]
+                if not lines:
+                    continue
+                # پیدا کردن خط تایم‌کد
+                time_idx = -1
+                for i, ln in enumerate(lines):
+                    if "-->" in ln:
+                        time_idx = i
+                        break
+                if time_idx == -1:
+                    continue
+                time_line = re.sub(r"(\d{2}:\d{2}:\d{2})\.(\d{3})", r"\1,\2", lines[time_idx])
+                text_lines = lines[time_idx + 1:]
+                if not text_lines:
+                    continue
+                clean_blocks.append(f"{counter}\n{time_line}\n" + "\n".join(text_lines))
+                counter += 1
+
+            if clean_blocks:
+                content = "\n\n".join(clean_blocks) + "\n"
+
+        # تبدیل تمام خطوط به استاندارد ویندوز (CRLF: \r\n) و ذخیره با امضای UTF-8-SIG (BOM)
+        windows_content = content.replace("\r\n", "\n").replace("\n", "\r\n")
+        with open(sub_path, "wb") as f:
+            f.write(windows_content.encode("utf-8-sig"))
+
         return sub_path
+
+    # حفظ نام قبلی برای سازگاری با کل پروژه
+    normalize_srt_utf8 = normalize_subtitle_file
+
+    @classmethod
+    def convert_ass_to_srt_file(cls, ass_path: Path, srt_out_path: Path | None = None) -> Path:
+        """
+        تبدیل کامل و حرفه‌ای فایل زیرنویس .ass / .ssa به فایل .srt استاندارد:
+        - حذف کامل تگ‌های استایل ASS مانند {\pos(...)}, {\fad(...)}, {\c&H...&}, {\fn...}
+        - حذف خطوط ترسیم وکتور گرافیکی ({\p1}...{\p0}) تا کدهای مختصات در زیرنویس نمایش داده نشوند
+        - تبدیل \N و \n به خط جدید واقعی و تبدیل \h به فاصله
+        - مرتب‌سازی بر اساس زمان شروع و شماره‌گذاری استاندارد با فرمت UTF-8-SIG و CRLF
+        """
+        ass_path = Path(ass_path).resolve()
+        if srt_out_path is None:
+            srt_out_path = ass_path.with_suffix(".srt")
+        else:
+            srt_out_path = Path(srt_out_path).resolve()
+
+        content = cls.read_subtitle_safe(ass_path)
+
+        def _ass_time_to_ms_and_srt(t_str: str) -> tuple[int, str]:
+            parts = t_str.strip().split(":")
+            if len(parts) != 3:
+                return 0, "00:00:00,000"
+            try:
+                h = int(parts[0])
+                m = int(parts[1])
+                s_parts = parts[2].replace(",", ".").split(".")
+                s = int(s_parts[0])
+                frac = s_parts[1] if len(s_parts) > 1 else "0"
+                ms = int((frac + "000")[:3])
+                total_ms = ((h * 3600) + (m * 60) + s) * 1000 + ms
+                return total_ms, f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+            except Exception:
+                return 0, "00:00:00,000"
+
+        parsed_events: list[tuple[int, int, str, str, str]] = []
+
+        for line in content.splitlines():
+            line_str = line.strip()
+            if not line_str.startswith("Dialogue:"):
+                continue
+
+            fields = line_str[9:].split(",", 9)
+            if len(fields) < 10:
+                continue
+
+            start_ms, start_srt = _ass_time_to_ms_and_srt(fields[1])
+            end_ms, end_srt = _ass_time_to_ms_and_srt(fields[2])
+            if end_ms <= start_ms:
+                continue
+
+            raw_text = fields[9]
+
+            # ۱. اگر خط حاوی دستورات ترسیم شکل گرافیکی ASS ({\p1} تا {\p0}) است، آن را کاملاً حذف کن
+            if re.search(r"\{\\[^}]*\\p[1-9][^}]*\}", raw_text):
+                raw_text = re.sub(r"\{\\[^}]*\\p[1-9][^}]*\}.*?(?:\{\\[^}]*\\p0[^}]*\}|$)", "", raw_text)
+                if not raw_text.strip():
+                    continue
+
+            # ۲. حذف تمامی بلوک‌های تگ و فرمت‌بندی ASS داخل آکولاد {...}
+            clean_text = re.sub(r"\{[^}]*\}", "", raw_text)
+
+            # ۳. تبدیل کاراکترهای خاص ASS به متن عادی
+            clean_text = clean_text.replace("\\N", "\n").replace("\\n", "\n").replace("\\h", " ")
+            clean_text = html.unescape(clean_text)
+
+            # ۴. پاکسازی خطوط خالی و فاصله‌های اضافی
+            clean_lines = [ln.strip() for ln in clean_text.split("\n") if ln.strip()]
+            if not clean_lines:
+                continue
+
+            final_text = "\n".join(clean_lines)
+            parsed_events.append((start_ms, end_ms, start_srt, end_srt, final_text))
+
+        # مرتب‌سازی دیالوگ‌ها بر اساس زمان شروع و حذف خطوط تکراری هم‌زمان
+        parsed_events.sort(key=lambda x: (x[0], x[1]))
+        deduped_blocks = []
+        seen_keys = set()
+
+        for start_ms, end_ms, start_srt, end_srt, txt in parsed_events:
+            key = (start_srt, end_srt, txt)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            idx = len(deduped_blocks) + 1
+            deduped_blocks.append(f"{idx}\r\n{start_srt} --> {end_srt}\r\n{txt}")
+
+        srt_content = "\r\n\r\n".join(deduped_blocks) + "\r\n"
+        srt_out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(srt_out_path, "wb") as f:
+            f.write(srt_content.encode("utf-8-sig"))
+
+        return srt_out_path
 
     @staticmethod
     def _find_archive_tool() -> tuple[str | None, str]:
-        """
-        پیدا کردن ابزار اکسترکت RAR / 7Z / ZIP روی ویندوز سرور:
-        ۱. WinRAR / UnRAR
-        ۲. 7-Zip (7z.exe)
-        ۳. ابزار داخلی ویندوز ۱۰/۱۱ (tar.exe که مبتنی بر libarchive است و RAR/ZIP/7Z را باز می‌کند)
-        """
         winrar_paths = [
             shutil.which("unrar"),
             shutil.which("winrar"),
@@ -79,11 +228,6 @@ class SubtitleService:
         remove_archive: bool = False,
         flatten_subtitles: bool = True
     ) -> list[Path]:
-        """
-        اکسترکت هوشمند انواع فایل‌های فشرده (.zip, .rar, .7z):
-        - برای .zip ابتدا از ماژول داخلی پایتون استفاده می‌کند.
-        - برای .rar و .7z (یا زیپ‌های خاص) از WinRAR، 7-Zip، tar.exe داخلی ویندوز و یا rarfile استفاده می‌کند.
-        """
         archive_path = Path(archive_path).resolve()
         extract_to = Path(extract_to).resolve()
         extract_to.mkdir(parents=True, exist_ok=True)
@@ -96,7 +240,6 @@ class SubtitleService:
         last_err = ""
 
         try:
-            # ۱. اگر فایل استاندارد ZIP است، ابتدا با zipfile پایتون باز کن
             if ext_low == ".zip" and zipfile.is_zipfile(archive_path):
                 try:
                     with zipfile.ZipFile(archive_path, "r") as zf:
@@ -127,7 +270,6 @@ class SubtitleService:
                 except Exception as ez:
                     last_err = str(ez)
 
-            # ۲. اگر فایل RAR یا 7Z است (یا باز کردن ZIP با خطا مواجه شد)، از ابزارهای سیستمی استفاده کن
             if not extracted_ok:
                 tool_bin, tool_type = cls._find_archive_tool()
 
@@ -147,7 +289,6 @@ class SubtitleService:
                     else:
                         last_err = res.stderr or res.stdout
 
-                # امتحان کردن tar.exe داخلی ویندوز ۱۰/۱۱ (bsdtar از فرمت‌های RAR، ZIP و 7Z پشتیبانی می‌کند)
                 if not extracted_ok:
                     tar_bin = shutil.which("tar") or r"C:\Windows\System32\tar.exe"
                     if tar_bin and Path(tar_bin).exists():
@@ -158,7 +299,6 @@ class SubtitleService:
                         else:
                             last_err = res.stderr or res.stdout
 
-                # امتحان کردن کتابخانه پایتونی rarfile در صورت نصب بودن
                 if not extracted_ok and ext_low == ".rar":
                     try:
                         import rarfile
@@ -171,11 +311,9 @@ class SubtitleService:
             if not extracted_ok:
                 raise RuntimeError(
                     f"عدم موفقیت در استخراج فایل {archive_path.name}. "
-                    "برای فایل‌های RAR5 مطمئن شوید WinRAR یا 7-Zip روی ویندوز سرور نصب باشد. "
                     f"({last_err[:150]})"
                 )
 
-            # ۳. انتقال فایل‌های استخراج‌شده از پوشه موقت به پوشه مقصد و نرمال‌سازی زیرنویس‌های SRT
             final_files: list[Path] = []
             for item in temp_extract_dir.rglob("*"):
                 if not item.is_file():
@@ -194,9 +332,9 @@ class SubtitleService:
                     target_path.unlink(missing_ok=True)
                 shutil.move(str(item), str(target_path))
 
-                if target_path.suffix.lower() == ".srt":
+                if target_path.suffix.lower() in cls.SUB_EXTENSIONS:
                     try:
-                        cls.normalize_srt_utf8(target_path)
+                        cls.normalize_subtitle_file(target_path)
                     except Exception:
                         pass
 
@@ -211,7 +349,6 @@ class SubtitleService:
             if temp_extract_dir.exists():
                 shutil.rmtree(temp_extract_dir, ignore_errors=True)
 
-    # حفظ نام متد قبلی به عنوان Alias تا تمام بخش‌های کد با هر سه فرمت ZIP/RAR/7Z کار کنند
     extract_zip_archive = extract_archive
 
     @staticmethod
@@ -232,7 +369,7 @@ class SubtitleService:
         content = cls.read_subtitle_safe(input_srt)
         if offset_ms == 0:
             output_srt.write_text(content, encoding="utf-8-sig")
-            return output_srt
+            return cls.normalize_subtitle_file(output_srt)
 
         def _replace_time(match: re.Match) -> str:
             h1, m1, s1, ms1, h2, m2, s2, ms2 = map(int, match.groups())
@@ -242,7 +379,7 @@ class SubtitleService:
 
         shifted_content = cls.SRT_TIME_PATTERN.sub(_replace_time, content)
         output_srt.write_text(shifted_content, encoding="utf-8-sig")
-        return output_srt
+        return cls.normalize_subtitle_file(output_srt)
 
     @classmethod
     async def auto_sync_subtitle(
@@ -253,7 +390,7 @@ class SubtitleService:
         reference_srt: Path | None = None,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
-        cls.normalize_srt_utf8(input_srt)
+        cls.normalize_subtitle_file(input_srt)
 
         ffsubsync_bin = cfg.get("paths", "ffsubsync_bin", "ffsubsync")
         ffmpeg_dir = cfg.get("paths", "ffmpeg_dir", "")
@@ -281,7 +418,7 @@ class SubtitleService:
         if proc.returncode != 0:
             raise RuntimeError(f"خطا در سینک خودکار زیرنویس: {stdout.decode('utf-8', errors='replace')}")
 
-        return output_srt
+        return cls.normalize_subtitle_file(output_srt)
 
     @staticmethod
     def html_hex_to_ass_bgr(hex_color: str) -> str:
@@ -314,4 +451,4 @@ class SubtitleService:
             styled_blocks.append(f"{idx_line}\n{time_line}\n{styled_text}")
 
         output_srt.write_text("\n\n".join(styled_blocks) + "\n", encoding="utf-8-sig")
-        return output_srt
+        return cls.normalize_subtitle_file(output_srt)

@@ -804,6 +804,12 @@ def file_browser_kb(
                 callback_data="fact:run_smart_auto_here"
             )
         )
+        builder.row(
+            InlineKeyboardButton(
+                text="☁️ آپلود هوشمند یک قسمت (SxxEyy) در پوشه‌های متناظر سرور",
+                callback_data="fact:smart_ep_upload"
+            )
+        )
 
     total_items = len(items)
     total_pages = max(1, math.ceil(total_items / BROWSER_PAGE_SIZE))

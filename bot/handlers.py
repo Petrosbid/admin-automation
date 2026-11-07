@@ -497,7 +497,7 @@ async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
         AutomationService.create_movie_structure(new_dir)
         sub_target = new_dir / "srt"
         desc = "در شاخه `Movies` با ساختار استاندارد فیلم (`SoftSub`, `Hardsub`, `srt`)"
-    elif mk_type in ("series", "anime"):
+    elif mk_type in ("series"):
         cat_key = "Anime" if mk_type == "anime" else "Series"
         base_parent = cats[cat_key] if parent_dir == workspace else parent_dir
         show_dir = base_parent / folder_name
@@ -505,6 +505,13 @@ async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
         AutomationService.create_series_season_structure(new_dir)
         sub_target = new_dir / "srt" / "FA"
         desc = f"در شاخه `{cat_key}` همراه با پوشه‌های پیش‌فرض فصل (`1080p-EBTV`, `720p-EBTV`, `1080p-x265-PSA`, `720p-x265-PSA`, `480p-RMTeam`, `srt/FA`, `srt/EN`)"
+    elif mk_type == "anime":
+        base_parent = cats["Anime"] if parent_dir == workspace else parent_dir
+        show_dir = base_parent / folder_name
+        new_dir = show_dir / "S01" if not AutomationService.SEASON_DIR_REGEX.match(folder_name) else show_dir
+        AutomationService.create_anime_season_structure(new_dir)
+        sub_target = new_dir / "srt"
+        desc = "در شاخه `Anime` همراه با پوشه‌های استاندارد (`1080p-EBTV`, `720p-EBTV`, `480p-EBTV`, `FullHD`, `1080p-x265-Judas`, `srt`)"
     else:
         new_dir = parent_dir / folder_name
         new_dir.mkdir(parents=True, exist_ok=True)
@@ -1254,3 +1261,104 @@ async def cb_notif_quick_upload_file(call: CallbackQuery):
         remote_dir
     )
     await call.answer(f"☁️ آپلود فایل در مسیر {remote_dir} به صف اضافه شد! (#{task.task_id})", show_alert=True)
+
+# ==================== آپلود هوشمند تمام فایل‌های یک قسمت (SxxEyy) به پوشه‌های متناظر در سرور ====================
+@router.callback_query(F.data == "fact:smart_ep_upload")
+async def cb_smart_episode_upload_menu(call: CallbackQuery, state: FSMContext):
+    """
+    نمایش لیست قسمت‌های موجود در فصل فعلی (مثلاً داخل Severance/S02):
+    با زدن روی هر قسمت، تمام فایل‌های آن قسمت در تمام زیرپوشه‌ها پیدا شده و هر کدام در جای متناسب خودش روی سرور آپلود می‌شود.
+    """
+    data = await state.get_data()
+    curr_dir = Path(data.get("current_dir", cfg.get("paths", "workspace_dir"))).resolve()
+
+    episodes = AutomationService.scan_all_episodes_anywhere_in_season(curr_dir)
+    if not episodes:
+        return await call.answer(
+            "⚠️ هیچ فایلی با تگ قسمت (SxxEyy) در زیرپوشه‌های این مسیر یافت نشد!",
+            show_alert=True
+        )
+
+    builder = InlineKeyboardBuilder()
+    ep_btns = [
+        InlineKeyboardButton(
+            text=f"☁️ {ep}",
+            callback_data=f"smartup_ep:{ep}"
+        )
+        for ep in episodes[:30]
+    ]
+    for i in range(0, len(ep_btns), 3):
+        builder.row(*ep_btns[i:i + 3])
+
+    builder.row(
+        InlineKeyboardButton(
+            text="☁️ آپلود هوشمند همه قسمت‌های این فصل",
+            callback_data="smartup_ep:ALL"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔙 بازگشت به فایل‌منیجر",
+            callback_data="menu:file_mgr"
+        )
+    )
+
+    await call.message.edit_text(
+        f"☁️ **آپلود هوشمند قسمت به سرور دانلود**\n"
+        f"📂 مسیر فصل فعلی:\n`{curr_dir}`\n\n"
+        "👇 **کدام قسمت را می‌خواهید آپلود کنید؟**\n"
+        "*(ربات تمام زیرپوشه‌های کیفیت، سافت‌ساب، هاردساب، انکود و `srt` را می‌گردد و هر فایلِ آن قسمت را دقیقاً در پوشه متناظر خودش روی سرور آپلود می‌کند)*:",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("smartup_ep:"))
+async def cb_smart_episode_upload_execute(call: CallbackQuery, state: FSMContext):
+    ep_choice = call.data.split(":")[1]
+    data = await state.get_data()
+    curr_dir = Path(data.get("current_dir", cfg.get("paths", "workspace_dir"))).resolve()
+
+    if ep_choice == "ALL":
+        episodes = AutomationService.scan_all_episodes_anywhere_in_season(curr_dir)
+    else:
+        episodes = [ep_choice]
+
+    all_matched: list[tuple[Path, str]] = []
+    for ep in episodes:
+        all_matched.extend(
+            AutomationService.collect_all_episode_files_for_smart_upload(curr_dir, ep)
+        )
+
+    if not all_matched:
+        return await call.answer("⚠️ هیچ فایلی برای این قسمت یافت نشد!", show_alert=True)
+
+    scheduled_lines = []
+    for local_file, remote_dir in all_matched:
+        task = await queue_engine.add_task(
+            "upload",
+            f"SmartUpload [{local_file.parent.name}]: {local_file.name}",
+            CuteFTPService.upload_path,
+            local_file,
+            remote_dir
+        )
+        scheduled_lines.append(
+            f"• `{local_file.parent.name}/{local_file.name}`\n  ⬅️ `{remote_dir}` (`#{task.task_id}`)"
+        )
+
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="📊 مشاهده زنده وضعیت آپلودها", callback_data="menu:queues"))
+    kb.row(InlineKeyboardButton(text="📂 بازگشت به فایل‌منیجر", callback_data="menu:file_mgr"))
+    kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
+
+    preview = "\n".join(scheduled_lines[:15])
+    if len(scheduled_lines) > 15:
+        preview += f"\n_... و {len(scheduled_lines) - 15} فایل دیگر_"
+
+    await call.message.edit_text(
+        f"✅ **آپلود هوشمند `{ep_choice}` آغاز شد!**\n"
+        f"تعداد **`{len(scheduled_lines)}` فایل** در پوشه‌های متناظر سرور صف‌بندی شدند:\n\n"
+        f"{preview}",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )

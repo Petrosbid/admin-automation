@@ -143,8 +143,8 @@ class MKVService:
             )
             await proc.communicate()
             if output_sub_path.exists() and output_sub_path.stat().st_size > 0:
-                if output_sub_path.suffix.lower() == ".srt":
-                    SubtitleService.normalize_srt_utf8(output_sub_path)
+                if output_sub_path.suffix.lower() in (".srt", ".ass", ".ssa"):
+                    SubtitleService.normalize_subtitle_file(output_sub_path)
                 return output_sub_path
 
         target_for_mkvextract = video_path

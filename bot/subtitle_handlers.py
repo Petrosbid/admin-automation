@@ -514,6 +514,25 @@ async def _place_and_ask_fa_sub_names(
     else:
         await call_or_msg.answer(text[:4000], reply_markup=kb, parse_mode="Markdown")
 
+def _ensure_anime_dual_ass_and_srt_in_folder(plans: list[AutomationPlan], final_fa_map: dict[str, str]):
+    """
+    مخصوص انیمه:
+    اگر زیرنویس فارسی با فرمت .ass یا .ssa باشد، علاوه بر نگه داشتن خود فایل .ass (برای سافت‌ساب/هاردساب)،
+    یک نسخه کاملاً کانورت‌شده و تمیز با فرمت .srt هم در همان پوشه srt (بدون زیرپوشه) می‌سازد!
+    """
+    if not plans or plans[0].category != "Anime":
+        return
+
+    for key, path_str in list(final_fa_map.items()):
+        sub_p = Path(path_str)
+        if sub_p.exists() and sub_p.suffix.lower() in (".ass", ".ssa"):
+            srt_sibling = sub_p.with_suffix(".srt")
+            try:
+                SubtitleService.convert_ass_to_srt_file(sub_p, srt_sibling)
+            except Exception as e:
+                logging.warning(f"Failed to convert Anime ASS to SRT for {sub_p.name}: {e}")
+
+
 
 @router.callback_query(SubtitleStates.sauto_waiting_fa_sub_name, F.data.startswith("sauto_subname:"))
 async def cb_sauto_fa_sub_name_choice(call: CallbackQuery, state: FSMContext):
@@ -532,6 +551,7 @@ async def cb_sauto_fa_sub_name_choice(call: CallbackQuery, state: FSMContext):
                     new_path.unlink(missing_ok=True)
                 curr_fa.rename(new_path)
                 curr_fa = new_path
+        SubtitleService.normalize_subtitle_file(curr_fa)
         final_fa_map[key] = str(curr_fa.resolve())
 
     await state.update_data(sauto_final_fa_map=final_fa_map)
@@ -580,17 +600,31 @@ async def handle_sauto_custom_fa_sub_name(message: Message, state: FSMContext):
                 new_path.unlink(missing_ok=True)
             curr_fa.rename(new_path)
             curr_fa = new_path
+        SubtitleService.normalize_subtitle_file(curr_fa)
         final_fa_map[key] = str(curr_fa.resolve())
 
     await state.update_data(sauto_final_fa_map=final_fa_map)
     await _check_english_sub_batch_step(message, state)
 
-
 async def _check_english_sub_batch_step(call_or_msg: CallbackQuery | Message, state: FSMContext):
     data = await state.get_data()
     target_dir = Path(data["sauto_target_dir"])
     ep_tags = data.get("sauto_ep_tags", [])
+    final_fa_map: dict[str, str] = data.get("sauto_final_fa_map", {})
     plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
+
+    # اگر انیمه است:
+    # ۱. در صورتی که زیرنویس .ass است، نسخه تبدیل‌شده .srt آن را هم در پوشه srt بساز
+    # ۲. نیازی به ساخت یا استخراج زیرنویس انگلیسی نیست -> مستقیم برو به مرحله انتخاب کیفیت‌ها!
+    if plans and plans[0].category == "Anime":
+        _ensure_anime_dual_ass_and_srt_in_folder(plans, final_fa_map)
+        await state.update_data(sauto_final_en_map={})
+        return await _prompt_final_automation_choices_step(
+            call_or_msg,
+            state,
+            plans,
+            en_note="🎌 **حالت انیمه:** زیرنویس در پوشه `srt` (همراه با تبدیل خودکار `.ass` به `.srt`) آماده شد (بدون نیاز به زیرنویس انگلیسی)."
+        )
 
     en_map: dict[str, str] = {}
     missing_extractable: list[str] = []
@@ -637,7 +671,6 @@ async def _check_english_sub_batch_step(call_or_msg: CallbackQuery | Message, st
         await call_or_msg.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
     else:
         await call_or_msg.answer(text, reply_markup=kb, parse_mode="Markdown")
-
 
 @router.callback_query(SubtitleStates.sauto_waiting_en_decision, F.data == "sauto_en:auto_extract")
 async def cb_sauto_auto_extract_en(call: CallbackQuery, state: FSMContext):
@@ -887,10 +920,18 @@ async def _execute_smart_automation_batch(
         if auto_upload:
             if fa_sub and fa_sub.exists():
                 r_dir_fa = AutomationService.compute_server_remote_dir_for_local_path(fa_sub)
-                await queue_engine.add_task("upload", f"AutoUpload Sub [{r_dir_fa}]: {fa_sub.name}", CuteFTPService.upload_path, fa_sub, r_dir_fa)
-            if en_sub and en_sub.exists():
+                await queue_engine.add_task("upload", f"AutoUpload Sub [{r_dir_fa}]: {fa_sub.name}",
+                                            CuteFTPService.upload_path, fa_sub, r_dir_fa)
+                # اگر انیمه است و فایل .ass به .srt هم تبدیل شده، فایل .srt را هم به پوشه srt سرور آپلود کن
+                if plan.category == "Anime" and fa_sub.suffix.lower() in (".ass", ".ssa"):
+                    converted_srt = fa_sub.with_suffix(".srt")
+                    if converted_srt.exists():
+                        await queue_engine.add_task("upload", f"AutoUpload Sub [{r_dir_fa}]: {converted_srt.name}",
+                                                    CuteFTPService.upload_path, converted_srt, r_dir_fa)
+            if en_sub and en_sub.exists() and plan.category != "Anime":
                 r_dir_en = AutomationService.compute_server_remote_dir_for_local_path(en_sub)
-                await queue_engine.add_task("upload", f"AutoUpload Sub [{r_dir_en}]: {en_sub.name}", CuteFTPService.upload_path, en_sub, r_dir_en)
+                await queue_engine.add_task("upload", f"AutoUpload Sub [{r_dir_en}]: {en_sub.name}",
+                                            CuteFTPService.upload_path, en_sub, r_dir_en)
 
         for st in plan.softsub_targets:
             if st.quality_folder_name not in selected_soft_set:
@@ -1360,31 +1401,39 @@ async def _after_fa_subtitle_chosen(
     state: FSMContext,
     chosen_fa_sub: Path
 ):
+    SubtitleService.normalize_subtitle_file(chosen_fa_sub)
     await state.update_data(fa_sub_path=str(chosen_fa_sub))
     data = await state.get_data()
     op_mode = data.get("operation_mode")
     ext_low = chosen_fa_sub.suffix.lower()
 
-    if op_mode == "hardsub" and ext_low == ".srt":
+    first_vid = Path(data["target_videos"][0]).resolve()
+    cat = AutomationService.detect_category_from_path(first_vid)
+
+    # اگر انیمه است و فایل زیرنویس .ass است: نسخه .srt را در پوشه srt بساز و مرحله زیرنویس انگلیسی را رد کن!
+    if cat == "Anime":
+        season_dir = first_vid.parent.parent if first_vid.parent.name.lower() != "anime" else first_vid.parent
+        srt_dir = season_dir / "srt"
+        srt_dir.mkdir(parents=True, exist_ok=True)
+        if chosen_fa_sub.parent.resolve() != srt_dir.resolve():
+            dest_sub = srt_dir / chosen_fa_sub.name
+            shutil.copy2(chosen_fa_sub, dest_sub)
+            chosen_fa_sub = dest_sub
+            await state.update_data(fa_sub_path=str(chosen_fa_sub))
+        if ext_low in (".ass", ".ssa"):
+            SubtitleService.convert_ass_to_srt_file(chosen_fa_sub, srt_dir / f"{chosen_fa_sub.stem}.srt")
+
         await state.update_data(en_sub_path=None)
         await state.set_state(SubtitleStates.waiting_sync_choice)
         text = (
-            f"✅ زیرنویس فارسی (`{chosen_fa_sub.name}`) با فرمت **SRT** برای هاردساب انتخاب شد.\n"
-            "ℹ️ *(برای هاردسابِ فایل SRT هیچ زیرنویس انگلیسی‌ای اضافه نمی‌شود)*\n\n"
-            "🔄 **مرحله سینک (هماهنگ‌سازی) زیرنویس قبل از پردازش:**\n"
-            "چگونه می‌خواهید تایمینگ زیرنویس با فیلم سینک شود؟"
+            f"🎌 **زیرنویس انیمه (`{chosen_fa_sub.name}`) آماده شد!**\n"
+            + ("✅ نسخه تبدیل‌شده `.srt` نیز در پوشه `srt` ساخته شد.\n\n" if ext_low in (".ass", ".ssa") else "\n")
+            + "🔄 **مرحله سینک (هماهنگ‌سازی) زیرنویس قبل از پردازش:**"
         )
         kb = sync_options_kb()
         if isinstance(msg_or_call, CallbackQuery):
             return await msg_or_call.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
-        else:
-            return await msg_or_call.answer(text, reply_markup=kb, parse_mode="Markdown")
-
-    await _prompt_en_subtitle_step(
-        msg_or_call,
-        state,
-        prefix_note=f"✅ زیرنویس فارسی انتخاب شد:\n`{chosen_fa_sub.name}`\n\n"
-    )
+        return await msg_or_call.answer(text, reply_markup=kb, parse_mode="Markdown")
 
 
 async def _prompt_fa_subtitle_step(msg_or_call: Message | CallbackQuery, state: FSMContext):
