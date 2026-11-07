@@ -475,6 +475,13 @@ class QueueManager:
         if not hasattr(self, "_worker_meta"):
             self._worker_meta = {}
 
+        # پس از reload، Workerهای قدیمی ممکن است هنوز فعال باشند اما metadata جدید ندارند.
+        # تا زمان پایان آن‌ها Worker موازی اضافه نکن؛ وگرنه ظرفیت پردازش ناخواسته دوبرابر می‌شود.
+        untracked_live = [w for w in self._workers if w not in self._worker_meta and not w.done()]
+        if untracked_live:
+            logging.info("Preserving %d active pre-reload workers; skipping duplicate startup.", len(untracked_live))
+            return
+
         conc = cfg.get("concurrency") or {}
         def _count(key: str, default: int) -> int:
             try:
