@@ -100,13 +100,6 @@ class SubtitleService:
 
     @classmethod
     def convert_ass_to_srt_file(cls, ass_path: Path, srt_out_path: Path | None = None) -> Path:
-        """
-        تبدیل کامل و حرفه‌ای فایل زیرنویس .ass / .ssa به فایل .srt استاندارد:
-        - حذف کامل تگ‌های استایل ASS مانند {\pos(...)}, {\fad(...)}, {\c&H...&}, {\fn...}
-        - حذف خطوط ترسیم وکتور گرافیکی ({\p1}...{\p0}) تا کدهای مختصات در زیرنویس نمایش داده نشوند
-        - تبدیل \N و \n به خط جدید واقعی و تبدیل \h به فاصله
-        - مرتب‌سازی بر اساس زمان شروع و شماره‌گذاری استاندارد با فرمت UTF-8-SIG و CRLF
-        """
         ass_path = Path(ass_path).resolve()
         if srt_out_path is None:
             srt_out_path = ass_path.with_suffix(".srt")

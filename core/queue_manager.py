@@ -78,6 +78,7 @@ class QueueManager:
         self._events: dict[str, asyncio.Event] = {q: asyncio.Event() for q in self.QUEUE_TYPES}
         self._locks: dict[str, asyncio.Lock] = {q: asyncio.Lock() for q in self.QUEUE_TYPES}
         self._workers: list[asyncio.Task] = []
+        self._worker_meta: dict[asyncio.Task, tuple[str, int]] = {}
         self._bot: Bot | None = None
         self._known_chats: set[int] = set()
 
@@ -456,20 +457,52 @@ class QueueManager:
             finally:
                 task.running_asyncio_task = None
 
+    async def _worker_supervisor(self, queue_type: str, worker_idx: int):
+        """اگر حلقه Worker به هر دلیل غیرمنتظره متوقف شد، آن را خودکار بالا می‌آورد."""
+        while True:
+            try:
+                await self._worker_loop(queue_type, worker_idx)
+                logging.error("Worker %s/%s exited unexpectedly; restarting.", queue_type, worker_idx)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("Worker %s/%s crashed; restarting in 2 seconds.", queue_type, worker_idx)
+            await asyncio.sleep(2)
+
     def start_workers(self):
-        if self._workers:
+        # Workerهای مرده را حذف کن؛ وجود یک Task قدیمی نباید مانع ساخت Worker جایگزین شود.
+        self._workers = [w for w in self._workers if not w.done()]
+        if not hasattr(self, "_worker_meta"):
+            self._worker_meta = {}
+
+        # پس از reload، Workerهای قدیمی ممکن است هنوز فعال باشند اما metadata جدید ندارند.
+        # تا زمان پایان آن‌ها Worker موازی اضافه نکن؛ وگرنه ظرفیت پردازش ناخواسته دوبرابر می‌شود.
+        untracked_live = [w for w in self._workers if w not in self._worker_meta and not w.done()]
+        if untracked_live:
+            logging.info("Preserving %d active pre-reload workers; skipping duplicate startup.", len(untracked_live))
             return
+
         conc = cfg.get("concurrency") or {}
+        def _count(key: str, default: int) -> int:
+            try:
+                return max(1, int(conc.get(key, default)))
+            except (TypeError, ValueError):
+                logging.warning("Invalid concurrency.%s; using %s", key, default)
+                return default
+
         counts = {
-            "handbrake": int(conc.get("handbrake_workers", 2)),
-            "mkvtoolnix": int(conc.get("mkvtoolnix_workers", 1)),
-            "download": int(conc.get("download_workers", 1)),
-            "upload": 1,
+            "handbrake": _count("handbrake_workers", 2),
+            "mkvtoolnix": _count("mkvtoolnix_workers", 1),
+            "download": _count("download_workers", 1),
+            "upload": _count("upload_workers", 1),
         }
         for q_type, num in counts.items():
-            for idx in range(1, max(1, num) + 1):
-                w = asyncio.create_task(self._worker_loop(q_type, idx))
-                self._workers.append(w)
+            active = sum(1 for w in self._workers if self._worker_meta.get(w, (None, None))[0] == q_type)
+            for idx in range(active + 1, num + 1):
+                worker = asyncio.create_task(self._worker_supervisor(q_type, idx))
+                self._workers.append(worker)
+                self._worker_meta[worker] = (q_type, idx)
+                logging.info("Started queue worker %s/%s", q_type, idx)
 
     def restart_workers_for_hot_reload(self):
         any_running = any(
@@ -477,12 +510,15 @@ class QueueManager:
             for t in self.tasks.values()
         )
         if not any_running:
-            for w in self._workers:
-                if not w.done():
-                    w.cancel()
+            for worker in self._workers:
+                if not worker.done():
+                    worker.cancel()
             self._workers.clear()
-            self.start_workers()
-            logging.info("🔄 Queue workers restarted with updated notification logic.")
+            if hasattr(self, "_worker_meta"):
+                self._worker_meta.clear()
+            logging.info("Queue workers will be restarted with updated code.")
+        # حتی اگر تعدادی Worker باقی مانده باشند، Workerهای مفقود نیز ساخته می‌شوند.
+        self.start_workers()
 
     def get_queue_summary(self) -> list[QueueTask]:
         return list(self.tasks.values())
