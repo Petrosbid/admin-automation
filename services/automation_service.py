@@ -20,7 +20,7 @@ class SoftSubTarget:
 
 @dataclass
 class HardSubTarget:
-    mode: str                 # 'hardsub_srt' (پوشه 1080p-HardSub) | 'encode_ass' (پوشه 1080p-EBTV با movie.ass)
+    mode: str                 # 'hardsub_srt' | 'encode_ass'
     quality_tag: str          # '1080p' | '720p' | '480p'
     source_video: Path
     output_dir: Path
@@ -37,7 +37,7 @@ class AutomationPlan:
     base_dir: Path
     series_title: str = ""
     season_ep_tag: str = ""   # مثلا S02E01
-    source_type: str = "WEB-DL"  # 'WEB-DL' | 'BluRay'
+    source_type: str = "WEB-DL"
     fa_sub_dest_dir: Path = None
     en_sub_dest_dir: Path = None
     existing_en_sub: Path | None = None
@@ -53,6 +53,15 @@ class AutomationService:
     EPISODE_REGEX = re.compile(r"[Ss](\d{1,2})[\s._\-]*[Ee](\d{1,3})")
     SEASON_DIR_REGEX = re.compile(r"^[Ss](\d{1,2})$")
     ROOT_CATEGORIES = ("Movies", "Series", "Anime")
+
+    # پوشه‌بندی پیش‌فرض جدید برای هر فصل سریال / انیمه
+    DEFAULT_SERIES_QUALITY_DIRS = (
+        "1080p-EBTV",
+        "720p-EBTV",
+        "1080p-x265-PSA",
+        "720p-x265-PSA",
+        "480p-RMTeam",
+    )
 
     @classmethod
     def ensure_workspace_root_categories(cls) -> dict[str, Path]:
@@ -130,17 +139,155 @@ class AutomationService:
 
     @classmethod
     def format_clean_title(cls, raw_title: str) -> str:
-        """استخراج نام تمیز سریال یا فیلم و حذف تگ‌های اضافی"""
         cleaned = re.sub(r'[<>:"/\\|?*]', "", raw_title).strip()
-        # اگر نام فایل کامل پاس داده شده بود، از SxxEyy یا سال یا کیفیت به بعد را ببر تا فقط نام خالص بماند
         cleaned = re.split(
-            r"[\s._\-]+(?:[Ss]\d{1,2}[Ee]\d{1,3}|2160p|1080p|720p|480p|FullHD|WEB-DL|WEBRip|BluRay)\b",
+            r"[\s._\-]+(?:[Ss]\d{1,2}[Ee]\d{1,3}|(?:19|20)\d{2}|2160p|1080p|720p|480p|FullHD|WEB-DL|WEBRip|BluRay)\b",
             cleaned,
             maxsplit=1,
             flags=re.IGNORECASE
         )[0]
         cleaned = re.sub(r"[\s_]+", ".", cleaned).strip(".")
         return cleaned or "Media"
+
+    @classmethod
+    async def detect_audio_channels_tag(cls, video_path: Path) -> str:
+        """تشخیص خودکار 6CH یا 2CH بودن صدا از روی مشخصات ترک صوتی فایل یا نام فایل"""
+        name_up = video_path.name.upper()
+        if any(k in name_up for k in ("6CH", "5.1", "DDP5.1", "DD5.1", "AAC5.1", "7.1", "8CH")):
+            return "6CH"
+        if any(k in name_up for k in ("2CH", "2.0", "DDP2.0", "AAC2.0")):
+            return "2CH"
+
+        try:
+            info = await MKVService.inspect_tracks(video_path)
+            for t in info.get("tracks", []):
+                if t.get("type") == "audio":
+                    ch = int(t.get("properties", {}).get("audio_channels", 2))
+                    if ch >= 6:
+                        return "6CH"
+                    return "2CH"
+        except Exception:
+            pass
+        return "6CH" if "1080" in name_up else "2CH"
+
+    @staticmethod
+    def detect_encoder_and_network(filename: str) -> tuple[str, str]:
+        """استخراج نام شبکه (مثل AMZN, NF, ATVP) و نام گروه ریلیز/انکودر برای FullHD"""
+        net = "AMZN"
+        for cand_net in ("AMZN", "NF", "ATVP", "DSNP", "HMAX", "MAX", "PCOK", "HULU", "PMTP", "STAN", "CRAV", "BBC", "ITV"):
+            if re.search(rf"\b{cand_net}\b", filename, flags=re.IGNORECASE):
+                net = cand_net.upper()
+                break
+
+        stem = Path(filename).stem
+        stem = re.sub(r"([.\-_](?:SoftSub|HardSub|EBTV|EmpireBestTv))+?$", "", stem, flags=re.IGNORECASE)
+        m_group = re.search(r"-([A-Za-z0-9]+)$", stem)
+        if m_group:
+            enc = m_group.group(1)
+        else:
+            known_encoders = ("NTb", "FLUX", "ETHEL", "Kitsune", "SuccessfulCrab", "RAWR", "TEPES", "SYNCOPY", "EDITH", "FENiX", "NOSiViD", "PECULATE")
+            enc = "FLUX"
+            for ke in known_encoders:
+                if ke.lower() in stem.lower():
+                    enc = ke
+                    break
+        return net, enc
+
+    @classmethod
+    async def build_standard_raw_filename_for_folder(
+        cls,
+        video_path: Path,
+        folder_name: str,
+        series_or_movie_title: str,
+        season_ep_tag: str | None = None,
+        is_series: bool = True
+    ) -> str:
+        """
+        تولید نام استاندارد دقیق برای فایل‌های دانلود شده بر اساس پوشه‌ای که در آن قرار دارند:
+        - 1080p-x265-PSA: {name}.SxxEyy.1080p.10bit.WEB-DL.6CH(or 2CH).x265.PSA.EBTV.mkv
+        - 720p-x265-PSA:  {name}.SxxEyy.720p.10bit.WEB-DL.2CH.x265.PSA.EBTV.mkv
+        - 480p-RMTeam:    {name}.SxxEyy.480p.WEB-DL.RMTeam.EBTV.mkv
+        - FullHD:         {name}.SxxEyy.1080p.AMZN.WEB-DL.FullHD.{encode name}.EBTV.mkv
+        - 1080p-EBTV:     {name}.SxxEyy.1080p.WEB-DL.6CH.EBTV.mp4
+        - 720p-EBTV:      {name}.SxxEyy.720p.WEB-DL.EBTV.mp4
+        """
+        clean_name = cls.format_clean_title(series_or_movie_title)
+        ep_tag = season_ep_tag or cls.extract_episode_tag(video_path.name) or ""
+        src_type = cls.detect_source_type(video_path.name)
+        ch_tag = await cls.detect_audio_channels_tag(video_path)
+        f_low = folder_name.lower()
+        orig_ext = video_path.suffix.lower() or ".mkv"
+
+        if is_series and ep_tag:
+            if "1080p-x265-psa" in f_low:
+                return f"{clean_name}.{ep_tag}.1080p.10bit.{src_type}.{ch_tag}.x265.PSA.EBTV.mkv"
+            if "720p-x265-psa" in f_low:
+                return f"{clean_name}.{ep_tag}.720p.10bit.{src_type}.2CH.x265.PSA.EBTV.mkv"
+            if "480p-rmteam" in f_low or "480p-rmt" in f_low:
+                return f"{clean_name}.{ep_tag}.480p.{src_type}.RMTeam.EBTV.mkv"
+            if f_low == "fullhd":
+                net, enc_name = cls.detect_encoder_and_network(video_path.name)
+                return f"{clean_name}.{ep_tag}.1080p.{net}.{src_type}.FullHD.{enc_name}.EBTV.mkv"
+            if "1080p-ebtv" in f_low:
+                return f"{clean_name}.{ep_tag}.1080p.{src_type}.6CH.EBTV.mp4"
+            if "720p-ebtv" in f_low:
+                return f"{clean_name}.{ep_tag}.720p.{src_type}.EBTV.mp4"
+            if "480p-ebtv" in f_low:
+                return f"{clean_name}.{ep_tag}.480p.{src_type}.EBTV.mp4"
+
+            # سایر پوشه‌های سفارشی (مثلاً 1080p-Pahe، 720p-Pahe، 2160p-x265-PSA و...)
+            custom_parts = [p for p in folder_name.split("-") if p]
+            custom_tag = ".".join(custom_parts)
+            return f"{clean_name}.{ep_tag}.{src_type}.{custom_tag}.EBTV{orig_ext}"
+
+        # استاندارد نام‌گذاری برای فیلم‌های سینمایی (Movies)
+        year_match = re.search(r"\b((?:19|20)\d{2})\b", video_path.name) or re.search(r"\b((?:19|20)\d{2})\b", series_or_movie_title)
+        year_str = f".{year_match.group(1)}" if year_match else ""
+        res_match = re.search(r"\b(2160p|1080p|720p|480p)\b", video_path.name, flags=re.IGNORECASE)
+        res_str = res_match.group(1).lower() if res_match else "1080p"
+
+        encoder_tag = ""
+        for enc_cand in ("PSA", "Pahe", "YTS", "RARBG", "RMTeam", "Tigole", "GalaxyRG"):
+            if enc_cand.lower() in video_path.name.lower():
+                encoder_tag = f".{enc_cand}"
+                break
+        x265_tag = ".10bit.x265" if ("x265" in video_path.name.lower() or "hevc" in video_path.name.lower()) else ""
+        ch_part = f".{ch_tag}" if ch_tag == "6CH" else ""
+
+        return f"{clean_name}{year_str}.{res_str}.{src_type}{ch_part}{x265_tag}{encoder_tag}.EBTV{orig_ext}"
+
+    @classmethod
+    def match_filename_from_server_siblings(
+        cls,
+        server_filenames: list[str],
+        new_ep_tag: str
+    ) -> str | None:
+        """
+        کپی کردن دقیق نام فایل از قسمت‌های قبلی موجود در همان پوشه در سرور اصلی
+        و جایگزینی فقط بخش Eyy (یا SxxEyy) با قسمت جدید!
+        """
+        if not server_filenames or not new_ep_tag:
+            return None
+
+        video_exts = (".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm")
+        valid_siblings = [
+            f for f in server_filenames
+            if f.lower().endswith(video_exts) and cls.EPISODE_REGEX.search(f)
+        ]
+        if not valid_siblings:
+            return None
+
+        # انتخاب آخرین قسمت موجود در سرور به عنوان الگو
+        template_name = sorted(valid_siblings)[-1]
+        new_e_only = new_ep_tag.split("E")[1]  # مثلا '05'
+
+        def _replacer(match: re.Match) -> str:
+            # حفظ فصل و تغییر فقط شماره قسمت Eyy
+            s_part = match.group(1)
+            return f"S{int(s_part):02d}E{new_e_only}"
+
+        new_filename = cls.EPISODE_REGEX.sub(_replacer, template_name, count=1)
+        return new_filename
 
     @classmethod
     def build_standard_subtitle_filename(
@@ -151,10 +298,6 @@ class AutomationService:
         lang: str,
         ext: str = ".srt"
     ) -> str:
-        """
-        فرمت نام زیرنویس:
-        {name}.S{xx}E{yy}.WEB-DL(یا BluRay).FA/EN.srt
-        """
         clean_name = cls.format_clean_title(series_or_movie_title)
         lang_up = lang.upper()
         if not ext.startswith("."):
@@ -171,14 +314,10 @@ class AutomationService:
         quality_tag: str,
         source_type: str = "WEB-DL"
     ) -> str:
-        """
-        فرمت استاندارد هاردساب فارسی SRT:
-        {name}.SxxEyy.WEB-DL/BluRay.1080p/720p.HardSub.EBTV.mp4
-        """
         clean_name = cls.format_clean_title(series_or_movie_title)
         if season_ep_tag:
-            return f"{clean_name}.{season_ep_tag}.{source_type}.{quality_tag}.HardSub.EBTV.mp4"
-        return f"{clean_name}.{source_type}.{quality_tag}.HardSub.EBTV.mp4"
+            return f"{clean_name}.{season_ep_tag}.{quality_tag}.{source_type}.HardSub.EBTV.mp4"
+        return f"{clean_name}.{quality_tag}.{source_type}.HardSub.EBTV.mp4"
 
     @classmethod
     def build_encode_ass_filename(
@@ -189,16 +328,15 @@ class AutomationService:
         source_type: str = "WEB-DL"
     ) -> str:
         """
-        فرمت استاندارد انکود با movie.ass طبق الگوی دقیق درخواستی شما:
-        {name}.SxxEyy.WEB-DL/BluRay.1080p/720p.{if 1080p => 6CH}.EBTV.mp4
-        مثال 1080p: Stick.S02E01.WEB-DL.1080p.6CH.EBTV.mp4
-        مثال 720p:  Stick.S02E01.WEB-DL.720p.EBTV.mp4
+        فرمت استاندارد انکود با movie.ass:
+        - 1080p-EBTV: {name}.SxxEyy.1080p.WEB-DL.6CH.EBTV.mp4
+        - 720p-EBTV:  {name}.SxxEyy.720p.WEB-DL.EBTV.mp4
         """
         clean_name = cls.format_clean_title(series_or_movie_title)
         ch_part = ".6CH" if quality_tag == "1080p" else ""
         if season_ep_tag:
-            return f"{clean_name}.{season_ep_tag}.{source_type}.{quality_tag}{ch_part}.EBTV.mp4"
-        return f"{clean_name}.{source_type}.{quality_tag}{ch_part}.EBTV.mp4"
+            return f"{clean_name}.{season_ep_tag}.{quality_tag}.{source_type}{ch_part}.EBTV.mp4"
+        return f"{clean_name}.{quality_tag}.{source_type}{ch_part}.EBTV.mp4"
 
     @staticmethod
     def clean_stem_for_ebtv(stem: str, target_res: str | None = None) -> str:
@@ -230,35 +368,46 @@ class AutomationService:
 
     @classmethod
     def create_movie_structure(cls, movie_folder: Path) -> dict[str, Path]:
+        """برای فیلم‌ها در ابتدا فقط پوشه اصلی و پوشه srt ساخته می‌شود؛ SoftSub و Hardsub موقع ساخت ایجاد می‌شوند"""
         movie_folder.mkdir(parents=True, exist_ok=True)
-        paths = {
+        srt_dir = movie_folder / "srt"
+        srt_dir.mkdir(parents=True, exist_ok=True)
+        return {
             "base": movie_folder,
             "softsub": movie_folder / "SoftSub",
             "hardsub": movie_folder / "Hardsub",
-            "srt": movie_folder / "srt",
+            "srt": srt_dir,
         }
-        for p in paths.values():
-            p.mkdir(parents=True, exist_ok=True)
-        return paths
 
     @classmethod
     def create_series_season_structure(cls, season_folder: Path) -> dict[str, Path]:
+        """
+        پوشه‌بندی پیش‌فرض جدید برای هر فصل سریال:
+        1080p-EBTV
+        720p-EBTV
+        1080p-x265-PSA
+        720p-x265-PSA
+        480p-RMTeam
+        srt/
+           FA
+           EN
+        (پوشه‌های هاردساب و سافت‌ساب متناسب با هر کیفیت فقط در زمان ساخت آن‌ها ایجاد می‌شوند)
+        """
         season_folder.mkdir(parents=True, exist_ok=True)
-        paths = {
+        for q_dir in cls.DEFAULT_SERIES_QUALITY_DIRS:
+            (season_folder / q_dir).mkdir(parents=True, exist_ok=True)
+
+        srt_fa = season_folder / "srt" / "FA"
+        srt_en = season_folder / "srt" / "EN"
+        srt_fa.mkdir(parents=True, exist_ok=True)
+        srt_en.mkdir(parents=True, exist_ok=True)
+
+        return {
             "base": season_folder,
-            "fullhd": season_folder / "FullHD",
-            "hardsub_1080": season_folder / "1080p-HardSub",
-            "hardsub_720": season_folder / "720p-HardSub",
-            "ebtv_1080": season_folder / "1080p-EBTV",
-            "ebtv_720": season_folder / "720p-EBTV",
-            "ebtv_480": season_folder / "480p-EBTV",
             "srt": season_folder / "srt",
-            "srt_fa": season_folder / "srt" / "FA",
-            "srt_en": season_folder / "srt" / "EN",
+            "srt_fa": srt_fa,
+            "srt_en": srt_en,
         }
-        for p in paths.values():
-            p.mkdir(parents=True, exist_ok=True)
-        return paths
 
     @classmethod
     def detect_category_from_path(cls, folder: Path) -> str:
@@ -279,12 +428,12 @@ class AutomationService:
         if cls.SEASON_DIR_REGEX.match(folder.name):
             return True
         if "series" in parts_low or "anime" in parts_low:
-            if (folder / "FullHD").is_dir() or (folder / "srt" / "FA").exists():
+            if (folder / "srt" / "FA").exists() or any((folder / d).is_dir() for d in cls.DEFAULT_SERIES_QUALITY_DIRS):
                 return True
         if (folder / "srt" / "FA").exists() or (folder / "srt" / "EN").exists():
             return True
-        if (folder / "FullHD").is_dir():
-            return True
+        if not folder.exists():
+            return False
         quality_subdirs = [
             d for d in folder.iterdir()
             if d.is_dir() and any(q in d.name.lower() for q in ("1080p", "720p", "480p", "2160p", "fullhd"))
@@ -690,13 +839,6 @@ class AutomationService:
         source_videos: list[Path],
         selected_qualities: list[str]
     ) -> list[HardSubTarget]:
-        """
-        ساخت تسک‌های انکود با movie.ass:
-        - movie.ass روی تصویر Burn-in (هاردساب) می‌شود.
-        - زیرنویس انگلیسی به صورت سافت‌ساب به خروجی اضافه می‌شود.
-        - نام فایل خروجی دقیقاً با فرمت:
-          {name}.SxxEyy.WEB-DL/BluRay.1080p/720p.{if 1080p => 6CH}.EBTV.mp4
-        """
         order_map = {"1080p": 1, "720p": 2, "480p": 3}
         sorted_quals = sorted(set(selected_qualities), key=lambda q: order_map.get(q, 9))
         logo_ass = cls.get_movie_ass_logo_path()
@@ -753,6 +895,8 @@ class AutomationService:
         auto_upload: bool = False,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
+        # پوشه سافت‌ساب متناسب با کیفیت دقیقاً در لحظه ساخت ایجاد می‌شود
+        output_file.parent.mkdir(parents=True, exist_ok=True)
         res_path = await MKVService.merge_softsub(
             video_path=raw_video,
             output_path=output_file,
@@ -785,6 +929,8 @@ class AutomationService:
         auto_upload: bool = False,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
+        # پوشه هاردساب / انکود متناسب با کیفیت دقیقاً در لحظه ساخت ایجاد می‌شود
+        ht.output_dir.mkdir(parents=True, exist_ok=True)
         if ht.mode == "encode_ass":
             logo_ass = ht.ass_logo_path or cls.get_movie_ass_logo_path()
             if not logo_ass.exists():

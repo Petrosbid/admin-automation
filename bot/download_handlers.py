@@ -1,3 +1,4 @@
+import asyncio
 import math
 import re
 import shutil
@@ -14,8 +15,10 @@ from core.config_loader import cfg
 from core.queue_manager import queue_engine
 from services.scraper_service import ScraperService
 from services.downloader_service import DownloaderService
+from services.subtitle_service import SubtitleService
 from services.mkv_service import MKVService
 from services.automation_service import AutomationService
+from services.cuteftp_service import CuteFTPService
 from bot.keyboards import (
     BROWSER_PAGE_SIZE, main_menu_kb, search_categories_kb,
     search_sites_kb, search_results_kb, download_folder_tree_browser_kb,
@@ -23,6 +26,9 @@ from bot.keyboards import (
 )
 
 router = Router()
+
+# حافظه موقت برای نگهداری آیتم‌هایی که پس از اتمام دانلود منتظر تایید نام یا تصمیم FullHD توسط ادمین هستند
+PENDING_POST_DL_ITEMS: dict[str, dict] = {}
 
 
 class DownloadStates(StatesGroup):
@@ -32,6 +38,7 @@ class DownloadStates(StatesGroup):
     waiting_new_dl_subfolder_name = State()
     waiting_link_for_sub_extract = State()
     browsing_local_for_sub_extract = State()
+    waiting_post_dl_custom_name = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -56,6 +63,475 @@ def _extract_batch_links(raw_text: str) -> list[str]:
                 links.append(clean)
     return links
 
+
+# ==============================================================================
+# خط لوله هوشمند پس از دانلود (Post-Download Smart Pipeline)
+# ==============================================================================
+
+def _resolve_series_or_movie_context(dest_dir: Path) -> tuple[bool, Path, str]:
+    """
+    تشخیص اینکه پوشه دانلود مربوط به فصل سریال است یا فیلم سینمایی:
+    خروجی: (is_series, season_or_movie_root_dir, series_or_movie_title)
+    """
+    dest_dir = dest_dir.resolve()
+    parts_low = [p.lower() for p in dest_dir.parts]
+
+    if "movies" in parts_low or "movie" in parts_low:
+        return False, dest_dir, dest_dir.name
+
+    if AutomationService.SEASON_DIR_REGEX.match(dest_dir.parent.name):
+        season_dir = dest_dir.parent
+        series_title = season_dir.parent.name
+        return True, season_dir, series_title
+
+    if AutomationService.SEASON_DIR_REGEX.match(dest_dir.name):
+        season_dir = dest_dir
+        series_title = season_dir.parent.name
+        return True, season_dir, series_title
+
+    is_ser = AutomationService.is_series_season_dir(dest_dir.parent)
+    if is_ser:
+        return True, dest_dir.parent, dest_dir.parent.name
+    return False, dest_dir, dest_dir.name
+
+
+async def _check_and_notify_missing_local_folders(bot: Bot, chat_id: int, season_or_movie_dir: Path):
+    """
+    بررسی پوشه‌های موجود روی سرور مقصد در مقایسه با پوشه‌های موجود در مبدا (Workspace):
+    اگر روی سرور مقصد پوشه‌ای وجود دارد که در مبدا نیست، به کاربر در ربات اطلاع می‌دهد!
+    """
+    remote_season_path = AutomationService.compute_server_remote_dir_for_local_path(season_or_movie_dir)
+    remote_info = await CuteFTPService.inspect_remote_dir(remote_season_path)
+    if not remote_info.get("exists"):
+        return
+
+    server_dirs = set(remote_info.get("dirs", []))
+    local_dirs = {d.name for d in season_or_movie_dir.iterdir() if d.is_dir()} if season_or_movie_dir.exists() else set()
+
+    missing_locally = sorted([
+        d for d in server_dirs
+        if d not in local_dirs and d not in (".", "..")
+    ])
+
+    if missing_locally:
+        token = uuid.uuid4().hex[:6]
+        PENDING_POST_DL_ITEMS[token] = {
+            "type": "sync_dirs",
+            "local_base": str(season_or_movie_dir),
+            "missing_dirs": missing_locally,
+        }
+        kb = InlineKeyboardBuilder()
+        kb.row(
+            InlineKeyboardButton(
+                text=f"📁 ساخت خودکار این {len(missing_locally)} پوشه در مبدا (Workspace)",
+                callback_data=f"pdl:mkdirs:{token}"
+            )
+        )
+        missing_str = "\n".join([f"• `{d}`" for d in missing_locally])
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"📡 **گزارش مغایرت پوشه‌های سرور مقصد و مبدا:**\n\n"
+                f"در مسیر `{remote_season_path}` روی سرور اصلی، پوشه‌های زیر وجود دارند اما در پوشه مبدا (`{season_or_movie_dir.name}`) روی سیستم شما نیستند:\n"
+                f"{missing_str}"
+            ),
+            reply_markup=kb.as_markup(),
+            parse_mode="Markdown"
+        )
+
+
+async def _smart_download_pipeline_job(
+    bot: Bot,
+    chat_id: int,
+    target_link: str,
+    dest_dir: Path,
+    progress_callback=None
+) -> Path:
+    """
+    موتور هوشمند دانلود + اکسترکت خودکار + تغییر نام از روی سرور یا استاندارد + آپلود خودکار:
+    ۱. ابتدا فایل را در پوشه dest_dir دانلود می‌کند.
+    ۲. اگر فایل دانلودشده فشرده (.zip / .rar / .7z) باشد، ابتدا آن را اکسترکت کرده و فایل فشرده را حذف می‌کند.
+    ۳. پوشه‌های فصل/فیلم در سرور مقصد را بررسی می‌کند و اگر پوشه‌ای در سرور هست که در لوکال نیست، خبر می‌دهد.
+    ۴. برای تغییر نام فایل ویدئو:
+       - اولویت اول: بررسی همان پوشه در همان فصل در سرور اصلی و کپی کردن نام قسمت‌های قبلی با تغییر فقط Eyy!
+       - اولویت دوم: اگر در سرور قسمت قبلی نبود، تولید نام استاندارد و پرسیدن از کاربر در ربات قبل از آپلود.
+    ۵. منطق ویژه پوشه FullHD:
+       - اگر پوشه FullHD در سرور وجود نداشته باشد و قسمت اول فصل (E01) نباشد -> آپلود نمی‌شود.
+       - اگر قسمت اول فصل (E01) باشد و در سرور FullHD نباشد -> از کاربر سوال می‌پرسد که آیا FullHD هم آپلود شود یا خیر.
+    """
+    dest_dir = Path(dest_dir).resolve()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    before_files = {p.resolve() for p in dest_dir.rglob("*") if p.is_file()}
+    await DownloaderService.download(target_link, dest_dir, progress_callback=progress_callback)
+
+    after_files = [
+        p.resolve() for p in dest_dir.rglob("*")
+        if p.is_file() and p.resolve() not in before_files and not p.name.endswith(".aria2")
+    ]
+
+    # ۱. اگر در بین فایل‌های جدید، فایل فشرده (.zip / .rar / .7z) وجود دارد، ابتدا آن را اکسترکت کن
+    extracted_new: list[Path] = []
+    for f_path in list(after_files):
+        if f_path.exists() and f_path.suffix.lower() in SubtitleService.ARCHIVE_EXTENSIONS:
+            if progress_callback:
+                progress_callback(f"در حال اکسترکت خودکار {f_path.name}...")
+            out_list = await asyncio.to_thread(
+                SubtitleService.extract_archive,
+                f_path,
+                f_path.parent,
+                True,   # حذف فایل زیپ/رر پس از اکسترکت
+                False
+            )
+            extracted_new.extend(out_list)
+            after_files.remove(f_path)
+
+    all_new_files = after_files + extracted_new
+    new_videos = [
+        p for p in all_new_files
+        if p.exists() and p.suffix.lower() in DownloaderService.VIDEO_EXTENSIONS
+    ]
+    if not new_videos:
+        # اگر فایل از قبل وجود داشته (مثلاً بازنویسی شده)، جدیدترین ویدئوی پوشه را بردار
+        all_vids_in_dest = DownloaderService.find_video_files(dest_dir, recursive=False)
+        if all_vids_in_dest:
+            new_videos = [max(all_vids_in_dest, key=lambda p: p.stat().st_mtime)]
+
+    if not new_videos:
+        return dest_dir
+
+    is_series, season_or_movie_dir, series_or_movie_title = _resolve_series_or_movie_context(dest_dir)
+
+    # ۲. بررسی مغایرت پوشه‌های سرور مقصد با مبدا (اطلاع‌رسانی پوشه‌هایی که روی سرور هستند ولی در لوکال نیستند)
+    try:
+        await _check_and_notify_missing_local_folders(bot, chat_id, season_or_movie_dir)
+    except Exception:
+        pass
+
+    # ۳. بررسی وضعیت پوشه فعلی در سرور اصلی
+    remote_folder_path = AutomationService.compute_server_remote_dir_for_local_path(dest_dir)
+    remote_folder_info = await CuteFTPService.inspect_remote_dir(remote_folder_path)
+    server_files_in_folder = remote_folder_info.get("files", [])
+    remote_folder_exists = bool(remote_folder_info.get("exists", False))
+
+    for vid in new_videos:
+        ep_tag = AutomationService.extract_episode_tag(vid.name) or ""
+        ep_num = AutomationService.extract_episode_number_only(vid.name)
+        is_fullhd_folder = (dest_dir.name.lower() == "fullhd")
+
+        # تعیین وضعیت آپلود برای پوشه FullHD طبق دستور شما
+        should_auto_upload = True
+        ask_fullhd_e01_question = False
+
+        if is_series and is_fullhd_folder and not remote_folder_exists:
+            if ep_num == 1 or ep_tag.endswith("E01"):
+                ask_fullhd_e01_question = True
+                should_auto_upload = False
+            else:
+                # در سرور اصلی پوشه FullHD وجود ندارد و قسمت اول هم نیست -> نیازی به آپلود FullHD نیست
+                should_auto_upload = False
+
+        # اولویت اول نام‌گذاری: کپی کردن الگوی نام از قسمت‌های قبلی همین پوشه در سرور اصلی (با حفظ Eyy جدید)
+        copied_server_name = None
+        if is_series and ep_tag and server_files_in_folder:
+            copied_server_name = AutomationService.match_filename_from_server_siblings(
+                server_files_in_folder, ep_tag
+            )
+
+        if copied_server_name:
+            # نام از روی قسمت‌های قبلی سرور کپی شد -> تغییر نام خودکار بدون نیاز به سوال از کاربر!
+            final_path = vid.with_name(copied_server_name)
+            if vid.resolve() != final_path.resolve():
+                if final_path.exists():
+                    final_path.unlink(missing_ok=True)
+                vid.rename(final_path)
+                vid = final_path
+
+            if ask_fullhd_e01_question:
+                await _send_fullhd_e01_prompt(bot, chat_id, vid, remote_folder_path)
+            elif should_auto_upload:
+                await queue_engine.add_task(
+                    "upload",
+                    f"AutoUpload [{remote_folder_path}]: {vid.name}",
+                    CuteFTPService.upload_path,
+                    vid,
+                    remote_folder_path
+                )
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"✅ فایل `FullHD` دانلود و به نام استاندارد تغییر یافت:\n`{vid.name}`\n"
+                        f"ℹ️ *(چون پوشه `FullHD` روی سرور اصلی وجود ندارد و قسمت اول نیست، به سرور آپلود نشد)*"
+                    ),
+                    parse_mode="Markdown"
+                )
+        else:
+            # اولویت دوم: در سرور اصلی قسمت قبلی برای کپی کردن نام وجود نداشت (یا فیلم سینمایی است)
+            # -> ساخت نام استاندارد بر اساس پوشه و پرسش از کاربر برای تایید یا ویرایش نام قبل از آپلود!
+            suggested_std_name = await AutomationService.build_standard_raw_filename_for_folder(
+                video_path=vid,
+                folder_name=dest_dir.name,
+                series_or_movie_title=series_or_movie_title,
+                season_ep_tag=ep_tag,
+                is_series=is_series
+            )
+            await _send_standard_name_confirmation_prompt(
+                bot=bot,
+                chat_id=chat_id,
+                vid_path=vid,
+                suggested_name=suggested_std_name,
+                remote_folder_path=remote_folder_path,
+                should_auto_upload=should_auto_upload,
+                ask_fullhd_e01_question=ask_fullhd_e01_question
+            )
+
+    return new_videos[0]
+
+
+async def _send_fullhd_e01_prompt(bot: Bot, chat_id: int, vid_path: Path, remote_folder_path: str):
+    token = uuid.uuid4().hex[:6]
+    PENDING_POST_DL_ITEMS[token] = {
+        "type": "fullhd_e01",
+        "vid_path": str(vid_path.resolve()),
+        "remote_dir": remote_folder_path,
+    }
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="✅ بله، پوشه FullHD در سرور ساخته و آپلود شود", callback_data=f"pdl:fhdyes:{token}"),
+        InlineKeyboardButton(text="❌ خیر، فقط در لوکال بماند", callback_data=f"pdl:fhdno:{token}"),
+    )
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"❓ **سوال درباره آپلود پوشه `FullHD` (قسمت اول فصل):**\n\n"
+            f"📄 فایل: `{vid_path.name}`\n"
+            f"پوشه `FullHD` در حال حاضر روی سرور اصلی (`{remote_folder_path}`) وجود ندارد، اما این فایل **قسمت اول فصل (`E01`)** است.\n\n"
+            "آیا می‌خواهید پوشه `FullHD` روی سرور اصلی هم ساخته و آپلود شود؟"
+        ),
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+
+
+async def _send_standard_name_confirmation_prompt(
+    bot: Bot,
+    chat_id: int,
+    vid_path: Path,
+    suggested_name: str,
+    remote_folder_path: str,
+    should_auto_upload: bool,
+    ask_fullhd_e01_question: bool
+):
+    token = uuid.uuid4().hex[:6]
+    PENDING_POST_DL_ITEMS[token] = {
+        "type": "confirm_name",
+        "vid_path": str(vid_path.resolve()),
+        "suggested_name": suggested_name,
+        "remote_dir": remote_folder_path,
+        "should_auto_upload": should_auto_upload,
+        "ask_fullhd_e01": ask_fullhd_e01_question,
+    }
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text="✅ تایید همین نام استاندارد و ادامه",
+            callback_data=f"pdl:stdok:{token}"
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="✏️ نوشتن دستی نام نهایی توسط شما",
+            callback_data=f"pdl:custom:{token}"
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="📄 حفظ نام فعلی فایل بدون تغییر",
+            callback_data=f"pdl:keep:{token}"
+        )
+    )
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"📝 **تایید نام استاندارد فایل دانلودشده**\n"
+            f"*(در پوشه `{remote_folder_path}` روی سرور اصلی قسمت قبلی برای کپی خودکار نام یافت نشد)*\n\n"
+            f"📂 پوشه: `{vid_path.parent.name}`\n"
+            f"📄 **نام فعلی فایل (برای کپی لمس کنید):**\n`{vid_path.name}`\n\n"
+            f"✨ **نام استاندارد پیشنهادی (برای کپی لمس کنید):**\n`{suggested_name}`\n\n"
+            "👇 لطفاً نام استاندارد را تایید کنید و یا دکمه **«✏️ نوشتن دستی نام نهایی»** را بزنید:"
+        ),
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("pdl:mkdirs:"))
+async def cb_pdl_create_missing_local_dirs(call: CallbackQuery):
+    token = call.data.split(":")[2]
+    info = PENDING_POST_DL_ITEMS.pop(token, None)
+    if not info:
+        return await call.answer("⚠️ این پیام منقضی شده است.", show_alert=True)
+
+    base_dir = Path(info["local_base"])
+    created = []
+    for d_name in info.get("missing_dirs", []):
+        p = base_dir / d_name
+        p.mkdir(parents=True, exist_ok=True)
+        created.append(f"`{d_name}`")
+
+    await call.message.edit_text(
+        f"✅ پوشه‌های زیر در مسیر `{base_dir}` همگام با سرور ساخته شدند:\n" + " ، ".join(created),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("pdl:fhdyes:"))
+async def cb_pdl_fullhd_upload_yes(call: CallbackQuery):
+    token = call.data.split(":")[2]
+    info = PENDING_POST_DL_ITEMS.pop(token, None)
+    if not info:
+        return await call.answer("⚠️ این آیتم منقضی شده است.", show_alert=True)
+
+    vid_path = Path(info["vid_path"])
+    remote_dir = info["remote_dir"]
+    task = await queue_engine.add_task(
+        "upload",
+        f"AutoUpload [{remote_dir}]: {vid_path.name}",
+        CuteFTPService.upload_path,
+        vid_path,
+        remote_dir
+    )
+    await call.message.edit_text(
+        f"☁️ آپلود فایل `FullHD` (`{vid_path.name}`) به مسیر `{remote_dir}` در صف قرار گرفت! (کد: `{task.task_id}`)",
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("pdl:fhdno:"))
+async def cb_pdl_fullhd_upload_no(call: CallbackQuery):
+    token = call.data.split(":")[2]
+    info = PENDING_POST_DL_ITEMS.pop(token, None)
+    vid_name = Path(info["vid_path"]).name if info else "FullHD"
+    await call.message.edit_text(
+        f"✅ فایل `{vid_name}` بدون آپلود به سرور، در پوشه `FullHD` لوکال(مبدا) برای هاردساب/انکود نگه داشته شد.",
+        parse_mode="Markdown"
+    )
+
+
+async def _finalize_post_dl_rename_and_upload(
+    msg_or_call: Message | CallbackQuery,
+    info: dict,
+    new_filename: str
+):
+    vid_path = Path(info["vid_path"])
+    if not vid_path.exists():
+        text = "❌ فایل مورد نظر روی دیسک یافت نشد!"
+        if isinstance(msg_or_call, CallbackQuery):
+            return await msg_or_call.message.edit_text(text)
+        return await msg_or_call.answer(text)
+
+    if not new_filename.lower().endswith(vid_path.suffix.lower()):
+        new_filename = f"{new_filename}{vid_path.suffix}"
+
+    final_path = vid_path.with_name(new_filename)
+    if vid_path.resolve() != final_path.resolve():
+        if final_path.exists():
+            final_path.unlink(missing_ok=True)
+        vid_path.rename(final_path)
+        vid_path = final_path
+
+    remote_dir = info["remote_dir"]
+    bot = msg_or_call.bot
+    chat_id = msg_or_call.message.chat.id if isinstance(msg_or_call, CallbackQuery) else msg_or_call.chat.id
+
+    if info.get("ask_fullhd_e01"):
+        if isinstance(msg_or_call, CallbackQuery):
+            await msg_or_call.message.edit_text(f"✅ نام فایل به `{vid_path.name}` تغییر یافت.", parse_mode="Markdown")
+        else:
+            await msg_or_call.answer(f"✅ نام فایل به `{vid_path.name}` تغییر یافت.", parse_mode="Markdown")
+        return await _send_fullhd_e01_prompt(bot, chat_id, vid_path, remote_dir)
+
+    if info.get("should_auto_upload", True):
+        task = await queue_engine.add_task(
+            "upload",
+            f"AutoUpload [{remote_dir}]: {vid_path.name}",
+            CuteFTPService.upload_path,
+            vid_path,
+            remote_dir
+        )
+        done_txt = (
+            f"✅ نام فایل به:\n`{vid_path.name}`\nتغییر یافت و آپلود خودکار آن به مسیر `{remote_dir}` در صف قرار گرفت! (کد: `{task.task_id}`)"
+        )
+    else:
+        done_txt = (
+            f"✅ نام فایل به:\n`{vid_path.name}`\nتغییر یافت.\n"
+            f"ℹ️ *(چون پوشه `FullHD` در سرور اصلی نیست، فقط در لوکال ذخیره شد)*"
+        )
+
+    if isinstance(msg_or_call, CallbackQuery):
+        await msg_or_call.message.edit_text(done_txt, parse_mode="Markdown")
+    else:
+        await msg_or_call.answer(done_txt, parse_mode="Markdown")
+
+
+@router.callback_query(F.data.startswith("pdl:stdok:"))
+async def cb_pdl_confirm_standard_name(call: CallbackQuery):
+    token = call.data.split(":")[2]
+    info = PENDING_POST_DL_ITEMS.pop(token, None)
+    if not info:
+        return await call.answer("⚠️ این آیتم منقضی شده است.", show_alert=True)
+    await _finalize_post_dl_rename_and_upload(call, info, info["suggested_name"])
+
+
+@router.callback_query(F.data.startswith("pdl:keep:"))
+async def cb_pdl_keep_original_name(call: CallbackQuery):
+    token = call.data.split(":")[2]
+    info = PENDING_POST_DL_ITEMS.pop(token, None)
+    if not info:
+        return await call.answer("⚠️ این آیتم منقضی شده است.", show_alert=True)
+    orig_name = Path(info["vid_path"]).name
+    await _finalize_post_dl_rename_and_upload(call, info, orig_name)
+
+
+@router.callback_query(F.data.startswith("pdl:custom:"))
+async def cb_pdl_ask_custom_name(call: CallbackQuery, state: FSMContext):
+    token = call.data.split(":")[2]
+    info = PENDING_POST_DL_ITEMS.get(token)
+    if not info:
+        return await call.answer("⚠️ این آیتم منقضی شده است.", show_alert=True)
+
+    await state.update_data(pdl_active_token=token)
+    await state.set_state(DownloadStates.waiting_post_dl_custom_name)
+    await call.message.edit_text(
+        f"✏️ **ارسال نام دلخواه برای فایل دانلودشده:**\n\n"
+        f"🔹 نام پیشنهادی (برای کپی و ویرایش لمس کنید):\n`{info['suggested_name']}`\n\n"
+        "لطفاً **نام نهایی فایل** را تایپ و ارسال کنید تا تغییر نام داده شده و در سرور آپلود شود:",
+        parse_mode="Markdown"
+    )
+
+
+@router.message(DownloadStates.waiting_post_dl_custom_name)
+async def handle_pdl_custom_name_input(message: Message, state: FSMContext):
+    custom_name = re.sub(r'[<>:"/\\|?*]', "", (message.text or "").strip()).strip()
+    if not custom_name:
+        return await message.answer("⚠️ نام وارد شده معتبر نیست. لطفاً دوباره بفرستید:")
+
+    data = await state.get_data()
+    token = data.get("pdl_active_token")
+    info = PENDING_POST_DL_ITEMS.pop(token, None) if token else None
+    await state.clear()
+
+    if not info:
+        return await message.answer("⚠️ اطلاعات فایل منقضی شده است.", reply_markup=main_menu_kb())
+
+    await _finalize_post_dl_rename_and_upload(message, info, custom_name)
+
+
+# ==============================================================================
+# مرورگر انتخاب پوشه مقصد دانلود و صف‌بندی هوشمند دانلودها
+# ==============================================================================
 
 async def _render_download_folder_browser(
     target_msg_or_call: Message | CallbackQuery,
@@ -107,7 +583,7 @@ async def _render_download_folder_browser(
         f"📍 **مسیر فعلی باز شده:**\n`{current_dir}`\n\n"
         f"📋 **زیرپوشه‌های این صفحه:**\n{list_block}\n\n"
         "• برای دانلود در همین پوشه فعلی، دکمه **«📥 دانلود در همین پوشه فعلی»** را بزنید.\n"
-        "• برای ورود به زیرپوشه‌های بعدی، روی نام پوشه کلیک کنید و یا در همینجا پوشه جدید بسازید:"
+        "• پس از اتمام دانلود، فایل به صورت خودکار (در صورت زیپ بودن اکسترکت شده)، بر اساس سرور اصلی تغییر نام می‌یابد و در همان پوشه در سرور آپلود می‌شود:"
     )
     kb = download_folder_tree_browser_kb(subfolders, current_dir, is_root, page=page)
 
@@ -117,15 +593,17 @@ async def _render_download_folder_browser(
         await target_msg_or_call.answer(text[:4000], reply_markup=kb, parse_mode="Markdown")
 
 
-async def _enqueue_batch_downloads(targets: list[str], dest_dir: Path) -> list[str]:
+async def _enqueue_batch_downloads(bot: Bot, chat_id: int, targets: list[str], dest_dir: Path) -> list[str]:
     task_ids = []
     total = len(targets)
     for idx, t_link in enumerate(targets, start=1):
-        label = f"دانلود [{idx}/{total}] در {dest_dir.name}" if total > 1 else f"دانلود در {dest_dir.name}"
+        label = f"دانلود هوشمند [{idx}/{total}] در {dest_dir.name}" if total > 1 else f"دانلود هوشمند در {dest_dir.name}"
         task = await queue_engine.add_task(
             "download",
             label,
-            DownloaderService.download,
+            _smart_download_pipeline_job,
+            bot,
+            chat_id,
             t_link,
             dest_dir
         )
@@ -209,10 +687,10 @@ async def cb_direct_dl(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(DownloadStates.waiting_direct_link)
     await call.message.edit_text(
-        "📥 **دانلود فیلم یا سریال (تکی و گروهی Batch)**\n\n"
+        "📥 **دانلود هوشمند فیلم یا سریال (تکی و گروهی Batch)**\n\n"
         "🔗 لطفاً **یک یا چند لینک (مستقیم، Magnet، Mega.nz، Google Drive)** را ارسال کنید:\n"
-        "• برای **دانلود گروهی (Batch)**، کافی است بین هر لینک یک خط فاصله بگذارید (یا هر لینک را در یک خط قرار دهید).\n"
-        "• همچنین می‌توانید فایل `.torrent` ارسال کنید:",
+        "• برای **دانلود گروهی (Batch)**، بین هر لینک یک خط فاصله بگذارید.\n"
+        "• پس از دانلود، اگر فایل زیپ باشد خودکار خارج می‌شود، نام آن از روی قسمت‌های قبلی سرور کپی (یا استانداردسازی) شده و در همان پوشه در سرور آپلود می‌گردد:",
         parse_mode="Markdown"
     )
 
@@ -273,13 +751,15 @@ async def cb_dlnav_select_here(call: CallbackQuery, state: FSMContext):
     if not targets and data.get("pending_direct_target"):
         targets = [data["pending_direct_target"]]
 
-    task_ids = await _enqueue_batch_downloads(targets, chosen_dir)
+    task_ids = await _enqueue_batch_downloads(call.bot, call.message.chat.id, targets, chosen_dir)
     await state.clear()
 
     ids_str = ", ".join([f"`{tid}`" for tid in task_ids])
+    remote_eq = AutomationService.compute_server_remote_dir_for_local_path(chosen_dir)
     await call.message.edit_text(
-        f"✅ تعداد **`{len(task_ids)}` دانلود** با موفقیت در صف قرار گرفت!\n"
-        f"📂 مسیر دقیق ذخیره:\n`{chosen_dir}`\n"
+        f"✅ تعداد **`{len(task_ids)}` دانلود هوشمند** در صف قرار گرفت!\n"
+        f"📂 مسیر ذخیره لوکال:\n`{chosen_dir}`\n"
+        f"☁️ مسیر متناظر در سرور اصلی:\n`{remote_eq}`\n"
         f"🆔 کد تسک‌ها: {ids_str}",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
@@ -296,7 +776,7 @@ async def cb_dlnav_mkdir_here(call: CallbackQuery, state: FSMContext):
     kb.row(InlineKeyboardButton(text="🔙 بازگشت به مرورگر پوشه", callback_data="dlnav:resume"))
     await call.message.edit_text(
         f"➕ **ساخت پوشه جدید در مسیر:**\n`{curr_dir}`\n\n"
-        "✏️ لطفاً **نام پوشه جدید** را ارسال کنید (می‌توانید نام ساده مثل `1080p-Pahe` یا مسیر چندسطحی مثل `The.Greatest/S01/FullHD` بفرستید):",
+        "✏️ لطفاً **نام پوشه جدید** را ارسال کنید (اگر نام فصل مثل `S01` یا `The.Greatest/S01` بفرستید، پوشه‌های پیش‌فرض `1080p-EBTV`, `720p-EBTV`, `1080p-x265-PSA`, `720p-x265-PSA`, `480p-RMTeam` و `srt/FA & EN` خودکار داخل آن ساخته می‌شوند):",
         reply_markup=kb.as_markup(),
         parse_mode="Markdown"
     )
@@ -330,7 +810,7 @@ async def handle_new_dl_subfolder_name(message: Message, state: FSMContext):
     await _render_download_folder_browser(message, state, new_dir, page=0)
 
 
-# ==================== ۳. استخراج زیرنویس (همراه با صفحه‌بندی دایرکتوری) ====================
+# ==================== ۳. استخراج زیرنویس ====================
 @router.callback_query(F.data == "menu:link_extract_sub")
 async def cb_link_extract_sub_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()

@@ -2,6 +2,7 @@ telegram:
   bot_token: "9194234248:AAGGkeiVf7E8v0BAL_Ft1R-VUvS6oh2ESME"
   admin_ids:
     - 815777731
+  progress_update_interval: 3.0
 proxy:
   enabled: true
   # مثال: socks5://127.0.0.1:10808 یا http://127.0.0.1:10809
@@ -69,11 +70,15 @@ subtitle_style:
   outline_width: 2.0
   shadow_depth: 1.0
 
-cuteftp:
-  host: "ftp.dl.example.com"
-  port: 21
-  protocol: "FTP"
-  username: "ftpuser"
-  password: "ftppassword"
-  remote_base_dir: "English"
-  base_download_url: "https://dl15.cdnzed.sbs/"
+ftp:
+  host: "dl15.cdnzed.sbs"           # آدرس هاست یا IP سرور دانلود
+  port: 21                          # پورت FTP
+  username: "3443"                  # نام کاربری استخراج شده
+  password: "YOUR_FTP_PASSWORD"     # رمز عبور استخراج شده
+  passive_mode: true                # حالت Passive (پیشنهادی برای عبور از فایروال)
+  timeout: 60                       # تایم‌اوت سوکت به ثانیه
+  chunk_size_kb: 512                # سایز بافر خواندن/نوشتن (512 کیلوبایت برای سرعت بالا)
+  max_retries: 5                    # حداکثر تلاش مجدد برای هر فایل در صورت قطعی شبکه
+  retry_delay_sec: 5                # فاصله پایه بین تلاش‌های مجدد (Exponential Backoff)
+  root_remote_dir: "/"              # پوشه ریشه در سرور FTP
+  public_base_url: "https://dl15.cdnzed.sbs"  # دامنه عمومی برای تولید لینک مستقیم دانلود

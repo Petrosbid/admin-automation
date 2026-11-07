@@ -504,7 +504,7 @@ async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
         new_dir = show_dir / "S01" if not AutomationService.SEASON_DIR_REGEX.match(folder_name) else show_dir
         AutomationService.create_series_season_structure(new_dir)
         sub_target = new_dir / "srt" / "FA"
-        desc = f"در شاخه `{cat_key}` همراه با پوشه‌های استاندارد فصل (`FullHD`, `1080p-HardSub`, `1080p-EBTV`, `srt/FA`, `srt/EN`)"
+        desc = f"در شاخه `{cat_key}` همراه با پوشه‌های پیش‌فرض فصل (`1080p-EBTV`, `720p-EBTV`, `1080p-x265-PSA`, `720p-x265-PSA`, `480p-RMTeam`, `srt/FA`, `srt/EN`)"
     else:
         new_dir = parent_dir / folder_name
         new_dir.mkdir(parents=True, exist_ok=True)

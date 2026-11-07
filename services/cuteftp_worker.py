@@ -380,3 +380,67 @@ def sync_upload_cuteftp(
 
         finally:
             _close_ftp_quietly(ftp_holder[0])
+
+def list_ftp_dir_entries(remote_dir: str) -> dict[str, list[str]]:
+    """
+    اتصال به سرور FTP و دریافت لیست فایل‌ها و زیرپوشه‌های موجود در مسیر remote_dir.
+    خروجی: {"files": [...], "dirs": [...], "exists": True/False}
+    """
+    result = {"files": [], "dirs": [], "exists": False}
+    ftp_cfg = cfg.get("cuteftp") or {}
+    protocol = str(ftp_cfg.get("protocol", "FTP")).strip().upper()
+    host = str(ftp_cfg.get("host", "")).strip()
+    port = int(ftp_cfg.get("port", 21) or 21)
+    username = str(ftp_cfg.get("username", "")).strip()
+    password = str(ftp_cfg.get("password", "")).strip()
+
+    if not host or not username or not password or password == "ftppassword":
+        return result
+
+    norm_dir = _normalize_remote_path(remote_dir)
+    ftp = None
+    try:
+        ftp = _create_ftp_connection(
+            host=host, port=port, username=username, password=password, protocol=protocol, timeout=30
+        )
+        try:
+            ftp.cwd(norm_dir)
+            result["exists"] = True
+        except Exception:
+            return result
+
+        # ۱. تلاش با دستور استاندارد MLSD
+        try:
+            for name, facts in ftp.mlsd():
+                if name in (".", ".."):
+                    continue
+                ftype = str(facts.get("type", "")).lower()
+                if ftype == "dir":
+                    result["dirs"].append(name)
+                elif ftype == "file":
+                    result["files"].append(name)
+            return result
+        except Exception:
+            pass
+
+        # ۲. فال‌بک به دستور LIST در صورتی که سرور MLSD را پشتیبانی نکند
+        lines: list[str] = []
+        ftp.retrlines("LIST", lines.append)
+        for line in lines:
+            parts = line.split(None, 8)
+            if len(parts) < 9:
+                continue
+            name = parts[8].strip()
+            if name in (".", ".."):
+                continue
+            if line.startswith("d") or "<DIR>" in line.upper():
+                result["dirs"].append(name)
+            else:
+                result["files"].append(name)
+
+        return result
+    except Exception as e:
+        logging.warning(f"FTP inspect warning for {norm_dir}: {e}")
+        return result
+    finally:
+        _close_ftp_quietly(ftp)
