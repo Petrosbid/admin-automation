@@ -1,26 +1,9 @@
-import ssl
-
-_orig_create_default_context = ssl.create_default_context
-
-
-def _unverified_ssl_context(*args, **kwargs) -> ssl.SSLContext:
-    ctx = _orig_create_default_context(*args, **kwargs)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-
-ssl.create_default_context = _unverified_ssl_context
-ssl._create_default_https_context = _unverified_ssl_context
-
 import asyncio
 import importlib
 import logging
 import msvcrt
 import sys
 import traceback
-import urllib3
-from aiohttp import TCPConnector
 from aiogram import Bot, Dispatcher, Router, BaseMiddleware
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
@@ -37,8 +20,6 @@ import bot.queue_handlers as queue_handlers_mod
 import bot.download_handlers as download_handlers_mod
 import bot.subtitle_handlers as subtitle_handlers_mod
 import bot.handlers as main_handlers_mod
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,11 +60,8 @@ class RegisterAdminChatMiddleware(BaseMiddleware):
 
 
 def create_bot_session(proxy_url: str | None) -> AiohttpSession:
-    session = AiohttpSession(proxy=proxy_url) if proxy_url else AiohttpSession()
-    session._connector_init["ssl"] = _unverified_ssl_context()
-    if not proxy_url:
-        session._connector_type = TCPConnector
-    return session
+    # از دست‌کاری private API کتابخانه و غیرفعال‌کردن اعتبارسنجی TLS خودداری می‌کنیم.
+    return AiohttpSession(proxy=proxy_url) if proxy_url else AiohttpSession()
 
 
 def _attach_all_routers(dp: Dispatcher):
@@ -122,7 +100,13 @@ async def hot_reload_code(dp: Dispatcher, bot: Bot) -> tuple[bool, str]:
                 importlib.reload(sys.modules[mod_name])
                 reloaded_count += 1
 
-        # ارتقای کلاس و ری‌استارت ورکرهای بیکار تا کد جدید نوتیفیکیشن بلافاصله در _worker_loop فعال شود
+                # مهم: reload کردن core.queue_manager یک singleton تازه می‌سازد.
+                # باید همان لحظه نمونه زنده قبلی را برگردانیم تا ماژول‌های بعدی
+                # (automation_service و handlerها) دقیقاً همان queue_engine را import کنند.
+                if mod_name == "core.queue_manager":
+                    queue_mod.queue_engine = active_engine
+                    active_engine.__class__ = queue_mod.QueueManager
+
         active_engine.__class__ = queue_mod.QueueManager
         if not hasattr(active_engine, "_known_chats"):
             active_engine._known_chats = set()
