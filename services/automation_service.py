@@ -982,18 +982,38 @@ class AutomationService:
             "srt_en": srt_dir,
         }
 
+    @staticmethod
+    def iter_files_one_subfolder(root_dir: Path):
+        """
+        فقط فایل‌های مستقیم پوشه انتخاب‌شده و فایل‌های داخل یک سطح زیرپوشه را برمی‌گرداند.
+        از پیمایش نامحدود rglob جلوگیری می‌کند تا فایل‌های پوشه‌های تو در تو وارد عملیات نشوند.
+        """
+        root_dir = Path(root_dir)
+        if not root_dir.is_dir():
+            return
+        for item in sorted(root_dir.iterdir(), key=lambda p: p.name.lower()):
+            if item.is_file():
+                yield item
+            elif item.is_dir() and not item.name.startswith("_"):
+                try:
+                    for child in sorted(item.iterdir(), key=lambda p: p.name.lower()):
+                        if child.is_file():
+                            yield child
+                except (PermissionError, OSError):
+                    continue
+
     @classmethod
     def scan_all_episodes_anywhere_in_season(cls, season_dir: Path) -> list[str]:
-        """اسکن تمام قسمت‌های SxxEyy موجود در کل زیرپوشه‌های فصل (خام، سافت‌ساب، هاردساب، انکود و زیرنویس)"""
+        """اسکن فایل‌های فصل و فقط یک سطح زیرپوشه برای یافتن تگ قسمت."""
         episodes: set[str] = set()
         if not season_dir.exists():
             return []
-        for f in season_dir.rglob("*"):
-            if f.is_file() and not f.name.startswith("_"):
-                ep = cls.extract_episode_tag(f.name)
+        for file_path in cls.iter_files_one_subfolder(season_dir):
+            if not file_path.name.startswith("_"):
+                ep = cls.extract_episode_tag(file_path.name)
                 if ep:
                     episodes.add(ep)
-        return sorted(list(episodes))
+        return sorted(episodes)
 
     @classmethod
     def collect_all_episode_files_for_smart_upload(
@@ -1011,9 +1031,7 @@ class AutomationService:
         ep_up = episode_tag.upper()
         matched_items: list[tuple[Path, str]] = []
 
-        for item in sorted(season_dir.rglob("*"), key=lambda p: p.as_posix().lower()):
-            if not item.is_file():
-                continue
+        for item in cls.iter_files_one_subfolder(season_dir):
             if item.name.startswith("_") or item.name.endswith(".aria2"):
                 continue
 
