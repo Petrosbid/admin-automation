@@ -1064,27 +1064,31 @@ async def cb_cuteftp_choose_destination(call: CallbackQuery, state: FSMContext):
         if not sel_files:
             return await call.answer("⚠️ هیچ فایلی انتخاب نشده است!", show_alert=True)
         await state.update_data(cuteftp_upload_targets=sel_files)
+        first_target = Path(sel_files[0]).resolve()
         target_desc = f"{len(sel_files)} فایل انتخاب‌شده"
+        auto_remote_path = AutomationService.compute_server_remote_dir_for_local_path(first_target)
     elif call.data == "vact:upload_file":
-        target = Path(data["selected_video"]).resolve()
-        await state.update_data(cuteftp_upload_targets=[str(target)])
-        target_desc = target.name
+        first_target = Path(data["selected_video"]).resolve()
+        await state.update_data(cuteftp_upload_targets=[str(first_target)])
+        target_desc = first_target.name
+        auto_remote_path = AutomationService.compute_server_remote_dir_for_local_path(first_target)
     else:
-        target = Path(data.get("current_dir", cfg.get("paths", "workspace_dir"))).resolve()
-        await state.update_data(cuteftp_upload_targets=[str(target)])
-        target_desc = f"پوشه {target.name}"
+        first_target = Path(data.get("current_dir", cfg.get("paths", "workspace_dir"))).resolve()
+        await state.update_data(cuteftp_upload_targets=[str(first_target)])
+        target_desc = f"کل پوشه {first_target.name}"
+        # برای آپلود کل پوشه، مسیر والد در سرور را به عنوان مقصد قرار می‌دهیم تا خود پوشه داخل آن ساخته شود
+        auto_remote_path = AutomationService.compute_server_remote_dir_for_local_path(first_target)
 
-    active_gui_path = await CuteFTPService.get_active_gui_remote_path()
+    await state.update_data(cuteftp_auto_mapped_path=auto_remote_path)
 
     await call.message.edit_text(
-        f"☁️ **آپلود به هاست دانلود (CuteFTP 9)**\n\n"
+        f"☁️ **آپلود مستقیم به سرور دانلود (بدون نیاز به GUI)**\n\n"
         f"📦 آیتم انتخاب شده برای آپلود:\n`{target_desc}`\n"
-        f"📍 مسیر فعلی باز در برنامه CuteFTP:\n`{active_gui_path}`\n\n"
-        "در کدام پوشه از هاست دانلود آپلود شود؟",
-        reply_markup=cuteftp_destination_kb(active_gui_path),
+        f"🎯 مسیر هوشمند تشخیص داده شده در سرور:\n`{auto_remote_path}`\n\n"
+        "در کدام مسیر از سرور دانلود آپلود شود؟",
+        reply_markup=cuteftp_destination_kb(auto_remote_path),
         parse_mode="Markdown"
     )
-
 
 async def _enqueue_cuteftp_targets(data: dict, remote_dest: str) -> str:
     targets = [Path(p) for p in data.get("cuteftp_upload_targets", [])]
@@ -1103,13 +1107,14 @@ async def _enqueue_cuteftp_targets(data: dict, remote_dest: str) -> str:
     return task.task_id
 
 
-@router.callback_query(F.data == "cftp_dest:current")
+@router.callback_query(F.data.in_({"cftp_dest:current", "cftp_dest:auto_mapped"}))
 async def cb_cuteftp_upload_to_current(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    task_id = await _enqueue_cuteftp_targets(data, "__CURRENT__")
+    remote_dest = data.get("cuteftp_auto_mapped_path") or "__CURRENT__"
+    task_id = await _enqueue_cuteftp_targets(data, remote_dest)
     await state.clear()
     await call.message.edit_text(
-        f"☁️ آپلود به **مسیر فعلی CuteFTP** در صف قرار گرفت!\n"
+        f"☁️ آپلود مستقیم به مسیر `{remote_dest}` در صف قرار گرفت!\n"
         f"🆔 کد تسک: `{task_id}`",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"

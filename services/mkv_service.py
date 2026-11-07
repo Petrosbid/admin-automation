@@ -14,11 +14,6 @@ from services.subtitle_service import SubtitleService
 class MKVService:
     @staticmethod
     def _get_ffmpeg_bin() -> str | None:
-        """
-        پیدا کردن دقیق فایل اجرایی ffmpeg.exe در سرور:
-        اگر در مسیر config.yaml نبود، در PATH ویندوز و مسیرهای استاندارد جستجو می‌کند.
-        اگر اصلاً روی سرور نصب نبود، None برمی‌گرداند تا به صورت خودکار به mkvmerge سوئیچ شود.
-        """
         ffmpeg_cfg = str(cfg.get("paths", "ffmpeg_dir", "")).strip()
         candidates: list[Path] = []
 
@@ -34,7 +29,6 @@ class MKVService:
         if which_ff:
             candidates.append(Path(which_ff))
 
-        # مسیرهای متداول روی ویندوز سرور
         common_paths = [
             Path("C:/ffmpeg/bin/ffmpeg.exe"),
             Path("C:/ffmpeg/ffmpeg.exe"),
@@ -44,10 +38,8 @@ class MKVService:
             Path("C:/MediaBot/ffmpeg.exe"),
             Path.cwd() / "ffmpeg.exe",
         ]
-        # بررسی پوشه Scripts محیط مجازی پایتون (در صورتی که imageio-ffmpeg یا مشابه نصب باشد)
         venv_scripts = Path(os.sys.executable).parent
         common_paths.append(venv_scripts / "ffmpeg.exe")
-
         candidates.extend(common_paths)
 
         for cand in candidates:
@@ -56,7 +48,6 @@ class MKVService:
                     return str(cand.resolve())
             except Exception:
                 continue
-
         return None
 
     @staticmethod
@@ -89,8 +80,9 @@ class MKVService:
     def _is_english_track(track_info: dict) -> bool:
         lang = str(track_info.get("language", "")).lower()
         name = str(track_info.get("track_name", "")).lower()
-        if lang in ("eng", "en", "english"):
-            return True
+        if lang in ("eng", "en", "english", "und"):
+            if "fa" not in name and "per" not in name and "persian" not in name:
+                return True
         if "english" in name or "eng" in name:
             return True
         return False
@@ -107,7 +99,7 @@ class MKVService:
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
             raise RuntimeError(f"mkvmerge -J error: {stderr.decode('utf-8', errors='replace')}")
-        return json.loads(stdout.decode("utf-8", errors='replace'))
+        return json.loads(stdout.decode("utf-8", errors="replace"))
 
     @classmethod
     async def list_subtitle_tracks(cls, video_path: Path) -> list[dict]:
@@ -137,7 +129,6 @@ class MKVService:
         ffmpeg_bin = cls._get_ffmpeg_bin()
         mkvextract_bin = cls._get_mkvextract_bin()
 
-        # اگر فایل MP4 است و ffmpeg روی سیستم نصب است، با ffmpeg استخراج کن
         if video_path.suffix.lower() == ".mp4" and ffmpeg_bin:
             cmd = [
                 ffmpeg_bin, "-y",
@@ -156,8 +147,6 @@ class MKVService:
                     SubtitleService.normalize_srt_utf8(output_sub_path)
                 return output_sub_path
 
-        # اگر فایل MKV است (یا ffmpeg نصب نبود):
-        # اگر فایل MP4 است و ffmpeg نداریم، ابتدا ترک زیرنویس را با mkvmerge به یک فایل موقت MKV منتقل و سپس با mkvextract استخراج کن!
         target_for_mkvextract = video_path
         temp_remux_mkv = None
         try:
@@ -179,7 +168,7 @@ class MKVService:
                 await r_proc.communicate()
                 if temp_remux_mkv.exists():
                     target_for_mkvextract = temp_remux_mkv
-                    track_id = 0  # در فایل موقت بدون ویدئو و صدا، ترک زیرنویس شماره 0 است
+                    track_id = 0
 
             cmd = [
                 mkvextract_bin,
@@ -414,11 +403,6 @@ class MKVService:
         sync_offset_ms: int = 0,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
-        """
-        سافت‌ساب بدون خطای WinError 2:
-        - اگر پسوند خروجی .mp4 باشد و ffmpeg روی سرور موجود باشد -> با ffmpeg (mov_text) مرج می‌کند.
-        - اگر پسوند خروجی .mkv باشد (یا ffmpeg روی سرور نصب نباشد) -> با mkvmerge مرج می‌کند تا هیچ‌وقت خطای عدم وجود فایل اجرایی رخ ندهد!
-        """
         output_path.parent.mkdir(parents=True, exist_ok=True)
         mkvmerge_bin = cls._get_mkvmerge_bin()
         ffmpeg_bin = cls._get_ffmpeg_bin()
@@ -470,7 +454,6 @@ class MKVService:
                             kept_embedded_en_id = t.get("id")
                             break
 
-            # اگر خروجی .mp4 است و ffmpeg.exe روی سرور وجود دارد، با ffmpeg مرج کن
             if output_path.suffix.lower() == ".mp4" and ffmpeg_bin:
                 return await cls._merge_softsub_mp4_ffmpeg(
                     ffmpeg_bin=ffmpeg_bin,
@@ -487,8 +470,6 @@ class MKVService:
                     progress_callback=progress_callback
                 )
 
-            # در غیر این صورت (برای MKV و یا زمانی که ffmpeg روی سرور نصب نیست)، با mkvmerge مرج کن
-            # (mkvmerge می‌تواند فایل ورودی .mp4 را بخواند و حتی با پسوند .mp4 ذخیره کند)
             cmd = [
                 mkvmerge_bin,
                 "--ui-language", "en",

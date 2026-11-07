@@ -114,7 +114,6 @@ async def hot_reload_code(dp: Dispatcher, bot: Bot) -> tuple[bool, str]:
         if hasattr(monitor_mod, "monitor_service"):
             monitor_mod.monitor_service.stop()
 
-        # حفظ نمونه فعلی queue_engine قبل از ریلود ماژول آن
         active_engine = queue_mod.queue_engine
 
         reloaded_count = 0
@@ -123,9 +122,12 @@ async def hot_reload_code(dp: Dispatcher, bot: Bot) -> tuple[bool, str]:
                 importlib.reload(sys.modules[mod_name])
                 reloaded_count += 1
 
-        # ارتقای کلاس نمونه در حال اجرا به کدهای جدید بدون از دست رفتن تسک‌ها و ورکرها
+        # ارتقای کلاس و ری‌استارت ورکرهای بیکار تا کد جدید نوتیفیکیشن بلافاصله در _worker_loop فعال شود
         active_engine.__class__ = queue_mod.QueueManager
+        if not hasattr(active_engine, "_known_chats"):
+            active_engine._known_chats = set()
         active_engine.set_bot(bot)
+        active_engine.restart_workers_for_hot_reload()
         queue_mod.queue_engine = active_engine
 
         _attach_all_routers(dp)
@@ -133,7 +135,7 @@ async def hot_reload_code(dp: Dispatcher, bot: Bot) -> tuple[bool, str]:
         if hasattr(monitor_mod, "monitor_service"):
             monitor_mod.monitor_service.start(bot)
 
-        msg = f"✅ [HOT-RELOAD] تعداد {reloaded_count} ماژول و فایل config.yaml با موفقیت آپدیت شدند! (پراسس‌های فعال بدون وقفه ادامه دارند)"
+        msg = f"✅ [HOT-RELOAD] تعداد {reloaded_count} ماژول و ورکرهای نوتیفیکیشن با موفقیت آپدیت شدند!"
         logging.info(msg)
         return True, msg
 
@@ -141,7 +143,6 @@ async def hot_reload_code(dp: Dispatcher, bot: Bot) -> tuple[bool, str]:
         err_trace = traceback.format_exc()
         logging.error(f"❌ [HOT-RELOAD ERROR] خطا در کدهای ویرایش شده:\n{err_trace}")
         return False, f"❌ خطا در بروزرسانی کدها:\n`{e}`"
-
 
 @system_router.message(Command("reload"))
 async def cmd_telegram_hot_reload(message: Message, dispatcher: Dispatcher):

@@ -2,6 +2,7 @@ import asyncio
 import html
 import inspect
 import logging
+import re
 import traceback
 import uuid
 from dataclasses import dataclass, field
@@ -54,13 +55,12 @@ class QueueManager:
         self._bot = bot
 
     def register_chat(self, chat_id: int):
-        """ثبت خودکار چت ادمین برای اطمینان ۱۰۰٪ از ارسال نوتیفیکیشن‌ها"""
         if chat_id:
             self._known_chats.add(int(chat_id))
 
     def _get_target_chat_ids(self) -> list[int]:
         raw_admins = cfg.get("telegram", "admin_ids", [])
-        chat_ids: set[int] = set(self._known_chats)
+        chat_ids: set[int] = set(getattr(self, "_known_chats", set()))
 
         if isinstance(raw_admins, (int, str)):
             try:
@@ -150,17 +150,13 @@ class QueueManager:
                 self._events[queue_type].clear()
             await self._events[queue_type].wait()
 
-    async def _notify_admins_html(self, html_text: str):
-        """ارسال ایمن پیام با فرمت HTML به تمام ادمین‌ها بدون خطای کاراکترهای Markdown"""
+    async def _notify_admins(self, html_text: str):
+        """ارسال تضمینی نوتیفیکیشن به تلگرام برای تمام انواع پراسس‌ها"""
         if not self._bot:
-            logging.warning("QueueManager._bot is None! Cannot send notification.")
+            logging.error("QueueManager._bot is None!")
             return
 
         target_ids = self._get_target_chat_ids()
-        if not target_ids:
-            logging.warning("No admin_ids found in config.yaml to send notification.")
-            return
-
         for admin_id in target_ids:
             try:
                 await self._bot.send_message(
@@ -170,9 +166,8 @@ class QueueManager:
                     disable_web_page_preview=True
                 )
             except Exception as e:
-                logging.error(f"HTML notify error for {admin_id}: {e}")
+                logging.warning(f"HTML notification fallback for {admin_id}: {e}")
                 try:
-                    import re
                     plain = re.sub(r"<[^>]+>", "", html_text)
                     await self._bot.send_message(
                         chat_id=admin_id,
@@ -180,51 +175,51 @@ class QueueManager:
                         disable_web_page_preview=True
                     )
                 except Exception as e2:
-                    logging.error(f"Plain notify error for {admin_id}: {e2}")
+                    logging.error(f"Failed to send notification to {admin_id}: {e2}")
 
     async def _send_completion_notification(self, task: QueueTask, res: Any):
-        """ارسال نوتیفیکیشن دقیق پس از اتمام دانلود، سافت‌ساب، هاردساب و آپلود"""
+        """ساخت و ارسال پیام تکمیل شدن برای دانلود، سافت‌ساب، هاردساب/انکود و آپلود"""
         section_label = html.escape(self.QUEUE_LABELS.get(task.queue_type, task.queue_type.upper()))
         safe_title = html.escape(str(task.title))
         safe_id = html.escape(str(task.task_id))
 
-        # ۱. نوتیفیکیشن آپلود
+        # ۱. اگر پراسس آپلود بود:
         if task.queue_type == "upload":
             if isinstance(res, list) and res:
                 links_block = "\n".join([f"🔗 <code>{html.escape(str(u))}</code>" for u in res[:25]])
-                await self._notify_admins_html(
+                await self._notify_admins(
                     f"☁️ <b>آپلود با موفقیت به پایان رسید!</b>\n"
                     f"🆔 کد: <code>{safe_id}</code>\n"
                     f"📌 عنوان: <code>{safe_title}</code>\n\n"
                     f"📥 <b>لینک‌های مستقیم دانلود:</b>\n{links_block}"
                 )
             else:
-                await self._notify_admins_html(
+                await self._notify_admins(
                     f"☁️ <b>آپلود با موفقیت انجام شد!</b>\n"
                     f"🆔 کد: <code>{safe_id}</code>\n"
                     f"📌 عنوان: <code>{safe_title}</code>"
                 )
             return
 
-        # ۲. پیدا کردن فایل یا پوشه خروجی برای دانلود، سافت‌ساب و هاردساب
+        # ۲. برای دانلود، سافت‌ساب (mkvtoolnix) و هاردساب/انکود (handbrake):
         out_path: Path | None = None
         if isinstance(res, Path):
             out_path = res
         elif isinstance(res, str) and res.strip():
             try:
-                if Path(res).exists():
-                    out_path = Path(res)
+                p = Path(res)
+                if p.exists():
+                    out_path = p
             except Exception:
                 pass
         elif isinstance(res, list) and len(res) > 0:
             try:
-                first_item = Path(str(res[0]))
-                if first_item.exists():
-                    out_path = first_item
+                p = Path(str(res[0]))
+                if p.exists():
+                    out_path = p
             except Exception:
                 pass
 
-        # اگر متد دانلود چیزی برنگردانده یا پوشه مقصد در args بوده، پوشه مقصد را از args استخراج کن
         if out_path is None and task.args:
             for arg in reversed(task.args):
                 if isinstance(arg, Path) and arg.exists():
@@ -236,12 +231,11 @@ class QueueManager:
             if out_path.is_file():
                 size_mb = out_path.stat().st_size / (1024 * 1024)
                 details = (
-                    f"\n📄 <b>فایل نهایی:</b>\n<code>{html.escape(out_path.name)}</code>\n"
+                    f"\n📄 <b>فایل خروجی:</b>\n<code>{html.escape(out_path.name)}</code>\n"
                     f"📂 <b>مسیر ذخیره:</b>\n<code>{html.escape(str(out_path.parent))}</code>\n"
                     f"📦 <b>حجم فایل:</b> <code>{size_mb:.2f} MB</code>"
                 )
             elif out_path.is_dir():
-                # اگر خروجی دانلود یک پوشه است، جدیدترین فایل‌های دانلودشده داخل آن را پیدا کن و نمایش بده
                 files_in_dir = sorted(
                     [
                         f for f in out_path.rglob("*")
@@ -262,15 +256,23 @@ class QueueManager:
                 else:
                     details = f"\n📂 <b>مسیر پوشه:</b>\n<code>{html.escape(str(out_path))}</code>"
 
-        icon = "📥" if task.queue_type == "download" else "✅"
-        header_txt = "دانلود فایل با موفقیت به پایان رسید!" if task.queue_type == "download" else f"عملیات {section_label} تکمیل شد!"
+        if task.queue_type == "download":
+            header = "📥 <b>دانلود فایل با موفقیت به پایان رسید!</b>"
+        elif task.queue_type == "mkvtoolnix":
+            header = "🎬 <b>عملیات سافت‌ساب (SoftSub) تکمیل شد!</b>"
+        elif task.queue_type == "handbrake":
+            header = "🔥 <b>عملیات هاردساب / انکود (HandBrake) تکمیل شد!</b>"
+        else:
+            header = f"✅ <b>عملیات {section_label} تکمیل شد!</b>"
 
-        await self._notify_admins_html(
-            f"{icon} <b>{header_txt}</b>\n"
+        msg = (
+            f"{header}\n"
             f"🆔 کد تسک: <code>{safe_id}</code>\n"
             f"📌 عنوان: <code>{safe_title}</code>"
             f"{details}"
         )
+        logging.info(f"🔔 Sending completion notification for task #{task.task_id} ({task.queue_type})")
+        await self._notify_admins(msg)
 
     async def _worker_loop(self, queue_type: str, worker_idx: int):
         while True:
@@ -305,8 +307,7 @@ class QueueManager:
                 task.progress = "100%"
                 task.is_finished = True
 
-                # فراخوانی از روی کلاس تا حتی در صورت Hot-Reload با کلید R نیز نسخه جدید متد اجرا شود!
-                await self.__class__._send_completion_notification(self, task, res)
+                await self._send_completion_notification(task, res)
 
             except asyncio.CancelledError:
                 task.status = "🛑 لغو شد"
@@ -318,8 +319,7 @@ class QueueManager:
                 task.status = "❌ خطا"
                 task.progress = "متوقف شده به دلیل خطا"
                 task.is_finished = True
-                await self.__class__._notify_admins_html(
-                    self,
+                await self._notify_admins(
                     f"❌ <b>خطا در پردازش!</b>\n"
                     f"🆔 کد: <code>{html.escape(str(task.task_id))}</code>\n"
                     f"⚙️ بخش: <code>{html.escape(task.queue_type.upper())}</code>\n"
@@ -343,6 +343,23 @@ class QueueManager:
             for idx in range(1, max(1, num) + 1):
                 w = asyncio.create_task(self._worker_loop(q_type, idx))
                 self._workers.append(w)
+
+    def restart_workers_for_hot_reload(self):
+        """
+        جایگزینی تسک‌های _worker_loop قدیمی با کد جدید هنگام زدن کلید R:
+        اگر تسکی در این لحظه در حال اجرا نباشد، ورکرهای قدیمی را بسته و ورکرهای جدید را با کد آپدیت‌شده استارت می‌زند.
+        """
+        any_running = any(
+            t.running_asyncio_task is not None and not t.running_asyncio_task.done()
+            for t in self.tasks.values()
+        )
+        if not any_running:
+            for w in self._workers:
+                if not w.done():
+                    w.cancel()
+            self._workers.clear()
+            self.start_workers()
+            logging.info("🔄 Queue workers restarted with updated notification logic.")
 
     def get_queue_summary(self) -> list[QueueTask]:
         return list(self.tasks.values())
@@ -379,13 +396,4 @@ class QueueManager:
         return len(to_del)
 
 
-# اگر از قبل نمونه queue_engine در حافظه وجود دارد (هنگام Hot-Reload با کلید R)،
-# متدهای کلاس آن را به کلاس جدید ارتقا بده بدون اینکه صف و پراسس‌های فعال پاک شوند!
-if "queue_engine" in globals() and globals()["queue_engine"] is not None:
-    _existing_engine = globals()["queue_engine"]
-    _existing_engine.__class__ = QueueManager
-    if not hasattr(_existing_engine, "_known_chats"):
-        _existing_engine._known_chats = set()
-    queue_engine = _existing_engine
-else:
-    queue_engine = QueueManager()
+queue_engine = QueueManager()

@@ -1,86 +1,87 @@
 import asyncio
-import json
 from pathlib import Path
 from typing import Callable
+
 from core.config_loader import cfg
-from services.cuteftp_worker import sync_upload_cuteftp, get_current_cuteftp_remote_dir
+from services.cuteftp_worker import (
+    sync_upload_cuteftp,
+    get_current_cuteftp_remote_dir,
+)
 
 
 class CuteFTPService:
     DEFAULT_DESTINATIONS = [
-        {"label": "🎬 فیلم‌ها (/English/Movies)", "path": "/English/Movies"},
-        {"label": "📺 سریال‌ها (/English/Series)", "path": "/English/Series"},
-        {"label": "📂 پوشه English (/English)", "path": "/English"},
-        {"label": "🏠 پوشه اصلی هاست (/)", "path": "/"},
+        {"label": "🎬 فیلم‌های خارجی (/English/Movies)", "path": "/English/Movies"},
+        {"label": "📺 سریال‌های خارجی (/English/Series)", "path": "/English/Series"},
+        {"label": "🎌 انیمه‌ها (/English/Anime)", "path": "/English/Anime"},
     ]
 
     @classmethod
     def get_saved_destinations(cls) -> list[dict[str, str]]:
-        ws = Path(cfg.get("paths", "workspace_dir", "./workspace"))
-        dest_file = ws / "cuteftp_destinations.json"
-        if dest_file.exists():
-            try:
-                data = json.loads(dest_file.read_text(encoding="utf-8"))
-                if isinstance(data, list) and data:
-                    return data
-            except Exception:
-                pass
-        return cls.DEFAULT_DESTINATIONS
+        saved = cfg.get("cuteftp", "saved_destinations", None)
+        if isinstance(saved, list) and saved:
+            return saved
+        return list(cls.DEFAULT_DESTINATIONS)
 
     @classmethod
     def add_saved_destination(cls, label: str, remote_path: str):
-        ws = Path(cfg.get("paths", "workspace_dir", "./workspace"))
-        ws.mkdir(parents=True, exist_ok=True)
-        dest_file = ws / "cuteftp_destinations.json"
-        norm_path = "/" + remote_path.replace("\\", "/").strip().lstrip("/")
+        clean_path = "/" + remote_path.replace("\\", "/").strip().lstrip("/")
+        if len(clean_path) > 1:
+            clean_path = clean_path.rstrip("/")
         current = cls.get_saved_destinations()
-        if not any(d["path"] == norm_path for d in current):
-            current.append({"label": f"📂 {label} ({norm_path})", "path": norm_path})
-            dest_file.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        if not any(d.get("path") == clean_path for d in current):
+            current.append({"label": f"📂 {label} ({clean_path})", "path": clean_path})
+            cfg.set_value("cuteftp", "saved_destinations", current)
 
     @staticmethod
     async def get_active_gui_remote_path() -> str:
+        """برگرداندن مسیر پیش‌فرض ثبت‌شده در config.yaml"""
         return await asyncio.to_thread(get_current_cuteftp_remote_dir)
 
-    @classmethod
+    @staticmethod
     async def upload_path(
-        cls,
         local_target: Path,
         remote_subpath: str = "__CURRENT__",
-        progress_callback: Callable[[str], None] = None
+        progress_callback: Callable[[str], None] | None = None
     ) -> list[str]:
-        dest_label = "مسیر فعلی CuteFTP" if remote_subpath == "__CURRENT__" else remote_subpath
-        if progress_callback:
-            progress_callback(f"شروع آپلود {local_target.name} به مسیر [{dest_label}]...")
-
-        urls = await asyncio.to_thread(
+        """آپلود غیرهمگام یک فایل یا یک پوشه کامل به سرور مقصد"""
+        return await asyncio.to_thread(
             sync_upload_cuteftp,
-            local_target.resolve(),
+            Path(local_target),
             remote_subpath,
             progress_callback
         )
-        if progress_callback:
-            progress_callback("آپلود با موفقیت تکمیل شد ✅")
-        return urls
 
     @classmethod
     async def upload_multiple_or_single(
         cls,
-        local_targets: list[Path] | Path,
+        targets: list[Path] | Path,
         remote_subpath: str = "__CURRENT__",
-        progress_callback: Callable[[str], None] = None
+        progress_callback: Callable[[str], None] | None = None
     ) -> list[str]:
-        """آپلود یک یا چند فایل/پوشه انتخاب شده به مسیر مقصد و تجمیع لینک‌های دانلود"""
-        if isinstance(local_targets, Path):
-            local_targets = [local_targets]
+        """
+        آپلود ترتیبی و کامل لیستی از فایل‌ها یا پوشه‌ها:
+        هر فایل صبر می‌کند تا فایل قبلی ۱۰۰٪ آپلود شود و سپس فایل بعدی ارسال می‌گردد.
+        """
+        if isinstance(targets, (str, Path)):
+            targets_list = [Path(targets)]
+        else:
+            targets_list = [Path(t) for t in targets]
 
-        all_urls: list[str] = []
-        total = len(local_targets)
-        for idx, target in enumerate(local_targets, start=1):
-            def _sub_cb(msg: str, i=idx):
+        all_links: list[str] = []
+        total = len(targets_list)
+
+        for idx, item in enumerate(targets_list, start=1):
+            def _sub_prog(msg: str, i=idx):
                 if progress_callback:
-                    progress_callback(f"[{i}/{total}] {msg}")
+                    prefix = f"آیتم {i}/{total} - " if total > 1 else ""
+                    progress_callback(f"{prefix}{msg}")
 
-            urls = await cls.upload_path(target, remote_subpath, progress_callback=_sub_cb)
-            all_urls.extend(urls)
-        return all_urls
+            links = await cls.upload_path(
+                local_target=item,
+                remote_subpath=remote_subpath,
+                progress_callback=_sub_prog
+            )
+            all_links.extend(links)
+
+        return all_links

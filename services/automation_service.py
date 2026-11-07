@@ -34,7 +34,7 @@ class HardSubTarget:
 class AutomationPlan:
     is_series: bool
     category: str             # 'Series' | 'Anime' | 'Movies'
-    base_dir: Path            # پوشه فیلم (Movies/Movie.2026) یا پوشه فصل سریال/انیمه (Series/VisionQuest/S02)
+    base_dir: Path
     series_title: str = ""
     season_ep_tag: str = ""   # مثلا S02E01
     source_type: str = "WEB-DL"  # 'WEB-DL' | 'BluRay'
@@ -56,7 +56,6 @@ class AutomationService:
 
     @classmethod
     def ensure_workspace_root_categories(cls) -> dict[str, Path]:
-        """ایجاد ۳ پوشه اصلی Movies, Series, Anime در Workspace منطبق با ساختار سرور"""
         ws = Path(cfg.get("paths", "workspace_dir", "./workspace")).resolve()
         ws.mkdir(parents=True, exist_ok=True)
         cats = {}
@@ -68,10 +67,6 @@ class AutomationService:
 
     @classmethod
     def get_movie_ass_logo_path(cls) -> Path:
-        """
-        مسیر فایل movie.ass که در دایرکتوری کنار دایرکتوری presets قرار دارد:
-        مثلاً C:\\MediaBot\\movie.ass
-        """
         presets_dir = Path(cfg.get("paths", "presets_dir", "C:\\MediaBot\\presets")).resolve()
         candidates = [
             presets_dir.parent / "movie.ass",
@@ -85,12 +80,6 @@ class AutomationService:
 
     @classmethod
     def compute_server_remote_dir_for_local_path(cls, local_path: Path) -> str:
-        """
-        محاسبه خودکار آدرس پوشه مقصد در هاست دانلود از روی مسیر فایل در Workspace:
-        مثال:
-        C:\\MediaBot\\workspace\\Series\\The.Greatest\\S01\\720p-HardSub\\the.greatest...mp4
-        ---> /English/Series/The.Greatest/S01/720p-HardSub
-        """
         ws = Path(cfg.get("paths", "workspace_dir", "./workspace")).resolve()
         target_dir = local_path.resolve().parent if local_path.is_file() else local_path.resolve()
 
@@ -141,9 +130,17 @@ class AutomationService:
 
     @classmethod
     def format_clean_title(cls, raw_title: str) -> str:
+        """استخراج نام تمیز سریال یا فیلم و حذف تگ‌های اضافی"""
         cleaned = re.sub(r'[<>:"/\\|?*]', "", raw_title).strip()
-        cleaned = re.sub(r"[\s_]+", ".", cleaned)
-        return cleaned
+        # اگر نام فایل کامل پاس داده شده بود، از SxxEyy یا سال یا کیفیت به بعد را ببر تا فقط نام خالص بماند
+        cleaned = re.split(
+            r"[\s._\-]+(?:[Ss]\d{1,2}[Ee]\d{1,3}|2160p|1080p|720p|480p|FullHD|WEB-DL|WEBRip|BluRay)\b",
+            cleaned,
+            maxsplit=1,
+            flags=re.IGNORECASE
+        )[0]
+        cleaned = re.sub(r"[\s_]+", ".", cleaned).strip(".")
+        return cleaned or "Media"
 
     @classmethod
     def build_standard_subtitle_filename(
@@ -175,13 +172,13 @@ class AutomationService:
         source_type: str = "WEB-DL"
     ) -> str:
         """
-        فرمت نام‌گذاری هاردساب با زیرنویس فارسی SRT در پوشه 1080p-HardSub / 720p-HardSub / 480p-HardSub:
-        {name}.S{xx}E{yy}.1080p.WEB-DL.HardSub.EBTV.mp4
+        فرمت استاندارد هاردساب فارسی SRT:
+        {name}.SxxEyy.WEB-DL/BluRay.1080p/720p.HardSub.EBTV.mp4
         """
         clean_name = cls.format_clean_title(series_or_movie_title)
         if season_ep_tag:
-            return f"{clean_name}.{season_ep_tag}.{quality_tag}.{source_type}.HardSub.EBTV.mp4"
-        return f"{clean_name}.{quality_tag}.{source_type}.HardSub.EBTV.mp4"
+            return f"{clean_name}.{season_ep_tag}.{source_type}.{quality_tag}.HardSub.EBTV.mp4"
+        return f"{clean_name}.{source_type}.{quality_tag}.HardSub.EBTV.mp4"
 
     @classmethod
     def build_encode_ass_filename(
@@ -192,16 +189,16 @@ class AutomationService:
         source_type: str = "WEB-DL"
     ) -> str:
         """
-        فرمت نام‌گذاری انکود با movie.ass در پوشه‌های 1080p-EBTV، 720p-EBTV، 480p-EBTV:
-        {name}.S{xx}E{yy}.1080p.WEB-DL.6CH.EBTV.mp4
-        {name}.S{xx}E{yy}.720p.WEB-DL.EBTV.mp4
-        {name}.S{xx}E{yy}.480p.WEB-DL.EBTV.mp4
+        فرمت استاندارد انکود با movie.ass طبق الگوی دقیق درخواستی شما:
+        {name}.SxxEyy.WEB-DL/BluRay.1080p/720p.{if 1080p => 6CH}.EBTV.mp4
+        مثال 1080p: Stick.S02E01.WEB-DL.1080p.6CH.EBTV.mp4
+        مثال 720p:  Stick.S02E01.WEB-DL.720p.EBTV.mp4
         """
         clean_name = cls.format_clean_title(series_or_movie_title)
         ch_part = ".6CH" if quality_tag == "1080p" else ""
         if season_ep_tag:
-            return f"{clean_name}.{season_ep_tag}.{quality_tag}.{source_type}{ch_part}.EBTV.mp4"
-        return f"{clean_name}.{quality_tag}.{source_type}{ch_part}.EBTV.mp4"
+            return f"{clean_name}.{season_ep_tag}.{source_type}.{quality_tag}{ch_part}.EBTV.mp4"
+        return f"{clean_name}.{source_type}.{quality_tag}{ch_part}.EBTV.mp4"
 
     @staticmethod
     def clean_stem_for_ebtv(stem: str, target_res: str | None = None) -> str:
@@ -227,7 +224,6 @@ class AutomationService:
 
     @classmethod
     def build_softsub_filename(cls, raw_video: Path) -> str:
-        """حفظ فرمت .mp4 برای فایل‌های MP4 و .mkv برای سایر فایل‌ها در سافت‌ساب"""
         clean = cls.clean_stem_for_ebtv(raw_video.stem)
         out_ext = ".mp4" if raw_video.suffix.lower() == ".mp4" else ".mkv"
         return f"{clean}.SoftSub.EBTV{out_ext}"
@@ -663,7 +659,6 @@ class AutomationService:
         plan: AutomationPlan,
         hardsub_srt_qualities: list[str]
     ) -> list[HardSubTarget]:
-        """ساخت تسک‌های هاردساب فارسی SRT از روی فایل FullHD برای بخش اتوماسیون"""
         if not plan.fullhd_source_video or not hardsub_srt_qualities:
             return []
 
@@ -696,8 +691,11 @@ class AutomationService:
         selected_qualities: list[str]
     ) -> list[HardSubTarget]:
         """
-        ساخت تسک‌های انکود با movie.ass (خارج از اتوماسیون و بدون نیاز به آپلود زیرنویس):
-        ذخیره در پوشه‌های 1080p-EBTV, 720p-EBTV, 480p-EBTV با نام استاندارد و حفظ زیرنویس انگلیسی داخل فیلم.
+        ساخت تسک‌های انکود با movie.ass:
+        - movie.ass روی تصویر Burn-in (هاردساب) می‌شود.
+        - زیرنویس انگلیسی به صورت سافت‌ساب به خروجی اضافه می‌شود.
+        - نام فایل خروجی دقیقاً با فرمت:
+          {name}.SxxEyy.WEB-DL/BluRay.1080p/720p.{if 1080p => 6CH}.EBTV.mp4
         """
         order_map = {"1080p": 1, "720p": 2, "480p": 3}
         sorted_quals = sorted(set(selected_qualities), key=lambda q: order_map.get(q, 9))
@@ -709,8 +707,7 @@ class AutomationService:
             ep_tag = cls.extract_episode_tag(vid.name) or ""
             src_type = cls.detect_source_type(vid.name)
 
-            # پیدا کردن پوشه اصلی فصل سریال یا پوشه فیلم
-            if vid.parent.name.lower() in ("fullhd", "1080p", "720p") or cls.SEASON_DIR_REGEX.match(vid.parent.parent.name):
+            if vid.parent.name.lower() in ("fullhd", "1080p", "720p", "480p") or cls.SEASON_DIR_REGEX.match(vid.parent.parent.name):
                 season_or_movie_dir = vid.parent.parent
                 series_title = (
                     season_or_movie_dir.parent.name
