@@ -985,7 +985,7 @@ async def cb_dlnav_mkdir_here(call: CallbackQuery, state: FSMContext):
     kb.row(InlineKeyboardButton(text="🔙 بازگشت به مرورگر پوشه", callback_data="dlnav:resume"))
     await call.message.edit_text(
         f"➕ **ساخت پوشه جدید در مسیر:**\n`{curr_dir}`\n\n"
-        "✏️ لطفاً **نام پوشه جدید** را ارسال کنید (اگر نام فصل مثل `S01` یا `The.Greatest/S01` بفرستید، پوشه‌های پیش‌فرض `1080p-EBTV`, `720p-EBTV`, `1080p-x265-PSA`, `720p-x265-PSA`, `480p-RMTeam` و `srt/FA & EN` خودکار داخل آن ساخته می‌شوند):",
+        "✏️ نام پوشه را ارسال کنید. اگر نام فصل مثل `S01` باشد، برنامه پوشه‌های کیفیت را از مسیر متناظر سرور می‌خواند و همان ساختار را در Workspace می‌سازد:",
         reply_markup=kb.as_markup(),
         parse_mode="Markdown"
     )
@@ -1013,10 +1013,11 @@ async def handle_new_dl_subfolder_name(message: Message, state: FSMContext):
     if ("movies" in parts_low or "movie" in parts_low) and new_dir.parent.name.lower() in ("movies", "movie"):
         AutomationService.create_movie_structure(new_dir)
     elif AutomationService.SEASON_DIR_REGEX.match(new_dir.name):
-        if "anime" in parts_low:
-            AutomationService.create_anime_season_structure(new_dir)
-        else:
-            AutomationService.create_series_season_structure(new_dir)
+        category = "Anime" if "anime" in parts_low else "Series"
+        await AutomationService.create_season_structure_from_server(
+            new_dir,
+            category=category,
+        )
 
     await message.answer(f"✅ پوشه `{new_dir.name}` ساخته شد و وارد آن شدید!", parse_mode="Markdown")
     await _render_download_folder_browser(message, state, new_dir, page=0)
