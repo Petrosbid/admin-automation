@@ -1389,7 +1389,15 @@ async def cb_dlnav_open_subfolder(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     subfolders = data.get("dl_browser_subfolders", [])
     if idx < len(subfolders):
-        await _render_download_folder_browser(call, state, Path(subfolders[idx]), page=0)
+        target_dir = Path(subfolders[idx]).resolve()
+        if AutomationService.SEASON_DIR_REGEX.match(target_dir.name):
+            parts_low = [part.casefold() for part in target_dir.parts]
+            category = "Anime" if "anime" in parts_low else "Series"
+            await AutomationService.create_season_structure_from_server(
+                target_dir,
+                category=category,
+            )
+        await _render_download_folder_browser(call, state, target_dir, page=0)
 
 
 @router.callback_query(DownloadStates.browsing_download_folder, F.data == "dlnav:up")
