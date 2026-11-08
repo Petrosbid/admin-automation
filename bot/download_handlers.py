@@ -291,15 +291,16 @@ async def _smart_download_pipeline_job(
                 await _schedule_fullhd_destination_automation(
                     bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag
                 )
-                if auto_upload_cfg and remote_folder_exists:
-                    await queue_engine.add_task(
-                        "upload",
-                        f"AutoUpload [{remote_folder_path}]: {vid.name}",
-                        CuteFTPService.upload_path,
-                        vid,
-                        remote_folder_path,
-                    )
-                elif auto_upload_cfg and not remote_folder_exists:
+                if remote_folder_exists:
+                    if auto_upload_cfg:
+                        await queue_engine.add_task(
+                            "upload",
+                            f"AutoUpload [{remote_folder_path}]: {vid.name}",
+                            CuteFTPService.upload_path,
+                            vid,
+                            remote_folder_path,
+                        )
+                else:
                     await _send_missing_remote_folder_upload_prompt(
                         bot, chat_id, vid, remote_folder_path
                     )
@@ -318,13 +319,13 @@ async def _smart_download_pipeline_job(
                     suggested_name=suggested_std_name,
                     remote_folder_path=remote_folder_path,
                     should_auto_upload=(auto_upload_cfg and remote_folder_exists),
-                    ask_fullhd_e01_question=(auto_upload_cfg and not remote_folder_exists),
+                    ask_fullhd_e01_question=(not remote_folder_exists),
                     fullhd_auto_encode=True,
                 )
             continue
 
         # اگر تنظیمات آپلود خودکار بعد از دانلود روشن است ولی پوشه روی سرور وجود ندارد -> از کاربر بپرس!
-        ask_missing_folder_question = (auto_upload_cfg and not remote_folder_exists)
+        ask_missing_folder_question = not remote_folder_exists
         should_auto_upload = (auto_upload_cfg and remote_folder_exists)
 
         copied_server_name = None
@@ -1027,7 +1028,7 @@ async def cb_pdl_fullhd_upload_no(call: CallbackQuery):
     info = PENDING_POST_DL_ITEMS.pop(token, None)
     vid_name = Path(info["vid_path"]).name if info else "FullHD"
     await call.message.edit_text(
-        f"✅ فایل `{vid_name}` بدون آپلود به سرور، در پوشه `FullHD` لوکال(مبدا) برای هاردساب/انکود نگه داشته شد.",
+        f"✅ فایل `{vid_name}` در Workspace باقی ماند و به سرور آپلود نشد.",
         parse_mode="Markdown"
     )
 
