@@ -1017,7 +1017,7 @@ async def cb_pdl_fullhd_upload_yes(call: CallbackQuery):
         remote_dir
     )
     await call.message.edit_text(
-        f"☁️ آپلود فایل `FullHD` (`{vid_path.name}`) به مسیر `{remote_dir}` در صف قرار گرفت! (کد: `{task.task_id}`)",
+        f"☁️ پوشه مقصد ساخته و آپلود فایل `{vid_path.name}` به مسیر `{remote_dir}` در صف قرار گرفت! (کد: `{task.task_id}`)",
         parse_mode="Markdown"
     )
 
