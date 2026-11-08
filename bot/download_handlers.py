@@ -622,13 +622,13 @@ async def _schedule_fullhd_destination_automation(
             continue
         q_tag = match.group(1).lower()
         if not (
-            re.search(r"(?i)(?:^|[-._\\s])EBTV$", name)
-            or re.search(r"(?i)(?:^|[-._\\s])EBTV-SoftSub$", name)
+            re.search(r"(?i)(?:^|[-._\s])EBTV$", name)
+            or re.search(r"(?i)(?:^|[-._\s])EBTV-SoftSub$", name)
         ):
             continue
 
         bucket = quality_map.setdefault(q_tag, {})
-        if re.search(r"(?i)(?:^|[-._\\s])EBTV-SoftSub$", name):
+        if re.search(r"(?i)(?:^|[-._\s])EBTV-SoftSub$", name):
             bucket["soft"] = name
         else:
             bucket["base"] = name
