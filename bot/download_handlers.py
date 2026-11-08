@@ -562,16 +562,21 @@ async def _run_fullhd_encode_with_destination_routing(
             True,
             progress_callback,
         )
-    else:
-        upload_dir = remote_ebtv_dir or remote_softsub_dir
-        if upload_dir:
-            await queue_engine.add_task(
-                "upload",
-                f"AutoUpload FullHD Encode [{upload_dir}]: {encoded.name}",
-                CuteFTPService.upload_path,
-                encoded,
-                upload_dir,
-            )
+    elif remote_ebtv_dir:
+        await queue_engine.add_task(
+            "upload",
+            f"AutoUpload FullHD Encode [{remote_ebtv_dir}]: {encoded.name}",
+            CuteFTPService.upload_path,
+            encoded,
+            remote_ebtv_dir,
+        )
+    elif remote_softsub_dir:
+        # فایل خام encode شده نباید در پوشه‌ای بارگذاری شود که مخصوص خروجی SoftSub است.
+        logging.warning(
+            "SoftSub destination %s exists but no matching Persian subtitle was found; "
+            "keeping encoded file locally instead of uploading a non-SoftSub file there.",
+            remote_softsub_dir,
+        )
     return encoded
 
 
