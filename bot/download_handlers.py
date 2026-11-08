@@ -1765,6 +1765,228 @@ async def handle_link_for_sub_extract(message: Message, state: FSMContext):
     )
 
 
+async def _show_link_purpose_prompt(
+    message: Message,
+    targets: list[str],
+):
+    token = uuid.uuid4().hex[:8]
+    PENDING_LINK_ACTIONS[token] = {
+        "targets": list(targets),
+        "reference": targets[0] if targets else "",
+    }
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text="⬇️ دانلود فیلم / سریال",
+            callback_data=f"lnk:purpose:{token}:download",
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="📤 استخراج زیرنویس از فایل ویدئویی",
+            callback_data=f"lnk:purpose:{token}:extract",
+        )
+    )
+    await message.answer(
+        "🔗 لینک دریافت شد. می‌خواهید با آن چه کاری انجام شود؟\n\n"
+        "• برای دانلود، نام فیلم/سریال از روی نام فایل یا متن لینک استخراج می‌شود و "
+        "پوشه‌های محتمل Workspace و سرور مقصد پیشنهاد داده می‌شوند.\n"
+        "• برای استخراج، ویدئو دانلود و ترک‌های زیرنویس آن استخراج و در همین چت ارسال می‌شوند.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("lnk:purpose:"))
+async def cb_link_purpose(call: CallbackQuery, state: FSMContext):
+    parts = call.data.split(":")
+    if len(parts) != 4:
+        return await call.answer("درخواست نامعتبر است.", show_alert=True)
+
+    token, purpose = parts[2], parts[3]
+    info = PENDING_LINK_ACTIONS.get(token)
+    if not info:
+        return await call.answer("این درخواست منقضی شده است؛ لینک را دوباره ارسال کنید.", show_alert=True)
+
+    targets = list(info.get("targets", []))
+    if not targets:
+        PENDING_LINK_ACTIONS.pop(token, None)
+        return await call.answer("لینکی برای پردازش ثبت نشده است.", show_alert=True)
+
+    if purpose == "extract":
+        PENDING_LINK_ACTIONS.pop(token, None)
+        task_ids = []
+        for target in targets:
+            job_uid = uuid.uuid4().hex[:6]
+            temp_dir = Path(cfg.get("paths", "workspace_dir")) / f"SubExtract_{job_uid}"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            task = await queue_engine.add_task(
+                "download",
+                f"دانلود + استخراج زیرنویس ({job_uid})",
+                _download_and_extract_subs_job,
+                call.bot,
+                call.message.chat.id,
+                target,
+                temp_dir,
+            )
+            task_ids.append(task.task_id)
+
+        ids = ", ".join(f"<code>{html.escape(str(tid))}</code>" for tid in task_ids)
+        await call.message.edit_text(
+            f"📤 تعداد <b>{len(task_ids)}</b> عملیات دانلود و استخراج زیرنویس در صف قرار گرفت.\n"
+            f"شناسه‌ها: {ids}",
+            parse_mode="HTML",
+        )
+        return await call.answer("در صف قرار گرفت.")
+
+    if purpose != "download":
+        return await call.answer("نوع عملیات نامعتبر است.", show_alert=True)
+
+    wait_msg = await call.message.edit_text(
+        "🔎 در حال جستجوی عنوان لینک در پوشه‌های Workspace و سرور مقصد..."
+    )
+    candidates = []
+    query = ""
+    try:
+        query = AutomationService.extract_media_title_query(info.get("reference", ""))
+        candidates = await AutomationService.search_media_destination_candidates(
+            info.get("reference", ""),
+            limit=7,
+        )
+    except Exception as exc:
+        logging.exception("Destination suggestion search failed")
+        await wait_msg.edit_text(
+            f"⚠️ جستجوی پیشنهادها انجام نشد: <code>{html.escape(str(exc)[:250])}</code>\n"
+            "می‌توانید مقصد را دستی انتخاب کنید.",
+            parse_mode="HTML",
+        )
+
+    PENDING_LINK_ACTIONS[token]["candidates"] = candidates
+    kb = InlineKeyboardBuilder()
+
+    if candidates:
+        lines = [
+            f"<b>{idx + 1}.</b> {html.escape(item['label'])} "
+            f"— <code>{html.escape(item['category'])}</code> "
+            f"({'محلی' if item.get('exists_local') else 'فقط در سرور'})"
+            for idx, item in enumerate(candidates)
+        ]
+        for idx, item in enumerate(candidates):
+            kb.row(
+                InlineKeyboardButton(
+                    text=f"📁 {item['label'][:42]}",
+                    callback_data=f"lnk:candidate:{token}:{idx}",
+                )
+            )
+        body = (
+            f"🔎 عنوان استخراج‌شده: <b>{html.escape(query or 'قابل تشخیص نبود')}</b>\n\n"
+            "پوشه‌های پیشنهادی؛ مقصد مناسب را انتخاب کنید:\n"
+            + "\n".join(lines)
+        )
+    else:
+        body = (
+            f"🔎 عنوان استخراج‌شده: <b>{html.escape(query or 'قابل تشخیص نبود')}</b>\n\n"
+            "پوشهٔ مطمئنی در Workspace یا فهرست پوشه‌های سرور پیدا نشد. "
+            "می‌توانید مقصد را به‌صورت دستی از Workspace انتخاب کنید."
+        )
+
+    kb.row(
+        InlineKeyboardButton(
+            text="📂 انتخاب دستی مقصد",
+            callback_data=f"lnk:manual:{token}",
+        )
+    )
+    kb.row(InlineKeyboardButton(text="❌ لغو", callback_data=f"lnk:cancel:{token}"))
+    await wait_msg.edit_text(
+        body[:3900],
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data.startswith("lnk:candidate:"))
+async def cb_link_candidate_selected(call: CallbackQuery):
+    parts = call.data.split(":")
+    if len(parts) != 4:
+        return await call.answer("درخواست نامعتبر است.", show_alert=True)
+    token, idx_text = parts[2], parts[3]
+    info = PENDING_LINK_ACTIONS.get(token)
+    if not info:
+        return await call.answer("این پیشنهاد منقضی شده است.", show_alert=True)
+
+    try:
+        candidate = info.get("candidates", [])[int(idx_text)]
+    except (IndexError, ValueError, TypeError):
+        return await call.answer("پوشهٔ انتخاب‌شده معتبر نیست.", show_alert=True)
+
+    info["selected_dir"] = candidate["path"]
+    info["selected_label"] = candidate["label"]
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text="⬇️ شروع دانلود در این پوشه",
+            callback_data=f"lnk:start:{token}",
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="📂 انتخاب دستی پوشه دیگر",
+            callback_data=f"lnk:manual:{token}",
+        )
+    )
+    kb.row(InlineKeyboardButton(text="🔙 بازگشت به پیشنهادها", callback_data=f"lnk:purpose:{token}:download"))
+    await call.message.edit_text(
+        f"✅ مقصد انتخاب‌شده: <b>{html.escape(candidate['label'])}</b>\n"
+        f"📂 مسیر محلی: <code>{html.escape(candidate['path'])}</code>\n"
+        f"☁️ مسیر متناظر سرور: <code>{html.escape(candidate['remote_path'])}</code>\n\n"
+        "با تأیید زیر دانلود شروع می‌شود.",
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("lnk:start:"))
+async def cb_link_start_download(call: CallbackQuery, state: FSMContext):
+    token = call.data.split(":")[2]
+    info = PENDING_LINK_ACTIONS.pop(token, None)
+    if not info or not info.get("selected_dir"):
+        return await call.answer("اطلاعات مقصد منقضی شده است.", show_alert=True)
+
+    targets = list(info.get("targets", []))
+    chosen_dir = Path(info["selected_dir"]).resolve()
+    chosen_dir.mkdir(parents=True, exist_ok=True)
+    task_ids = await _enqueue_batch_downloads(call.bot, call.message.chat.id, targets, chosen_dir)
+    await state.clear()
+    remote_eq = AutomationService.compute_server_remote_dir_for_local_path(chosen_dir)
+    await call.message.edit_text(
+        f"✅ تعداد <b>{len(task_ids)}</b> دانلود در صف قرار گرفت.\n"
+        f"📂 مقصد: <code>{html.escape(str(chosen_dir))}</code>\n"
+        f"☁️ مسیر سرور: <code>{html.escape(remote_eq)}</code>\n"
+        f"🆔 شناسه‌ها: {', '.join(html.escape(str(x)) for x in task_ids)}",
+        reply_markup=main_menu_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("lnk:manual:"))
+async def cb_link_manual_destination(call: CallbackQuery, state: FSMContext):
+    token = call.data.split(":")[2]
+    info = PENDING_LINK_ACTIONS.pop(token, None)
+    if not info:
+        return await call.answer("این درخواست منقضی شده است.", show_alert=True)
+
+    await state.update_data(pending_direct_targets=list(info.get("targets", [])))
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    await _render_download_folder_browser(call, state, workspace, page=0)
+
+
+@router.callback_query(F.data.startswith("lnk:cancel:"))
+async def cb_link_cancel(call: CallbackQuery):
+    token = call.data.split(":")[2]
+    PENDING_LINK_ACTIONS.pop(token, None)
+    await call.message.edit_text("⏭ عملیات لینک لغو شد.", reply_markup=main_menu_kb())
+
+
 @router.message(StateFilter(None), F.document)
 async def receive_download_torrent(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -1787,6 +2009,4 @@ async def catch_direct_links_in_chat(message: Message, state: FSMContext):
     targets = _extract_batch_links(message.text or "")
     if not targets:
         return
-    await state.update_data(pending_direct_targets=targets)
-    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-    await _render_download_folder_browser(message, state, workspace, page=0)
+    await _show_link_purpose_prompt(message, targets)
