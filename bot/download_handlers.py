@@ -1116,13 +1116,8 @@ async def _finalize_post_dl_rename_and_upload(
     else:
         done_txt = (
             f"✅ نام فایل به:\n`{vid_path.name}`\nتغییر یافت.\n"
-            f"ℹ️ *(چون پوشه `FullHD` در سرور اصلی نیست، فقط در لوکال ذخیره شد)*"
+            "ℹ️ آپلود خودکار غیرفعال است؛ فایل در Workspace باقی ماند."
         )
-
-    if isinstance(msg_or_call, CallbackQuery):
-        await msg_or_call.message.edit_text(done_txt, parse_mode="Markdown")
-    else:
-        await msg_or_call.answer(done_txt, parse_mode="Markdown")
 
     if isinstance(msg_or_call, CallbackQuery):
         await msg_or_call.message.edit_text(done_txt, parse_mode="Markdown")
@@ -2004,6 +1999,7 @@ async def cb_link_candidate_selected(call: CallbackQuery, state: FSMContext):
                 dl_smart_season=chosen_dir.name,
                 dl_smart_season_dir=str(chosen_dir),
             )
+            PENDING_LINK_ACTIONS.pop(token, None)
             await _render_download_folder_browser(
                 call,
                 state,
@@ -2018,6 +2014,7 @@ async def cb_link_candidate_selected(call: CallbackQuery, state: FSMContext):
             pending_direct_targets=list(info.get("targets", [])),
             dl_smart_series_title=candidate.get("name", chosen_dir.name),
         )
+        PENDING_LINK_ACTIONS.pop(token, None)
         await _render_download_folder_browser(call, state, chosen_dir, page=0)
         return
 
