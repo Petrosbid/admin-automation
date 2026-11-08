@@ -288,6 +288,47 @@ async def _init_smart_auto_batch(
     ep_tags = [p.season_ep_tag for p in plans if p.season_ep_tag]
     selected_ep_nums = {int(ep.split("E")[1]) for ep in ep_tags if "E" in ep}
 
+    # فایل‌های ارسالی کاربر را پیش از تحلیل/اتوماسیون در پوشه استاندارد FA یا EN قرار بده.
+    # در غیر این صورت Queue ممکن است فایل موقت _incoming_subs را به‌عنوان مسیر مقصد FTP تشخیص دهد.
+    placed_fa_subs: list[Path] = []
+    for source_sub in pre_uploaded_subs or []:
+        source_sub = Path(source_sub)
+        if not source_sub.exists() or source_sub.suffix.lower() not in SubtitleService.SUB_EXTENSIONS:
+            continue
+
+        low_sub_name = source_sub.name.casefold()
+        is_english_upload = (
+            low_sub_name.startswith("en_")
+            or ".en." in low_sub_name
+            or low_sub_name.endswith(("_en.srt", "_en.ass", "_en.ssa"))
+        )
+        if is_english_upload and first_plan.category != "Anime":
+            destination_dir = first_plan.en_sub_dest_dir
+        else:
+            destination_dir = first_plan.fa_sub_dest_dir
+
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination_sub = destination_dir / source_sub.name
+        if source_sub.resolve() != destination_sub.resolve():
+            shutil.copy2(source_sub, destination_sub)
+        if destination_sub.suffix.lower() == ".srt":
+            SubtitleService.normalize_srt_utf8(destination_sub)
+
+        if is_english_upload and first_plan.category != "Anime":
+            fallback_season = AutomationService.extract_season_num_from_dir(first_plan.base_dir)
+            sub_ep = AutomationService.extract_episode_tag(
+                destination_sub.name,
+                fallback_season=fallback_season,
+            )
+            for plan_item in plans:
+                if not sub_ep or not plan_item.season_ep_tag or plan_item.season_ep_tag == sub_ep:
+                    plan_item.existing_en_sub = destination_sub.resolve()
+        else:
+            placed_fa_subs.append(destination_sub.resolve())
+
+    if pre_uploaded_subs is not None:
+        pre_uploaded_subs = placed_fa_subs
+
     await state.update_data(
         sauto_target_dir=str(target_dir),
         sauto_ep_tags=ep_tags,
@@ -1551,6 +1592,7 @@ async def cb_incoming_subtitle_auto(call: CallbackQuery, state: FSMContext):
     info = PENDING_INCOMING_SUBTITLES.pop(token, None)
     if not info:
         return await call.answer("این انتخاب منقضی شده است.", show_alert=True)
+    await state.update_data(sauto_incoming_subs=[])
 
     target_dir = Path(info["target_dir"])
     subs = [Path(p) for p in info["sub_files"]]
@@ -1559,11 +1601,12 @@ async def cb_incoming_subtitle_auto(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("subfind:upload:"))
-async def cb_incoming_subtitle_upload(call: CallbackQuery):
+async def cb_incoming_subtitle_upload(call: CallbackQuery, state: FSMContext):
     token = call.data.split(":")[2]
     info = PENDING_INCOMING_SUBTITLES.pop(token, None)
     if not info:
         return await call.answer("این انتخاب منقضی شده است.", show_alert=True)
+    await state.update_data(sauto_incoming_subs=[])
     await _start_incoming_subtitle_upload_batch(
         call,
         Path(info["target_dir"]),
@@ -1584,9 +1627,10 @@ async def cb_incoming_subtitle_manual(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("subfind:cancel:"))
-async def cb_incoming_subtitle_cancel(call: CallbackQuery):
+async def cb_incoming_subtitle_cancel(call: CallbackQuery, state: FSMContext):
     token = call.data.split(":")[2]
     PENDING_INCOMING_SUBTITLES.pop(token, None)
+    await state.update_data(sauto_incoming_subs=[])
     await call.message.edit_text("⏭ عملیات زیرنویس لغو شد.", reply_markup=main_menu_kb())
 
 
