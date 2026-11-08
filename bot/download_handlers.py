@@ -81,6 +81,13 @@ def _resolve_series_or_movie_context(dest_dir: Path) -> tuple[bool, Path, str]:
     parts_low = [p.lower() for p in dest_dir.parts]
 
     if "movies" in parts_low or "movie" in parts_low:
+        media_quality_dir = (
+            dest_dir.name.casefold() in ("fullhd", "softsub", "hardsub", "srt", "sub")
+            or bool(re.search(r"(?i)(1080p|720p|480p).*EBTV", dest_dir.name))
+        )
+        if media_quality_dir and dest_dir.parent != dest_dir:
+            movie_root = dest_dir.parent
+            return False, movie_root, movie_root.name
         return False, dest_dir, dest_dir.name
 
     if AutomationService.SEASON_DIR_REGEX.match(dest_dir.parent.name):
@@ -555,14 +562,16 @@ async def _run_fullhd_encode_with_destination_routing(
             True,
             progress_callback,
         )
-    elif remote_ebtv_dir:
-        await queue_engine.add_task(
-            "upload",
-            f"AutoUpload FullHD Encode [{remote_ebtv_dir}]: {encoded.name}",
-            CuteFTPService.upload_path,
-            encoded,
-            remote_ebtv_dir,
-        )
+    else:
+        upload_dir = remote_ebtv_dir or remote_softsub_dir
+        if upload_dir:
+            await queue_engine.add_task(
+                "upload",
+                f"AutoUpload FullHD Encode [{upload_dir}]: {encoded.name}",
+                CuteFTPService.upload_path,
+                encoded,
+                upload_dir,
+            )
     return encoded
 
 
@@ -664,6 +673,16 @@ async def _schedule_fullhd_destination_automation(
         key=lambda q: {"1080p": 1, "720p": 2, "480p": 3}.get(q, 9),
     )
     targets = AutomationService.build_manual_encode_ass_targets([vid_path], qualities)
+    if not is_series:
+        source_type = AutomationService.detect_source_type(vid_path.name)
+        for target in targets:
+            movie_output_name = AutomationService.build_encode_ass_filename(
+                season_or_movie_dir.name,
+                "",
+                target.quality_tag,
+                source_type,
+            )
+            target.output_file = target.output_file.with_name(movie_output_name)
     targets_by_quality = {target.quality_tag: target for target in targets}
     batch_id = uuid.uuid4().hex[:10]
     tasks = []
@@ -720,15 +739,20 @@ async def _schedule_fullhd_destination_automation(
             parse_mode="HTML",
         )
 
+    status_title = (
+        season_or_movie_dir.parent.name
+        if is_series and AutomationService.SEASON_DIR_REGEX.match(season_or_movie_dir.name)
+        else season_or_movie_dir.name
+    )
     status_message = await bot.send_message(
         chat_id,
-        _build_fullhd_status_text(vid_path.parent.parent.name, tasks, notes),
+        _build_fullhd_status_text(status_title, tasks, notes),
         reply_markup=_fullhd_status_markup(),
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
     monitor = asyncio.create_task(
-        _watch_fullhd_batch(status_message, batch_id, vid_path.parent.parent.name, tasks, notes),
+        _watch_fullhd_batch(status_message, batch_id, status_title, tasks, notes),
         name=f"fullhd-status-{batch_id}",
     )
     _ACTIVE_FULLHD_BATCH_MONITORS.add(monitor)
