@@ -38,6 +38,22 @@ router = Router()
 _ACTIVE_AUTOMATION_MONITORS: set[asyncio.Task] = set()
 
 
+def _release_automation_monitor(task: asyncio.Task):
+    _ACTIVE_AUTOMATION_MONITORS.discard(task)
+    if task.cancelled():
+        return
+    try:
+        error = task.exception()
+    except asyncio.CancelledError:
+        return
+    if error:
+        logging.error(
+            "Automation status monitor failed: %s",
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
 class SubtitleStates(StatesGroup):
     sauto_browsing_dir = State()
     sauto_waiting_fa_sub = State()
@@ -1304,7 +1320,7 @@ async def _execute_smart_automation_batch(
 
         if (
             not any(st.quality_folder_name in selected_soft_set for st in plan.softsub_targets)
-            and not hardsub_targets
+            and not selected_hb_srt
         ):
             skipped_items.append(
                 f"{key}: هیچ کیفیت SoftSub یا HardSub برای اجرا انتخاب/موجود نبود."
@@ -1342,7 +1358,9 @@ async def _execute_smart_automation_batch(
             name=f"automation-status-{batch_id}",
         )
         _ACTIVE_AUTOMATION_MONITORS.add(monitor_task)
-        monitor_task.add_done_callback(_ACTIVE_AUTOMATION_MONITORS.discard)
+        monitor_task.add_done_callback(_release_automation_monitor)
+
+    await call.answer("اتوماسیون در صف قرار گرفت و گزارش آن به‌روزرسانی می‌شود.")
 
 
 @router.message(StateFilter(None), F.document)
