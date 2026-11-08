@@ -160,7 +160,7 @@ async def _send_missing_remote_folder_upload_prompt(
     """وقتی بعد از دانلود می‌خواهد فایلی را آپلود کند اما پوشه‌اش روی سرور نیست، از کاربر سوال می‌پرسد"""
     token = uuid.uuid4().hex[:6]
     PENDING_POST_DL_ITEMS[token] = {
-        "type": "fullhd_e01",
+        "type": "missing_remote_folder",
         "vid_path": str(vid_path.resolve()),
         "remote_dir": remote_folder_path,
     }
@@ -291,6 +291,18 @@ async def _smart_download_pipeline_job(
                 await _schedule_fullhd_destination_automation(
                     bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag
                 )
+                if auto_upload_cfg and remote_folder_exists:
+                    await queue_engine.add_task(
+                        "upload",
+                        f"AutoUpload [{remote_folder_path}]: {vid.name}",
+                        CuteFTPService.upload_path,
+                        vid,
+                        remote_folder_path,
+                    )
+                elif auto_upload_cfg and not remote_folder_exists:
+                    await _send_missing_remote_folder_upload_prompt(
+                        bot, chat_id, vid, remote_folder_path
+                    )
             else:
                 suggested_std_name = await AutomationService.build_standard_raw_filename_for_folder(
                     video_path=vid,
@@ -305,8 +317,8 @@ async def _smart_download_pipeline_job(
                     vid_path=vid,
                     suggested_name=suggested_std_name,
                     remote_folder_path=remote_folder_path,
-                    should_auto_upload=False,
-                    ask_fullhd_e01_question=False,
+                    should_auto_upload=(auto_upload_cfg and remote_folder_exists),
+                    ask_fullhd_e01_question=(auto_upload_cfg and not remote_folder_exists),
                     fullhd_auto_encode=True,
                 )
             continue
@@ -370,27 +382,9 @@ async def _smart_download_pipeline_job(
 
 
 async def _send_fullhd_e01_prompt(bot: Bot, chat_id: int, vid_path: Path, remote_folder_path: str):
-    token = uuid.uuid4().hex[:6]
-    PENDING_POST_DL_ITEMS[token] = {
-        "type": "fullhd_e01",
-        "vid_path": str(vid_path.resolve()),
-        "remote_dir": remote_folder_path,
-    }
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="✅ بله، پوشه FullHD در سرور ساخته و آپلود شود", callback_data=f"pdl:fhdyes:{token}"),
-        InlineKeyboardButton(text="❌ خیر، فقط در لوکال بماند", callback_data=f"pdl:fhdno:{token}"),
-    )
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"❓ **سوال درباره آپلود پوشه `FullHD` (قسمت اول فصل):**\n\n"
-            f"📄 فایل: `{vid_path.name}`\n"
-            f"پوشه `FullHD` در حال حاضر روی سرور اصلی (`{remote_folder_path}`) وجود ندارد، اما این فایل **قسمت اول فصل (`E01`)** است.\n\n"
-            "آیا می‌خواهید پوشه `FullHD` روی سرور اصلی هم ساخته و آپلود شود؟"
-        ),
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown"
+    # سازگاری با callbackهای قدیمی؛ سوال اکنون برای هر پوشه مقصدی استفاده می‌شود.
+    return await _send_missing_remote_folder_upload_prompt(
+        bot, chat_id, vid_path, remote_folder_path
     )
 
 def _release_fullhd_monitor(task: asyncio.Task):
@@ -1075,16 +1069,37 @@ async def _finalize_post_dl_rename_and_upload(
             vid_path.name,
             fallback_season=AutomationService.extract_season_num_from_dir(season_or_movie_dir),
         ) or ""
-        return await _schedule_fullhd_destination_automation(
+        await _schedule_fullhd_destination_automation(
             bot, chat_id, vid_path, season_or_movie_dir, is_ser, ep_tag
         )
+        if info.get("ask_fullhd_e01"):
+            return await _send_missing_remote_folder_upload_prompt(
+                bot, chat_id, vid_path, remote_dir
+            )
+        if info.get("should_auto_upload"):
+            task = await queue_engine.add_task(
+                "upload",
+                f"AutoUpload [{remote_dir}]: {vid_path.name}",
+                CuteFTPService.upload_path,
+                vid_path,
+                remote_dir,
+            )
+            return await bot.send_message(
+                chat_id,
+                f"☁️ فایل FullHD نیز به دلیل موجود بودن پوشه مقصد، بدون نیاز به تأیید در صف آپلود قرار گرفت. کد: <code>{task.task_id}</code>",
+                parse_mode="HTML",
+            )
+        return
 
     if info.get("ask_fullhd_e01"):
+        confirmation = f"✅ نام فایل نهایی شد: <code>{html.escape(vid_path.name)}</code>"
         if isinstance(msg_or_call, CallbackQuery):
-            await msg_or_call.message.edit_text(f"✅ نام فایل به `{vid_path.name}` تغییر یافت.", parse_mode="Markdown")
+            await msg_or_call.message.edit_text(confirmation, parse_mode="HTML")
         else:
-            await msg_or_call.answer(f"✅ نام فایل به `{vid_path.name}` تغییر یافت.", parse_mode="Markdown")
-        return await _send_fullhd_e01_prompt(bot, chat_id, vid_path, remote_dir)
+            await msg_or_call.answer(confirmation, parse_mode="HTML")
+        return await _send_missing_remote_folder_upload_prompt(
+            bot, chat_id, vid_path, remote_dir
+        )
 
     if info.get("should_auto_upload", True):
         task = await queue_engine.add_task(
