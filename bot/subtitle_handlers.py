@@ -6,6 +6,7 @@ import re
 import shutil
 import uuid
 from pathlib import Path
+from typing import Any
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardButton
 from aiogram.filters import StateFilter
@@ -32,6 +33,9 @@ from bot.keyboards import (
 )
 
 router = Router()
+
+# نگه‌داشتن reference تسک‌های مانیتور تا زمان پایان آن‌ها.
+_ACTIVE_AUTOMATION_MONITORS: set[asyncio.Task] = set()
 
 
 class SubtitleStates(StatesGroup):
@@ -796,7 +800,7 @@ async def cb_sauto_skip_en(call: CallbackQuery, state: FSMContext):
 
 async def _detect_existing_automation_quality_defaults(
     plans: list[AutomationPlan],
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """
     کیفیت‌هایی را پیش‌فرض انتخاب می‌کند که خروجی متناظرشان در مقصد FTP وجود دارد.
 
@@ -1108,7 +1112,8 @@ def _build_automation_batch_status_text(
             else:
                 icon, detail = "⏳", "در انتظار"
             lines.append(
-                f"{icon} <code>{html.escape(str(task.title)[:100])}</code> — "
+                f"{icon} <code>#{html.escape(str(task.task_id))} "
+                f"{html.escape(str(task.title)[:90])}</code> — "
                 f"<i>{html.escape(detail)}</i>"
             )
         if len(tasks) > 14:
@@ -1122,7 +1127,9 @@ def _build_automation_batch_status_text(
             lines.append(f"<i>... و {len(skipped_items) - 6} مورد دیگر</i>")
 
     if final:
-        if failed or cancelled:
+        if not tasks:
+            lines.extend(["", "ℹ️ <b>هیچ عملیات اجرایی در صف ثبت نشد.</b>"])
+        elif failed or cancelled:
             lines.extend(["", "⚠️ <b>اتوماسیون با موارد ناموفق/لغوشده پایان یافت.</b>"])
         else:
             lines.extend(["", "🎉 <b>تمام عملیات ثبت‌شده با موفقیت تکمیل شدند.</b>"])
@@ -1323,7 +1330,7 @@ async def _execute_smart_automation_batch(
     )
 
     if batch_tasks:
-        asyncio.create_task(
+        monitor_task = asyncio.create_task(
             _watch_smart_automation_batch(
                 status_message=status_message,
                 batch_id=batch_id,
@@ -1334,6 +1341,8 @@ async def _execute_smart_automation_batch(
             ),
             name=f"automation-status-{batch_id}",
         )
+        _ACTIVE_AUTOMATION_MONITORS.add(monitor_task)
+        monitor_task.add_done_callback(_ACTIVE_AUTOMATION_MONITORS.discard)
 
 
 @router.message(StateFilter(None), F.document)
