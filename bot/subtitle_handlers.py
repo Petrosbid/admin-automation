@@ -1,8 +1,12 @@
+import asyncio
+import html
 import logging
 import math
 import re
 import shutil
+import uuid
 from pathlib import Path
+from typing import Any
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardButton
 from aiogram.filters import StateFilter
@@ -29,6 +33,9 @@ from bot.keyboards import (
 )
 
 router = Router()
+
+# نگه‌داشتن reference تسک‌های مانیتور تا زمان پایان آن‌ها.
+_ACTIVE_AUTOMATION_MONITORS: set[asyncio.Task] = set()
 
 
 class SubtitleStates(StatesGroup):
@@ -791,6 +798,102 @@ async def cb_sauto_skip_en(call: CallbackQuery, state: FSMContext):
     await _prompt_final_automation_choices_step(call, state, plans, en_note="⏭ ادامه بدون زیرنویس انگلیسی جدید.")
 
 
+async def _detect_existing_automation_quality_defaults(
+    plans: list[AutomationPlan],
+) -> dict[str, Any]:
+    """
+    کیفیت‌هایی را پیش‌فرض انتخاب می‌کند که خروجی متناظرشان در مقصد FTP وجود دارد.
+
+    Series/Anime:
+      - SoftSub: پوشه‌هایی مثل 1080p-EBTV-SoftSub
+      - HardSub: پوشه‌هایی مثل 1080p-HardSub
+
+    Movies:
+      - چون همه خروجی‌های SoftSub و HardSub داخل یک پوشه مشترک قرار می‌گیرند،
+        نام فایل‌های موجود در پوشه بررسی می‌شود تا کیفیت دقیق تشخیص داده شود.
+    """
+    selected_soft: set[str] = set()
+    selected_hard: set[str] = set()
+    checked_roots: set[str] = set()
+    unavailable_roots: list[str] = []
+    remote_cache: dict[str, dict] = {}
+
+    async def inspect(path: str) -> dict:
+        key = path.casefold()
+        if key not in remote_cache:
+            try:
+                remote_cache[key] = await CuteFTPService.inspect_remote_dir(path)
+            except Exception as exc:
+                logging.warning("Could not inspect automation output folder %s: %s", path, exc)
+                remote_cache[key] = {"exists": False, "dirs": [], "files": []}
+        return remote_cache[key]
+
+    hard_qualities = ("1080p", "720p", "480p")
+
+    for plan in plans:
+        remote_root = AutomationService.compute_server_remote_dir_for_local_path(plan.base_dir)
+        root_info = await inspect(remote_root)
+
+        if not root_info.get("exists"):
+            if remote_root not in unavailable_roots:
+                unavailable_roots.append(remote_root)
+            continue
+
+        checked_roots.add(remote_root)
+        remote_dirs = {
+            str(name).strip().casefold()
+            for name in root_info.get("dirs", [])
+            if str(name).strip()
+        }
+
+        if plan.is_series:
+            # در سریال و انیمه هر کیفیت خروجی پوشه مستقل دارد.
+            for target in plan.softsub_targets:
+                remote_output_dir = AutomationService.compute_server_remote_dir_for_local_path(
+                    target.output_dir
+                ).rsplit("/", 1)[-1].casefold()
+                if remote_output_dir in remote_dirs:
+                    selected_soft.add(target.quality_folder_name)
+
+            for quality in hard_qualities:
+                expected_dir = f"{quality}-HardSub".casefold()
+                if plan.fullhd_source_video and expected_dir in remote_dirs:
+                    selected_hard.add(quality)
+            continue
+
+        # فیلم سینمایی: همه خروجی‌ها داخل SoftSub/Hardsub هستند؛ فایل‌ها کیفیت را مشخص می‌کنند.
+        if "softsub" in remote_dirs:
+            soft_remote_path = f"{remote_root.rstrip('/')}/SoftSub"
+            soft_info = await inspect(soft_remote_path)
+            existing_soft_files = {
+                str(name).casefold()
+                for name in soft_info.get("files", [])
+            }
+            if soft_info.get("exists"):
+                for target in plan.softsub_targets:
+                    if target.output_file.name.casefold() in existing_soft_files:
+                        selected_soft.add(target.quality_folder_name)
+
+        if plan.fullhd_source_video and "hardsub" in remote_dirs:
+            hard_remote_path = f"{remote_root.rstrip('/')}/Hardsub"
+            hard_info = await inspect(hard_remote_path)
+            existing_hard_files = list(hard_info.get("files", []))
+            for quality in hard_qualities:
+                quality_pattern = re.compile(
+                    rf"(?<![a-z0-9]){re.escape(quality)}(?![a-z0-9])",
+                    flags=re.IGNORECASE,
+                )
+                if any(quality_pattern.search(str(name)) for name in existing_hard_files):
+                    selected_hard.add(quality)
+
+    return {
+        "soft": selected_soft,
+        "hard": selected_hard,
+        "checked_roots": sorted(checked_roots),
+        "unavailable_roots": unavailable_roots,
+    }
+
+
 async def _prompt_final_automation_choices_step(
     call_or_msg: CallbackQuery | Message,
     state: FSMContext,
@@ -803,9 +906,33 @@ async def _prompt_final_automation_choices_step(
             if st.quality_folder_name not in avail_soft_quals:
                 avail_soft_quals.append(st.quality_folder_name)
 
-    default_selected_soft = list(avail_soft_quals)
-    default_srt_hb = ["1080p", "720p"]
+    server_defaults = await _detect_existing_automation_quality_defaults(plans)
+    default_selected_soft = sorted(
+        set(avail_soft_quals) & set(server_defaults["soft"]),
+        key=str.casefold,
+    )
+    default_srt_hb = sorted(
+        set(server_defaults["hard"]),
+        key=lambda q: {"1080p": 1, "720p": 2, "480p": 3}.get(q, 9),
+    )
     default_auto_upload = True
+
+    checked_roots = server_defaults["checked_roots"]
+    unavailable_roots = server_defaults["unavailable_roots"]
+    if checked_roots:
+        remote_check_note = (
+            "☁️ تیک‌های اولیه بر اساس پوشه‌ها/فایل‌های موجود در سرور مقصد تنظیم شده‌اند.\n"
+        )
+    else:
+        remote_check_note = (
+            "⚠️ پوشه مقصد در سرور قابل بررسی نبود؛ هیچ کیفیتی به‌صورت پیش‌فرض تیک نخورده است. "
+            "می‌توانید کیفیت‌ها را دستی انتخاب کنید.\n"
+        )
+    if unavailable_roots and checked_roots:
+        remote_check_note += (
+            f"⚠️ دسترسی به {len(unavailable_roots)} مسیر مقصد برقرار نشد؛ "
+            "برای آن مسیرها انتخاب پیش‌فرضی انجام نشد.\n"
+        )
 
     await state.set_state(SubtitleStates.sauto_waiting_hb_qualities)
     await state.update_data(
@@ -822,8 +949,11 @@ async def _prompt_final_automation_choices_step(
         f"{en_note}\n\n"
         f"🎯 **مرحله نهایی اتوماسیون: انتخاب کیفیت‌های سافت‌ساب و هاردساب**\n\n"
         f"🎞 تعداد قسمت‌های آماده: **`{len(plans)}` مورد**\n"
-        f"📂 پوشه‌های کیفیت خام موجود: `{', '.join(avail_soft_quals)}`\n"
+        f"📂 پوشه‌های کیفیت خام موجود: `{', '.join(avail_soft_quals) or 'موردی یافت نشد'}`\n"
         f"🔥 **سورس هاردساب (`FullHD`):**\n{fhd_block}\n\n"
+        f"{remote_check_note}\n"
+        f"✅ پیش‌فرض SoftSub: `{', '.join(default_selected_soft) or 'هیچ‌کدام'}`\n"
+        f"✅ پیش‌فرض HardSub: `{', '.join(default_srt_hb) or 'هیچ‌کدام'}`\n\n"
         "👇 در پنل زیر می‌توانید:\n"
         "1️⃣ مشخص کنید کدام **پوشه‌های کیفیت خام** سافت‌ساب شوند (`✅`).\n"
         "2️⃣ مشخص کنید کدام یک از **۳ کیفیت اصلی (`1080p`, `720p`, `480p`)** از روی فایل `FullHD` هاردساب شوند:"
@@ -847,7 +977,7 @@ async def cb_sauto_hb_quality_action(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     avail_soft: list[str] = data.get("sauto_avail_soft_quals", [])
     sel_soft = set(data.get("sauto_selected_soft_quals", avail_soft))
-    srt_set = set(data.get("sauto_hb_srt_qualities", ["1080p", "720p"]))
+    srt_set = set(data.get("sauto_hb_srt_qualities", []))
     auto_up = bool(data.get("sauto_auto_upload", True))
 
     if action.startswith("toggle_soft:"):
@@ -889,6 +1019,175 @@ async def cb_sauto_hb_quality_action(call: CallbackQuery, state: FSMContext):
     )
 
 
+def _automation_batch_status_markup():
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="📊 مشاهده صف کامل", callback_data="menu:queues"),
+        InlineKeyboardButton(text="📂 فایل‌منیجر", callback_data="menu:file_mgr"),
+    )
+    kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
+    return kb.as_markup()
+
+
+def _build_automation_batch_status_text(
+    title: str,
+    tasks: list,
+    skipped_items: list[str],
+    auto_upload: bool,
+    final: bool = False,
+) -> str:
+    """ساخت یک گزارش HTML جمع‌وجور از وضعیت کل Batch."""
+    done = [t for t in tasks if t.is_finished and "خطا" not in str(t.status) and "لغو" not in str(t.status)]
+    failed = [t for t in tasks if "خطا" in str(t.status)]
+    cancelled = [t for t in tasks if "لغو" in str(t.status)]
+    running = [
+        t for t in tasks
+        if not t.is_finished and ("اجرا" in str(t.status) or t.running_asyncio_task is not None)
+    ]
+    pending = [t for t in tasks if not t.is_finished and t not in running]
+
+    if final:
+        stage = "✅ اجرای مراحل ثبت‌شده به پایان رسید"
+    elif any(t.queue_type == "upload" for t in running):
+        stage = "☁️ مرحله جاری: آپلود به سرور"
+    elif any(t.queue_type == "handbrake" for t in running):
+        stage = "🔥 مرحله جاری: پردازش HardSub"
+    elif any(t.queue_type == "mkvtoolnix" for t in running):
+        stage = "📎 مرحله جاری: پردازش SoftSub"
+    elif pending:
+        stage = "⏳ مرحله جاری: انتظار در صف پردازش"
+    else:
+        stage = "🧾 در حال آماده‌سازی گزارش نهایی"
+
+    lines = [
+        f"🎬 <b>گزارش زنده اتوماسیون: {html.escape(title)}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📍 <b>{stage}</b>",
+        f"☁️ آپلود خودکار: {'فعال' if auto_upload else 'غیرفعال'}",
+        "",
+        (
+            f"✅ تکمیل‌شده: <b>{len(done)}</b>  |  "
+            f"⚙️ در حال اجرا: <b>{len(running)}</b>  |  "
+            f"⏳ منتظر: <b>{len(pending)}</b>"
+        ),
+        f"❌ خطا: <b>{len(failed)}</b>  |  🛑 لغوشده: <b>{len(cancelled)}</b>",
+        "",
+        "<b>وضعیت مراحل:</b>",
+    ]
+
+    stage_labels = (
+        ("mkvtoolnix", "📎 SoftSub"),
+        ("handbrake", "🔥 HardSub"),
+        ("upload", "☁️ Upload"),
+    )
+    for queue_type, label in stage_labels:
+        subset = [t for t in tasks if t.queue_type == queue_type]
+        if not subset:
+            continue
+        subset_done = sum(
+            1 for t in subset
+            if t.is_finished and "خطا" not in str(t.status) and "لغو" not in str(t.status)
+        )
+        subset_failed = sum(
+            1 for t in subset
+            if "خطا" in str(t.status) or "لغو" in str(t.status)
+        )
+        lines.append(
+            f"• {label}: <b>{subset_done}/{len(subset)}</b> تکمیل"
+            + (f" | <b>{subset_failed}</b> ناموفق" if subset_failed else "")
+        )
+
+    if tasks:
+        lines.extend(["", "<b>فایل‌ها و عملیات:</b>"])
+        for task in tasks[:14]:
+            status = str(task.status)
+            if "خطا" in status:
+                icon, detail = "❌", f"خطا: {str(task.error or task.progress)[:65]}"
+            elif "لغو" in status:
+                icon, detail = "🛑", "لغو شد"
+            elif task.is_finished:
+                icon, detail = "✅", "تکمیل شد"
+            elif task in running:
+                icon, detail = "⚙️", str(task.progress or "در حال اجرا")[:65]
+            else:
+                icon, detail = "⏳", "در انتظار"
+            lines.append(
+                f"{icon} <code>#{html.escape(str(task.task_id))} "
+                f"{html.escape(str(task.title)[:90])}</code> — "
+                f"<i>{html.escape(detail)}</i>"
+            )
+        if len(tasks) > 14:
+            lines.append(f"<i>... و {len(tasks) - 14} عملیات دیگر</i>")
+
+    if skipped_items:
+        lines.extend(["", "<b>انجام‌نشده / ردشده:</b>"])
+        for item in skipped_items[:6]:
+            lines.append(f"▫️ {html.escape(item[:150])}")
+        if len(skipped_items) > 6:
+            lines.append(f"<i>... و {len(skipped_items) - 6} مورد دیگر</i>")
+
+    if final:
+        if not tasks:
+            lines.extend(["", "ℹ️ <b>هیچ عملیات اجرایی در صف ثبت نشد.</b>"])
+        elif failed or cancelled:
+            lines.extend(["", "⚠️ <b>اتوماسیون با موارد ناموفق/لغوشده پایان یافت.</b>"])
+        else:
+            lines.extend(["", "🎉 <b>تمام عملیات ثبت‌شده با موفقیت تکمیل شدند.</b>"])
+
+    return "\n".join(lines)[:3900]
+
+
+async def _watch_smart_automation_batch(
+    status_message: Message,
+    batch_id: str,
+    title: str,
+    initial_tasks: list,
+    skipped_items: list[str],
+    auto_upload: bool,
+):
+    """پیام وضعیت واحد را هر چند ثانیه ویرایش می‌کند؛ برای هر فایل پیام جداگانه نمی‌فرستد."""
+    known_tasks = {task.task_id: task for task in initial_tasks}
+    markup = _automation_batch_status_markup()
+    last_rendered = None
+    stable_completed_cycles = 0
+
+    while True:
+        # کارهای Upload که از داخل پردازش SoftSub/HardSub ساخته می‌شوند نیز batch_id را به ارث می‌برند.
+        for task in list(queue_engine.tasks.values()):
+            if getattr(task, "batch_id", None) == batch_id:
+                known_tasks[task.task_id] = task
+
+        tasks = list(known_tasks.values())
+        is_complete = bool(tasks) and all(task.is_finished for task in tasks)
+        stable_completed_cycles = stable_completed_cycles + 1 if is_complete else 0
+
+        report = _build_automation_batch_status_text(
+            title=title,
+            tasks=tasks,
+            skipped_items=skipped_items,
+            auto_upload=auto_upload,
+            final=stable_completed_cycles >= 2,
+        )
+
+        if report != last_rendered:
+            try:
+                await status_message.edit_text(
+                    report,
+                    reply_markup=markup,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                last_rendered = report
+            except Exception as exc:
+                if "message is not modified" not in str(exc).lower():
+                    logging.warning("Could not update automation status message: %s", exc)
+
+        if stable_completed_cycles >= 2:
+            return
+
+        await asyncio.sleep(3)
+
+
 async def _execute_smart_automation_batch(
     call: CallbackQuery,
     state: FSMContext,
@@ -905,39 +1204,68 @@ async def _execute_smart_automation_batch(
 
     plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
     selected_soft_set = set(selected_soft_qualities)
-
-    scheduled_soft_lines = []
-    scheduled_hard_lines = []
+    batch_id = uuid.uuid4().hex[:10]
+    batch_tasks = []
+    skipped_items: list[str] = []
 
     for plan in plans:
         key = plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
         fa_sub = Path(fa_map[key]) if key in fa_map else None
         en_sub = Path(en_map[key]) if key in en_map else plan.existing_en_sub
 
-        if not fa_sub:
+        if not fa_sub or not fa_sub.exists():
+            skipped_items.append(
+                f"{key}: زیرنویس فارسی معتبر پیدا نشد؛ SoftSub/HardSub این مورد اجرا نشد."
+            )
             continue
 
         if auto_upload:
-            if fa_sub and fa_sub.exists():
+            if fa_sub.exists():
                 r_dir_fa = AutomationService.compute_server_remote_dir_for_local_path(fa_sub)
-                await queue_engine.add_task("upload", f"AutoUpload Sub [{r_dir_fa}]: {fa_sub.name}",
-                                            CuteFTPService.upload_path, fa_sub, r_dir_fa)
-                # اگر انیمه است و فایل .ass به .srt هم تبدیل شده، فایل .srt را هم به پوشه srt سرور آپلود کن
+                subtitle_task = await queue_engine.add_task(
+                    "upload",
+                    f"AutoUpload Sub [{r_dir_fa}]: {fa_sub.name}",
+                    CuteFTPService.upload_path,
+                    fa_sub,
+                    r_dir_fa,
+                    batch_id=batch_id,
+                    notify_completion=False,
+                )
+                batch_tasks.append(subtitle_task)
+
+                # در انیمه، نسخه SRT تبدیل‌شده نیز باید همراه ASS ارسال شود.
                 if plan.category == "Anime" and fa_sub.suffix.lower() in (".ass", ".ssa"):
                     converted_srt = fa_sub.with_suffix(".srt")
                     if converted_srt.exists():
-                        await queue_engine.add_task("upload", f"AutoUpload Sub [{r_dir_fa}]: {converted_srt.name}",
-                                                    CuteFTPService.upload_path, converted_srt, r_dir_fa)
+                        converted_task = await queue_engine.add_task(
+                            "upload",
+                            f"AutoUpload Sub [{r_dir_fa}]: {converted_srt.name}",
+                            CuteFTPService.upload_path,
+                            converted_srt,
+                            r_dir_fa,
+                            batch_id=batch_id,
+                            notify_completion=False,
+                        )
+                        batch_tasks.append(converted_task)
+
             if en_sub and en_sub.exists() and plan.category != "Anime":
                 r_dir_en = AutomationService.compute_server_remote_dir_for_local_path(en_sub)
-                await queue_engine.add_task("upload", f"AutoUpload Sub [{r_dir_en}]: {en_sub.name}",
-                                            CuteFTPService.upload_path, en_sub, r_dir_en)
+                en_task = await queue_engine.add_task(
+                    "upload",
+                    f"AutoUpload Sub [{r_dir_en}]: {en_sub.name}",
+                    CuteFTPService.upload_path,
+                    en_sub,
+                    r_dir_en,
+                    batch_id=batch_id,
+                    notify_completion=False,
+                )
+                batch_tasks.append(en_task)
 
         for st in plan.softsub_targets:
             if st.quality_folder_name not in selected_soft_set:
                 continue
             st.output_dir.mkdir(parents=True, exist_ok=True)
-            t_soft = await queue_engine.add_task(
+            soft_task = await queue_engine.add_task(
                 "mkvtoolnix",
                 f"SoftSub [{st.quality_folder_name}]: {st.output_file.name}",
                 AutomationService.run_softsub_and_optional_upload,
@@ -946,14 +1274,21 @@ async def _execute_smart_automation_batch(
                 fa_sub,
                 en_sub,
                 brand,
-                auto_upload
+                auto_upload,
+                batch_id=batch_id,
+                notify_completion=False,
             )
-            scheduled_soft_lines.append(f"📎 `{st.output_dir.name}/{st.output_file.name}` (`{t_soft.task_id}`)")
+            batch_tasks.append(soft_task)
 
-        hb_targets = AutomationService.build_hardsub_targets(plan, selected_hb_srt)
-        for ht in hb_targets:
+        hardsub_targets = AutomationService.build_hardsub_targets(plan, selected_hb_srt)
+        if selected_hb_srt and not plan.fullhd_source_video:
+            skipped_items.append(
+                f"{key}: سورس FullHD موجود نیست؛ HardSub انتخاب‌شده اجرا نشد."
+            )
+
+        for ht in hardsub_targets:
             ht.output_dir.mkdir(parents=True, exist_ok=True)
-            t_hb = await queue_engine.add_task(
+            hard_task = await queue_engine.add_task(
                 "handbrake",
                 f"HardSub [{ht.quality_tag}]: {ht.output_file.name}",
                 AutomationService.run_hardsub_or_encode_and_optional_upload,
@@ -961,31 +1296,53 @@ async def _execute_smart_automation_batch(
                 fa_sub,
                 en_sub,
                 brand,
-                auto_upload
+                auto_upload,
+                batch_id=batch_id,
+                notify_completion=False,
             )
-            scheduled_hard_lines.append(f"🔥 `{ht.output_dir.name}/{ht.output_file.name}` (`{t_hb.task_id}`)")
+            batch_tasks.append(hard_task)
+
+        if (
+            not any(st.quality_folder_name in selected_soft_set for st in plan.softsub_targets)
+            and not hardsub_targets
+        ):
+            skipped_items.append(
+                f"{key}: هیچ کیفیت SoftSub یا HardSub برای اجرا انتخاب/موجود نبود."
+            )
 
     await state.clear()
     await state.update_data(current_dir=str(target_dir))
 
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="📊 مشاهده صف و تغییر اولویت‌ها", callback_data="menu:queues"))
-    kb.row(InlineKeyboardButton(text="📂 باز کردن در فایل‌منیجر", callback_data="menu:file_mgr"))
-    kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
-
     title_str = plans[0].series_title if plans else target_dir.name
-    up_status = "🟢 فعال (پس از اتمام هر فایل به ترتیب آپلود می‌شود)" if auto_upload else "🔴 غیرفعال"
-
-    report = (
-        f"🎉 **اتوماسیون کامل `{title_str}` آغاز شد!**\n"
-        f"☁️ آپلود خودکار به هاست: {up_status}\n\n"
-        f"📎 **سافت‌ساب‌های انتخابی (`{len(scheduled_soft_lines)}` فایل):**\n"
-        + ("\n".join(scheduled_soft_lines[:10]) or "_(ندارد)_")
-        + f"\n\n🔥 **هاردساب‌های فارسی (`{len(scheduled_hard_lines)}` فایل):**\n"
-        + ("\n".join(scheduled_hard_lines[:8]) or "_(ندارد)_")
+    initial_report = _build_automation_batch_status_text(
+        title=title_str,
+        tasks=batch_tasks,
+        skipped_items=skipped_items,
+        auto_upload=auto_upload,
+        final=not bool(batch_tasks),
     )
 
-    await call.message.edit_text(report[:4000], reply_markup=kb.as_markup(), parse_mode="Markdown")
+    status_message = await call.message.edit_text(
+        initial_report,
+        reply_markup=_automation_batch_status_markup(),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+    if batch_tasks:
+        monitor_task = asyncio.create_task(
+            _watch_smart_automation_batch(
+                status_message=status_message,
+                batch_id=batch_id,
+                title=title_str,
+                initial_tasks=batch_tasks,
+                skipped_items=skipped_items,
+                auto_upload=auto_upload,
+            ),
+            name=f"automation-status-{batch_id}",
+        )
+        _ACTIVE_AUTOMATION_MONITORS.add(monitor_task)
+        monitor_task.add_done_callback(_ACTIVE_AUTOMATION_MONITORS.discard)
 
 
 @router.message(StateFilter(None), F.document)
