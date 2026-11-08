@@ -1,4 +1,6 @@
+import logging
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -450,11 +452,114 @@ class AutomationService:
             "srt": srt_dir,
         }
 
+    REMOTE_STRUCTURE_CACHE_TTL = 45
+    _remote_structure_cache: dict[str, tuple[float, bool, list[str]]] = {}
+
     @classmethod
-    def create_series_season_structure(cls, season_folder: Path) -> dict[str, Path]:
+    def normalize_server_quality_directories(cls, remote_dirs: list[str]) -> list[str]:
+        """
+        تبدیل پوشه‌های مستقیم سرور به نام پوشه‌های مجاز در Workspace.
+
+        - پوشه‌های SoftSub روی مبدا نیز ساخته می‌شوند.
+        - برای هر پوشه *-SoftSub، پوشه مبدأ بدون پسوند SoftSub را نیز می‌سازد.
+        - اگر نام یکی از پوشه‌های مقصد شامل EBTV باشد، FullHD را نیز تضمین می‌کند.
+        """
+        local_names: set[str] = set()
+
+        for raw_name in remote_dirs or []:
+            name = str(raw_name or "").strip().rstrip("/").strip()
+            if (
+                not name
+                or name in (".", "..")
+                or any(char in name for char in '<>:"/\\|?*')
+                or name.casefold() == "srt"
+            ):
+                continue
+
+            local_names.add(name)
+
+            softsub_match = re.search(r"(?:[-_. ]?softsub)$", name, flags=re.IGNORECASE)
+            if softsub_match:
+                source_name = name[:softsub_match.start()].rstrip(" ._-")
+                if source_name and source_name.casefold() != "srt":
+                    local_names.add(source_name)
+
+        if any("ebtv" in str(name).casefold() for name in remote_dirs or []):
+            local_names.add("FullHD")
+
+        return sorted(local_names, key=str.casefold)
+
+    @classmethod
+    async def create_season_structure_from_server(
+        cls,
+        season_folder: Path,
+        category: str = "Series"
+    ) -> dict[str, Path]:
+        """
+        ساخت ساختار محلی فصل بر اساس زیرپوشه‌های همان مسیر در سرور مقصد.
+        درخواست FTP در thread جدا اجرا می‌شود تا حلقه اصلی ربات مسدود نشود.
+        """
+        season_folder = Path(season_folder).resolve()
+        remote_dir = cls.compute_server_remote_dir_for_local_path(season_folder)
+        cache_key = remote_dir.casefold()
+        now = time.monotonic()
+
+        cached = cls._remote_structure_cache.get(cache_key)
+        if cached and now - cached[0] < cls.REMOTE_STRUCTURE_CACHE_TTL:
+            remote_exists, remote_dirs = cached[1], list(cached[2])
+        else:
+            remote_exists = False
+            remote_dirs: list[str] = []
+            try:
+                remote_info = await CuteFTPService.inspect_remote_dir(remote_dir)
+                remote_exists = bool(remote_info.get("exists", False))
+                if remote_exists:
+                    remote_dirs = list(remote_info.get("dirs", []))
+                    cls._remote_structure_cache[cache_key] = (
+                        now,
+                        True,
+                        remote_dirs.copy(),
+                    )
+            except Exception as exc:
+                logging.warning(
+                    "Could not inspect destination season folder %s: %s",
+                    remote_dir,
+                    exc,
+                )
+
+        quality_dirs = cls.normalize_server_quality_directories(remote_dirs)
+
+        if str(category).strip().lower() == "anime":
+            paths = cls.create_anime_season_structure(season_folder, quality_dirs)
+        else:
+            paths = cls.create_series_season_structure(season_folder, quality_dirs)
+
+        if not remote_exists:
+            logging.warning(
+                "Destination season folder was not found or could not be inspected: %s. "
+                "Only the local subtitle structure was created.",
+                remote_dir,
+            )
+        else:
+            logging.info(
+                "Mirrored %d destination folders from %s into %s",
+                len(quality_dirs),
+                remote_dir,
+                season_folder,
+            )
+
+        return paths
+
+    @classmethod
+    def create_series_season_structure(
+        cls,
+        season_folder: Path,
+        quality_dirs: list[str] | None = None
+    ) -> dict[str, Path]:
         season_folder.mkdir(parents=True, exist_ok=True)
-        for q_dir in cls.DEFAULT_SERIES_QUALITY_DIRS:
-            (season_folder / q_dir).mkdir(parents=True, exist_ok=True)
+        for q_dir in quality_dirs or []:
+            if q_dir and q_dir not in (".", "..") and not any(c in q_dir for c in '<>:"/\\|?*'):
+                (season_folder / q_dir).mkdir(parents=True, exist_ok=True)
 
         srt_fa = season_folder / "srt" / "FA"
         srt_en = season_folder / "srt" / "EN"
@@ -469,10 +574,15 @@ class AutomationService:
         }
 
     @classmethod
-    def create_anime_season_structure(cls, season_folder: Path) -> dict[str, Path]:
+    def create_anime_season_structure(
+        cls,
+        season_folder: Path,
+        quality_dirs: list[str] | None = None
+    ) -> dict[str, Path]:
         season_folder.mkdir(parents=True, exist_ok=True)
-        for q_dir in cls.DEFAULT_ANIME_QUALITY_DIRS:
-            (season_folder / q_dir).mkdir(parents=True, exist_ok=True)
+        for q_dir in quality_dirs or []:
+            if q_dir and q_dir not in (".", "..") and not any(c in q_dir for c in '<>:"/\\|?*'):
+                (season_folder / q_dir).mkdir(parents=True, exist_ok=True)
 
         srt_dir = season_folder / "srt"
         srt_dir.mkdir(parents=True, exist_ok=True)
@@ -647,10 +757,10 @@ class AutomationService:
 
         if is_series:
             is_anime = (category == "Anime")
-            if is_anime:
-                paths = cls.create_anime_season_structure(target_dir)
-            else:
-                paths = cls.create_series_season_structure(target_dir)
+            paths = await cls.create_season_structure_from_server(
+                target_dir,
+                category="Anime" if is_anime else "Series",
+            )
 
             series_title = target_dir.parent.name if cls.SEASON_DIR_REGEX.match(target_dir.name) else target_dir.name
             fallback_s = cls.extract_season_num_from_dir(target_dir)
