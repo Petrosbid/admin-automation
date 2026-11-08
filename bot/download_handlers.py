@@ -1355,9 +1355,8 @@ async def handle_direct_link_input(message: Message, state: FSMContext):
     else:
         return await message.answer("⚠️ لطفاً لینک یا فایل `.torrent` ارسال کنید:")
 
-    await state.update_data(pending_direct_targets=targets)
-    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-    await _render_download_folder_browser(message, state, workspace, page=0)
+    await state.clear()
+    await _show_link_purpose_prompt(message, targets)
 
 
 @router.callback_query(DownloadStates.browsing_download_folder, F.data.startswith("dlnav:page:"))
@@ -1835,6 +1834,8 @@ async def cb_link_purpose(call: CallbackQuery, state: FSMContext):
     if not targets:
         PENDING_LINK_ACTIONS.pop(token, None)
         return await call.answer("لینکی برای پردازش ثبت نشده است.", show_alert=True)
+
+    await state.clear()
 
     if purpose == "extract":
         PENDING_LINK_ACTIONS.pop(token, None)
