@@ -2024,7 +2024,7 @@ async def cb_extract_sub_list(call: CallbackQuery, state: FSMContext):
     for t in tracks:
         kb.button(
             text=f"Track #{t['id']} | {t['language']} | {t['track_name']} ({t['codec']})",
-            callback_data=f"exttrack:{t['id']}"
+            callback_data=f"exttrack:{t['id']}:{t['codec']}"
         )
     kb.adjust(1)
     await call.message.edit_text("📤 کدام ترک زیرنویس استخراج شود؟", reply_markup=kb.as_markup())
@@ -2032,20 +2032,36 @@ async def cb_extract_sub_list(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("exttrack:"))
 async def cb_extract_sub_run(call: CallbackQuery, state: FSMContext):
-    track_id = int(call.data.split(":")[1])
+    parts = call.data.split(":")
+    track_id = int(parts[1])
+    codec_low = parts[2].lower() if len(parts) > 2 else "srt"
+
     data = await state.get_data()
     sel_files = data.get("fm_selected_files", [])
     video_path = Path(sel_files[0]) if sel_files else Path(data["selected_video"])
-    out_srt = video_path.with_name(f"{video_path.stem}_track{track_id}.srt")
 
-    await call.message.edit_text("⏳ در حال استخراج زیرنویس با `mkvextract`...", parse_mode="Markdown")
-    await MKVService.extract_subtitle_track(video_path, track_id, out_srt)
+    ext = ".ass" if ("ass" in codec_low or "ssa" in codec_low) else ".srt"
+    out_sub = video_path.with_name(f"{video_path.stem}_track{track_id}{ext}")
+
+    await call.message.edit_text("⏳ در حال استخراج و استانداردسازی زیرنویس برای موبایل و دسکتاپ...", parse_mode="Markdown")
+    await MKVService.extract_subtitle_track(video_path, track_id, out_sub)
+    SubtitleService.normalize_subtitle_file(out_sub)
+
     await call.message.answer_document(
-        FSInputFile(out_srt),
-        caption=f"✅ زیرنویس استخراج شد:\n`{out_srt.name}`",
+        FSInputFile(out_sub),
+        caption=f"✅ زیرنویس استخراج و استانداردسازی شد:\n`{out_sub.name}`",
         parse_mode="Markdown"
     )
 
+    # اگر فایل استخراج‌شده .ass بود، یک نسخه تبدیل‌شده و تمیز .srt هم کنارش برای راحتی ادیت در موبایل بفرست
+    if ext == ".ass":
+        srt_copy = out_sub.with_suffix(".srt")
+        SubtitleService.convert_ass_to_srt_file(out_sub, srt_copy)
+        await call.message.answer_document(
+            FSInputFile(srt_copy),
+            caption=f"📱 نسخه تبدیل‌شده به **SRT استاندارد** (مخصوص ادیت در موبایل):\n`{srt_copy.name}`",
+            parse_mode="Markdown"
+        )
 
 @router.callback_query(F.data.in_({"vact:softsub", "vact:hardsub", "vact:encode_ass", "vact:full_auto", "fact:batch_sub"}))
 async def cb_single_or_batch_video_sub_flow(call: CallbackQuery, state: FSMContext):

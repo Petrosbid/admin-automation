@@ -20,12 +20,10 @@ class SubtitleService:
 
     @staticmethod
     def read_subtitle_safe(sub_path: Path) -> str:
-        """خواندن ایمن فایل زیرنویس با تشخیص خودکار انکودینگ و حذف بایت‌های مخرب"""
-        raw_bytes = sub_path.read_bytes()
-        # حذف کاراکترهای Null که باعث خراب شدن فایل در پلیرها و نوت‌پد ویندوز می‌شوند
+        """خواندن ایمن فایل زیرنویس با تشخیص خودکار انکودینگ و حذف کامل BOM و کاراکترهای مخرب"""
+        raw_bytes = Path(sub_path).read_bytes()
         raw_bytes = raw_bytes.replace(b"\x00", b"")
 
-        # بررسی BOM های استاندارد
         if raw_bytes.startswith(b"\xef\xbb\xbf"):
             text = raw_bytes.decode("utf-8-sig", errors="replace")
         elif raw_bytes.startswith(b"\xff\xfe") or raw_bytes.startswith(b"\xfe\xff"):
@@ -43,16 +41,46 @@ class SubtitleService:
                 except Exception:
                     text = raw_bytes.decode("cp1256", errors="replace")
 
-        # پاکسازی کاراکترهای کنترلی غیرمجاز و یکسان‌سازی پایان خطوط
-        text = text.lstrip("\ufeff")
+        # حذف تمام کاراکترهای نامرئی BOM و Zero-Width از ابتدای متن که پارسرهای موبایل را خراب می‌کنند
+        text = text.lstrip("\ufeff\u200b\u200e\u200f")
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         return text
+
+    @staticmethod
+    def _standardize_srt_timestamp_line(line: str) -> str | None:
+        """
+        تبدیل هر نوع خط تایم‌کد (حتی فرمت‌های ناقص، WebVTT یا دارای نقطه به جای ویرگول)
+        به فرمت استاندارد دقیق 00:00:00,000 --> 00:00:00,000 برای اپلیکیشن‌های موبایل
+        """
+        if "-->" not in line:
+            return None
+        m = re.search(
+            r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})",
+            line
+        )
+        if not m:
+            # پشتیبانی از فرمت بدون ساعت (MM:SS.mmm --> MM:SS.mmm در برخی زیرنویس‌های وب)
+            m_short = re.search(
+                r"(\d{1,2}):(\d{2})[,.](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2})[,.](\d{1,3})",
+                line
+            )
+            if not m_short:
+                return None
+            m1, s1, ms1, m2, s2, ms2 = m_short.groups()
+            h1, h2 = "00", "00"
+        else:
+            h1, m1, s1, ms1, h2, m2, s2, ms2 = m.groups()
+
+        ms1_pad = (ms1 + "000")[:3]
+        ms2_pad = (ms2 + "000")[:3]
+        return f"{int(h1):02d}:{int(m1):02d}:{int(s1):02d},{ms1_pad} --> {int(h2):02d}:{int(m2):02d}:{int(s2):02d},{ms2_pad}"
 
     @classmethod
     def normalize_subtitle_file(cls, sub_path: Path) -> Path:
         """
-        نرمال‌سازی کامل فایل زیرنویس (.srt, .ass, .ssa) به فرمت استاندارد ویندوز (CRLF + UTF-8-BOM)
-        تا بدون نیاز به باز کردن و Save As دستی، در تمام پلیرها و نرم‌افزارها به درستی باز شود.
+        ذخیره و بازسازی زیرنویس دقیقا مشابه Save As در Notepad ویندوز (UTF-8 بدون BOM + خطوط استاندارد):
+        - اگر محتوای فایل ASS/SSA باشد ولی پسوندش .srt گذاشته شده باشد، خودکار آن را به SRT واقعی تبدیل می‌کند!
+        - تمام تایم‌کدها و شماره‌گذاری‌های SRT را از نو و بدون هیچ کاراکتر مخفی بازنویسی می‌کند تا در تمام اپ‌های موبایل باز شود.
         """
         sub_path = Path(sub_path)
         if not sub_path.exists() or sub_path.suffix.lower() not in cls.SUB_EXTENSIONS:
@@ -61,39 +89,62 @@ class SubtitleService:
         content = cls.read_subtitle_safe(sub_path)
         ext_low = sub_path.suffix.lower()
 
+        # اگر فایل پسوند .srt دارد اما محتوای داخل آن فرمت ASS/SSA است ([Script Info] یا Dialogue:)
+        if ext_low == ".srt" and ("[script info]" in content[:300].lower() or "\ndialogue:" in content.lower()):
+            return cls.convert_ass_to_srt_file(sub_path, sub_path)
+
         if ext_low == ".srt":
-            # بازسازی ساختار بلوک‌های SRT برای رفع به هم ریختگی شماره‌ها یا خطوط خالی
-            blocks = re.split(r"\n\s*\n", content.strip())
+            # حذف هدر WEBVTT در صورتی که زیرنویس استخراجی از نوع VTT بوده باشد
+            content = re.sub(r"^WEBVTT.*?\n\n", "", content, flags=re.IGNORECASE | re.DOTALL)
+            raw_lines = content.split("\n")
+
             clean_blocks = []
+            idx = 0
+            n_lines = len(raw_lines)
             counter = 1
-            for b in blocks:
-                lines = [ln.strip() for ln in b.split("\n") if ln.strip()]
-                if not lines:
-                    continue
-                # پیدا کردن خط تایم‌کد
-                time_idx = -1
-                for i, ln in enumerate(lines):
-                    if "-->" in ln:
-                        time_idx = i
-                        break
-                if time_idx == -1:
-                    continue
-                time_line = re.sub(r"(\d{2}:\d{2}:\d{2})\.(\d{3})", r"\1,\2", lines[time_idx])
-                text_lines = lines[time_idx + 1:]
-                if not text_lines:
-                    continue
-                clean_blocks.append(f"{counter}\n{time_line}\n" + "\n".join(text_lines))
-                counter += 1
+
+            while idx < n_lines:
+                ln = raw_lines[idx].strip()
+                std_time = cls._standardize_srt_timestamp_line(ln)
+                if std_time:
+                    idx += 1
+                    text_lines = []
+                    while idx < n_lines:
+                        curr_ln = raw_lines[idx].strip()
+                        if not curr_ln:
+                            break
+                        # اگر بدون خط خالی به تایم‌کد بعدی رسیدیم یا شماره بلوک بعدی قبل از تایم‌کد بود:
+                        if cls._standardize_srt_timestamp_line(curr_ln):
+                            break
+                        if curr_ln.isdigit() and (idx + 1 < n_lines) and cls._standardize_srt_timestamp_line(
+                                raw_lines[idx + 1]):
+                            break
+                        # پاکسازی تگ‌های استایل ASS سرگردان مثل {\an8}
+                        cleaned_txt = re.sub(r"\{\\[^}]*\}", "", curr_ln).strip()
+                        if cleaned_txt:
+                            text_lines.append(cleaned_txt)
+                        idx += 1
+
+                    if text_lines:
+                        clean_blocks.append(f"{counter}\r\n{std_time}\r\n" + "\r\n".join(text_lines))
+                        counter += 1
+                else:
+                    idx += 1
 
             if clean_blocks:
-                content = "\n\n".join(clean_blocks) + "\n"
+                final_str = "\r\n\r\n".join(clean_blocks) + "\r\n"
+            else:
+                final_str = content.replace("\n", "\r\n")
+        else:
+            final_str = content.replace("\n", "\r\n")
 
-        # تبدیل تمام خطوط به استاندارد ویندوز (CRLF: \r\n) و ذخیره با امضای UTF-8-SIG (BOM)
-        windows_content = content.replace("\r\n", "\n").replace("\n", "\r\n")
+        # ذخیره با UTF-8 خالص (بدون BOM) دقیقاً مشابه Save As پیش‌فرض ویندوز تا در موبایل و دسکتاپ بدون خطا باز شود
         with open(sub_path, "wb") as f:
-            f.write(windows_content.encode("utf-8-sig"))
+            f.write(final_str.encode("utf-8"))
 
         return sub_path
+
+    normalize_srt_utf8 = normalize_subtitle_file
 
     # حفظ نام قبلی برای سازگاری با کل پروژه
     normalize_srt_utf8 = normalize_subtitle_file
@@ -179,7 +230,7 @@ class SubtitleService:
         srt_content = "\r\n\r\n".join(deduped_blocks) + "\r\n"
         srt_out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(srt_out_path, "wb") as f:
-            f.write(srt_content.encode("utf-8-sig"))
+            f.write(srt_content.encode("utf-8"))
 
         return srt_out_path
 

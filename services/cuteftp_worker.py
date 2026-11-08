@@ -1,5 +1,6 @@
 from ftplib import FTP, FTP_TLS, error_perm, all_errors
 import logging
+import re
 import socket
 import threading
 import time
@@ -15,6 +16,8 @@ _FTP_SERIAL_LOCK = threading.Lock()
 # سایز بلاک بهینه برای انتقال سریع فایل‌های ویدئویی حجیم روی شبکه (512 کیلوبایت)
 UPLOAD_BLOCK_SIZE = 512 * 1024
 MAX_UPLOAD_RETRIES = 4
+
+_EP_TAG_RE = re.compile(r"[Ss](\d{1,2})[\s._\-]*[Ee][Pp]?(\d{1,3})")
 
 
 def _format_speed_and_eta(uploaded_bytes: int, total_bytes: int, elapsed_sec: float) -> str:
@@ -35,7 +38,6 @@ def _enable_socket_keepalive(sock: socket.socket | None):
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         if hasattr(socket, "SIO_KEEPALIVE_VALS"):
-            # در ویندوز: ارسال پکت Keep-Alive هر ۳۰ ثانیه، در صورت عدم پاسخ هر ۱۰ ثانیه
             sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30000, 10000))
     except Exception:
         pass
@@ -85,9 +87,7 @@ def _normalize_remote_path(remote_dir: str) -> str:
 
 
 def _ensure_ftp_remote_dir(ftp: FTP, remote_dir: str):
-    """
-    ساخت تضمینی و مرحله‌به‌مرحله تمام پوشه‌ها و زیرپوشه‌ها در سرور مقصد با مسیر مطلق (Absolute Path)
-    """
+    """ساخت تضمینی و مرحله‌به‌مرحله تمام پوشه‌ها و زیرپوشه‌ها در سرور مقصد با مسیر مطلق"""
     norm_dir = _normalize_remote_path(remote_dir)
     if norm_dir == "/":
         ftp.cwd("/")
@@ -108,6 +108,71 @@ def _ensure_ftp_remote_dir(ftp: FTP, remote_dir: str):
             ftp.cwd(accum)
 
 
+def _auto_align_filename_with_server_siblings(ftp: FTP, local_file: Path) -> Path:
+    """
+    بررسی فایل‌های موجود در پوشه مقصد روی سرور (دقیقاً قبل از آپلود):
+    اگر قسمت‌های قبلی در همین پوشه روی سرور وجود داشته باشند و فرمول نامشان متفاوت باشد،
+    فرمول نام سرور را کپی کرده، فقط بخش Eyy را به قسمت فعلی تغییر می‌دهد و فایل لوکال را هم تغییر نام می‌دهد.
+    """
+    m_cur = _EP_TAG_RE.search(local_file.name)
+    if not m_cur:
+        return local_file
+
+    cur_ep_num = int(m_cur.group(2))
+    cur_ext = local_file.suffix.lower()
+
+    remote_files: list[str] = []
+    try:
+        for name, facts in ftp.mlsd():
+            if name not in (".", "..") and str(facts.get("type", "")).lower() == "file":
+                remote_files.append(name)
+    except Exception:
+        try:
+            lines: list[str] = []
+            ftp.retrlines("NLST", lines.append)
+            remote_files = [Path(ln.strip()).name for ln in lines if ln.strip() not in (".", "..")]
+        except Exception:
+            return local_file
+
+    video_exts = {".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"}
+    is_vid = cur_ext in video_exts
+
+    siblings = []
+    for rf in remote_files:
+        rf_ext = Path(rf).suffix.lower()
+        if is_vid and rf_ext not in video_exts:
+            continue
+        if not is_vid and rf_ext != cur_ext:
+            continue
+        if _EP_TAG_RE.search(rf):
+            siblings.append(rf)
+
+    if not siblings:
+        return local_file
+
+    template_name = sorted(siblings)[-1]
+    template_stem = Path(template_name).stem
+
+    def _replace_ep(match: re.Match) -> str:
+        s_num = int(match.group(1))
+        return f"S{s_num:02d}E{cur_ep_num:02d}"
+
+    aligned_stem = _EP_TAG_RE.sub(_replace_ep, template_stem, count=1)
+    aligned_name = f"{aligned_stem}{local_file.suffix}"
+
+    if aligned_name != local_file.name:
+        new_local_path = local_file.with_name(aligned_name)
+        try:
+            if not new_local_path.exists():
+                local_file.rename(new_local_path)
+                logging.info(f"✏️ [AUTO-RENAME ON UPLOAD] '{local_file.name}' -> '{aligned_name}'")
+                return new_local_path
+        except Exception as e:
+            logging.warning(f"Could not rename local file before upload: {e}")
+
+    return local_file
+
+
 def _upload_single_file_with_retry(
     ftp_holder: list[FTP | None],
     conn_params: dict,
@@ -115,11 +180,10 @@ def _upload_single_file_with_retry(
     remote_dest_dir: str,
     progress_prefix: str = "",
     progress_callback: Callable[[str], None] | None = None
-):
+) -> Path:
     """
-    آپلود یک فایل منفرد با قابلیت تلاش مجدد خودکار (Auto-Retry) و بازسازی اتصال در صورت قطعی شبکه.
-    اگر سرور از دستور REST (ادامه آپلود از نقطه قطع‌شده) پشتیبانی کند، ادامه فایل را می‌فرستد؛
-    در غیر این صورت فایل را از ابتدا به صورت کامل ارسال می‌کند.
+    آپلود یک فایل منفرد با قابلیت Auto-Retry و تطبیق خودکار نام با سرور.
+    در پایان، مسیر نهایی فایل (که ممکن است هم‌نام با فرمول سرور تغییر نام یافته باشد) را برمی‌گرداند.
     """
     if not local_file.exists() or not local_file.is_file():
         raise FileNotFoundError(f"فایل محلی برای آپلود یافت نشد: {local_file}")
@@ -145,8 +209,11 @@ def _upload_single_file_with_retry(
                     ftp = _create_ftp_connection(**conn_params)
                     ftp_holder[0] = ftp
 
-            # ۲. ورود به پوشه مقصد (و ساخت خودکار آن در صورت عدم وجود)
+            # ۲. ورود به پوشه مقصد در سرور
             _ensure_ftp_remote_dir(ftp, remote_dest_dir)
+
+            # ۲.۵. تطبیق خودکار نام فایل با فرمول قسمت‌های قبلی موجود در همین پوشه روی سرور (تغییر فقط Eyy)
+            local_file = _auto_align_filename_with_server_siblings(ftp, local_file)
 
             # ۳. بررسی امکان Resume در صورتی که تلاش دوم به بعد باشد
             rest_offset = 0
@@ -157,24 +224,21 @@ def _upload_single_file_with_retry(
                     if isinstance(remote_size, int) and 0 < remote_size < total_size:
                         rest_offset = remote_size
                     elif remote_size == total_size:
-                        # فایل در تلاش قبلی به طور کامل آپلود شده است
                         if progress_callback:
                             progress_callback(f"{progress_prefix}100% ({total_mb:.1f} MB)")
-                        return
+                        return local_file
                 except Exception:
                     rest_offset = 0
 
             uploaded = rest_offset
             start_time = time.time()
             last_report_time = 0.0
-            last_noop_time = time.time()
 
             def _on_chunk_sent(chunk: bytes):
-                nonlocal uploaded, last_report_time, last_noop_time
+                nonlocal uploaded, last_report_time
                 uploaded += len(chunk)
                 now = time.time()
 
-                # گزارش زنده پیشرفت به ربات هر ۱.۵ ثانیه
                 if progress_callback and (now - last_report_time >= 1.5):
                     last_report_time = now
                     pct = min(100.0, (uploaded / total_size) * 100.0)
@@ -196,7 +260,6 @@ def _upload_single_file_with_retry(
                         rest=(rest_offset if rest_offset > 0 else None)
                     )
                 except error_perm:
-                    # اگر سرور دستور REST را پشتیبانی نکرد، از اول فایل ارسال کن
                     if rest_offset > 0:
                         f.seek(0)
                         uploaded = 0
@@ -211,7 +274,9 @@ def _upload_single_file_with_retry(
 
             if progress_callback:
                 progress_callback(f"{progress_prefix}100% ({total_mb:.1f} MB) - تکمیل شد")
-            return
+
+            # برگرداندن مسیر فایل (با نام جدید در صورت تغییر نام خودکار)
+            return local_file
 
         except all_errors as e:
             last_error = e
@@ -235,12 +300,10 @@ def _upload_single_file_with_retry(
 
 
 def get_current_cuteftp_remote_dir() -> str:
-    """خواندن مسیر پیش‌فرض سرور از config.yaml بدون نیاز به رابط گرافیکی"""
     return str(cfg.get("cuteftp", "remote_base_dir", "/English/Movies")).strip() or "/English/Movies"
 
 
 def extract_credentials_from_open_cuteftp() -> dict[str, str]:
-    """خواندن مستقیم اطلاعات اتصال از config.yaml (برای سازگاری با سایر ماژول‌ها)"""
     ftp_cfg = cfg.get("cuteftp") or {}
     return {
         "site_profile": str(ftp_cfg.get("site_profile", "dl15")),
@@ -252,17 +315,71 @@ def extract_credentials_from_open_cuteftp() -> dict[str, str]:
     }
 
 
+def list_ftp_dir_entries(remote_dir: str) -> dict[str, list[str]]:
+    """اتصال به سرور FTP و دریافت لیست فایل‌ها و زیرپوشه‌های موجود در مسیر remote_dir"""
+    result = {"files": [], "dirs": [], "exists": False}
+    ftp_cfg = cfg.get("cuteftp") or {}
+    protocol = str(ftp_cfg.get("protocol", "FTP")).strip().upper()
+    host = str(ftp_cfg.get("host", "")).strip()
+    port = int(ftp_cfg.get("port", 21) or 21)
+    username = str(ftp_cfg.get("username", "")).strip()
+    password = str(ftp_cfg.get("password", "")).strip()
+
+    if not host or not username or not password or password == "ftppassword":
+        return result
+
+    norm_dir = _normalize_remote_path(remote_dir)
+    ftp = None
+    try:
+        ftp = _create_ftp_connection(
+            host=host, port=port, username=username, password=password, protocol=protocol, timeout=30
+        )
+        try:
+            ftp.cwd(norm_dir)
+            result["exists"] = True
+        except Exception:
+            return result
+
+        try:
+            for name, facts in ftp.mlsd():
+                if name in (".", ".."):
+                    continue
+                ftype = str(facts.get("type", "")).lower()
+                if ftype == "dir":
+                    result["dirs"].append(name)
+                elif ftype == "file":
+                    result["files"].append(name)
+            return result
+        except Exception:
+            pass
+
+        lines: list[str] = []
+        ftp.retrlines("LIST", lines.append)
+        for line in lines:
+            parts = line.split(None, 8)
+            if len(parts) < 9:
+                continue
+            name = parts[8].strip()
+            if name in (".", ".."):
+                continue
+            if line.startswith("d") or "<DIR>" in line.upper():
+                result["dirs"].append(name)
+            else:
+                result["files"].append(name)
+
+        return result
+    except Exception as e:
+        logging.warning(f"FTP inspect warning for {norm_dir}: {e}")
+        return result
+    finally:
+        _close_ftp_quietly(ftp)
+
+
 def sync_upload_cuteftp(
     local_target: Path,
     remote_subpath: str = "__CURRENT__",
     progress_callback: Callable[[str], None] | None = None
 ) -> list[str]:
-    """
-    موتور اصلی آپلود مستقیم به سرور از طریق مشخصات config.yaml (بدون هیچ‌گونه نیاز به GUI):
-    - با قفل انحصاری (_FTP_SERIAL_LOCK) تضمین می‌کند که در هر لحظه فقط یک آیتم آپلود شود.
-    - اگر local_target یک پوشه باشد، کل درخت پوشه و تمام فایل‌های داخل آن را به ترتیب در مسیر مقصد آپلود می‌کند.
-    - در پایان، لیست دقیق لینک‌های دانلود مستقیم تمام فایل‌های آپلودشده را برمی‌گرداند.
-    """
     local_target = Path(local_target).resolve()
     if not local_target.exists():
         raise FileNotFoundError(f"فایل یا پوشه مورد نظر برای آپلود وجود ندارد: {local_target}")
@@ -278,7 +395,7 @@ def sync_upload_cuteftp(
         if not host or not username or not password or password == "ftppassword":
             raise RuntimeError(
                 "مشخصات اتصال FTP (فیلدهای host، username یا password) در config.yaml تنظیم نشده است!\n"
-                "لطفاً دستور /settings را در ربات بزنید، وارد بخش «☁️ مشخصات سرور دانلود و CuteFTP» شوید و رمز عبور سرور را ثبت کنید."
+                "لطفاً دستور /settings را در ربات بزنید و رمز عبور سرور را ثبت کنید."
             )
 
         base_url = str(ftp_cfg.get("base_download_url", "https://dl15.cdnzed.sbs")).rstrip("/")
@@ -316,7 +433,8 @@ def sync_upload_cuteftp(
         try:
             if local_target.is_file():
                 logging.info(f"☁️ [FTP UPLOAD START] File: {local_target.name} -> {target_remote_dir}")
-                _upload_single_file_with_retry(
+                # دریافت مسیر نهایی فایل (در صورتی که هنگام آپلود هم‌فرمول با سرور تغییر نام یافته باشد)
+                local_target = _upload_single_file_with_retry(
                     ftp_holder=ftp_holder,
                     conn_params=conn_params,
                     local_file=local_target,
@@ -328,7 +446,6 @@ def sync_upload_cuteftp(
                 logging.info(f"✅ [FTP UPLOAD DONE] File: {local_target.name}")
 
             else:
-                # آپلود کامل یک پوشه به همراه تمام زیرپوشه‌ها به ترتیب الفبا و شماره قسمت
                 last_remote_part = target_remote_dir.rstrip("/").split("/")[-1]
                 if last_remote_part.lower() == local_target.name.lower():
                     folder_remote_root = target_remote_dir
@@ -364,7 +481,8 @@ def sync_upload_cuteftp(
                     )
                     prefix_str = f"[{idx}/{total_files}] {file_p.name[:22]}: "
 
-                    _upload_single_file_with_retry(
+                    # دریافت مسیر نهایی هر فایل پس از تطبیق نام با سرور
+                    file_p = _upload_single_file_with_retry(
                         ftp_holder=ftp_holder,
                         conn_params=conn_params,
                         local_file=file_p,
@@ -380,67 +498,3 @@ def sync_upload_cuteftp(
 
         finally:
             _close_ftp_quietly(ftp_holder[0])
-
-def list_ftp_dir_entries(remote_dir: str) -> dict[str, list[str]]:
-    """
-    اتصال به سرور FTP و دریافت لیست فایل‌ها و زیرپوشه‌های موجود در مسیر remote_dir.
-    خروجی: {"files": [...], "dirs": [...], "exists": True/False}
-    """
-    result = {"files": [], "dirs": [], "exists": False}
-    ftp_cfg = cfg.get("cuteftp") or {}
-    protocol = str(ftp_cfg.get("protocol", "FTP")).strip().upper()
-    host = str(ftp_cfg.get("host", "")).strip()
-    port = int(ftp_cfg.get("port", 21) or 21)
-    username = str(ftp_cfg.get("username", "")).strip()
-    password = str(ftp_cfg.get("password", "")).strip()
-
-    if not host or not username or not password or password == "ftppassword":
-        return result
-
-    norm_dir = _normalize_remote_path(remote_dir)
-    ftp = None
-    try:
-        ftp = _create_ftp_connection(
-            host=host, port=port, username=username, password=password, protocol=protocol, timeout=30
-        )
-        try:
-            ftp.cwd(norm_dir)
-            result["exists"] = True
-        except Exception:
-            return result
-
-        # ۱. تلاش با دستور استاندارد MLSD
-        try:
-            for name, facts in ftp.mlsd():
-                if name in (".", ".."):
-                    continue
-                ftype = str(facts.get("type", "")).lower()
-                if ftype == "dir":
-                    result["dirs"].append(name)
-                elif ftype == "file":
-                    result["files"].append(name)
-            return result
-        except Exception:
-            pass
-
-        # ۲. فال‌بک به دستور LIST در صورتی که سرور MLSD را پشتیبانی نکند
-        lines: list[str] = []
-        ftp.retrlines("LIST", lines.append)
-        for line in lines:
-            parts = line.split(None, 8)
-            if len(parts) < 9:
-                continue
-            name = parts[8].strip()
-            if name in (".", ".."):
-                continue
-            if line.startswith("d") or "<DIR>" in line.upper():
-                result["dirs"].append(name)
-            else:
-                result["files"].append(name)
-
-        return result
-    except Exception as e:
-        logging.warning(f"FTP inspect warning for {norm_dir}: {e}")
-        return result
-    finally:
-        _close_ftp_quietly(ftp)

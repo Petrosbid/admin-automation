@@ -3,6 +3,7 @@ import html
 import inspect
 import logging
 import re
+import sys
 import time
 import traceback
 import uuid
@@ -16,14 +17,15 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.config_loader import cfg
 
-# کش موقت مسیرها برای دکمه‌های شیشه‌ای نوتیفیکیشن‌ها (جلوگیری از محدودیت ۶۴ بایت callback_data در تلگرام)
-NOTIF_PATH_REGISTRY: dict[str, str] = {}
+# کش موقت مسیرها برای دکمه‌های شیشه‌ای نوتیفیکیشن‌ها (حفظ در برابر Hot-Reload)
+NOTIF_PATH_REGISTRY: dict[str, str] = getattr(
+    sys.modules.get(__name__), "NOTIF_PATH_REGISTRY", {}
+)
 
 
 def register_notif_path(path_obj: Path | str) -> str:
     token = uuid.uuid4().hex[:8]
     NOTIF_PATH_REGISTRY[token] = str(Path(path_obj).resolve())
-    # نگه داشتن حداکثر ۵۰۰ مسیر اخیر در حافظه
     if len(NOTIF_PATH_REGISTRY) > 500:
         oldest_key = next(iter(NOTIF_PATH_REGISTRY))
         NOTIF_PATH_REGISTRY.pop(oldest_key, None)
@@ -82,16 +84,32 @@ class QueueManager:
         self._bot: Bot | None = None
         self._known_chats: set[int] = set()
 
+    def _ensure_internal_structures(self):
+        """تضمین وجود ساختارهای داخلی در صورت ارتقای کلاس هنگام Hot-Reload"""
+        if not hasattr(self, "_worker_meta") or self._worker_meta is None:
+            self._worker_meta = {}
+        if not hasattr(self, "_known_chats") or self._known_chats is None:
+            self._known_chats = set()
+        for q in self.QUEUE_TYPES:
+            if q not in self.pending_lists:
+                self.pending_lists[q] = []
+            if q not in self._events:
+                self._events[q] = asyncio.Event()
+            if q not in self._locks:
+                self._locks[q] = asyncio.Lock()
+
     def set_bot(self, bot: Bot):
         self._bot = bot
 
     def register_chat(self, chat_id: int):
+        self._ensure_internal_structures()
         if chat_id:
             self._known_chats.add(int(chat_id))
 
     def _get_target_chat_ids(self) -> list[int]:
+        self._ensure_internal_structures()
         raw_admins = cfg.get("telegram", "admin_ids", [])
-        chat_ids: set[int] = set(getattr(self, "_known_chats", set()))
+        chat_ids: set[int] = set(self._known_chats)
 
         if isinstance(raw_admins, (int, str)):
             try:
@@ -116,8 +134,12 @@ class QueueManager:
         priority_top: bool = False,
         **kwargs
     ) -> QueueTask:
+        self._ensure_internal_structures()
         if queue_type not in self.QUEUE_TYPES:
             queue_type = "download"
+
+        # تضمین زنده بودن ورکرها قبل از افزودن تسک
+        self.start_workers()
 
         task_id = str(uuid.uuid4())[:6]
         task = QueueTask(
@@ -152,12 +174,15 @@ class QueueManager:
         if direction == "top" and idx > 0:
             p_list.pop(idx)
             p_list.insert(0, task_id)
+            self._events[task.queue_type].set()
             return True
         elif direction == "up" and idx > 0:
             p_list[idx - 1], p_list[idx] = p_list[idx], p_list[idx - 1]
+            self._events[task.queue_type].set()
             return True
         elif direction == "down" and idx < len(p_list) - 1:
             p_list[idx + 1], p_list[idx] = p_list[idx], p_list[idx + 1]
+            self._events[task.queue_type].set()
             return True
         return False
 
@@ -170,16 +195,39 @@ class QueueManager:
             return 0, len(p_list)
         return p_list.index(task_id) + 1, len(p_list)
 
+    def _rebuild_orphaned_pending_lists(self):
+        """
+        اگر به هر دلیلی تسکی وضعیت «در انتظار» دارد اما آیدی آن در pending_lists جا افتاده است،
+        آن را خودکار به لیست نوبت برمی‌گرداند تا هرگز تسکی در حالت انتظار قفل نشود.
+        """
+        for tid, t in list(self.tasks.items()):
+            if not t.is_finished and not t.is_cancelled and "انتظار" in str(t.status):
+                q_type = t.queue_type if t.queue_type in self.QUEUE_TYPES else "download"
+                if tid not in self.pending_lists[q_type]:
+                    self.pending_lists[q_type].append(tid)
+                    self._events[q_type].set()
+
     async def _pop_next_pending(self, queue_type: str) -> QueueTask | None:
         while True:
+            self._ensure_internal_structures()
             async with self._locks[queue_type]:
                 while self.pending_lists[queue_type]:
                     tid = self.pending_lists[queue_type].pop(0)
                     t = self.tasks.get(tid)
-                    if t and not t.is_cancelled and not t.is_finished:
+                    if t and not t.is_cancelled and not t.is_finished and t.running_asyncio_task is None:
+                        # اگر هنوز تسک دیگری در لیست هست، Event را روشن نگه دار تا ورکر موازی بعدی هم بلافاصله بردارد
+                        if self.pending_lists[queue_type]:
+                            self._events[queue_type].set()
+                        else:
+                            self._events[queue_type].clear()
                         return t
                 self._events[queue_type].clear()
-            await self._events[queue_type].wait()
+
+            # به جای خوابیدن ابدی، هر ۱.۵ ثانیه بیدار شو و لیست انتظار را چک کن (ضد قفل شدن پس از Hot-Reload)
+            try:
+                await asyncio.wait_for(self._events[queue_type].wait(), timeout=1.5)
+            except asyncio.TimeoutError:
+                self._rebuild_orphaned_pending_lists()
 
     @staticmethod
     def _build_notification_kb(
@@ -187,14 +235,6 @@ class QueueManager:
         target_file: Path | None = None,
         target_dir: Path | None = None
     ) -> InlineKeyboardMarkup:
-        """
-        ساخت دکمه‌های عملیاتی هوشمند زیر هر نوتیفیکیشن:
-        - 📂 رفتن به پوشه در فایل‌منیجر
-        - 🚀 اجرای اتوماسیون روی این پوشه (مخصوص بعد از دانلود)
-        - ☁️ آپلود سریع به سرور (مخصوص بعد از سافت‌ساب/هاردساب دستی)
-        - 📊 مشاهده صف
-        - 🗑 حذف این پیام از تلگرام (برای جلوگیری از شلوغی چت)
-        """
         builder = InlineKeyboardBuilder()
 
         folder_to_open = target_dir
@@ -210,7 +250,6 @@ class QueueManager:
                 )
             )
             if queue_type == "download":
-                # اگر پوشه فصل سریال است یا زیرپوشه کیفیت، پوشه فصل را برای اتوماسیون هدف بگیر
                 auto_dir = folder_to_open.parent if re.match(r"^[Ss]\d{1,2}$", folder_to_open.parent.name) else folder_to_open
                 auto_token = register_notif_path(auto_dir)
                 builder.row(
@@ -282,7 +321,6 @@ class QueueManager:
         safe_id = html.escape(str(task.task_id))
         elapsed = task.elapsed_str
 
-        # استخراج مسیر فایل یا پوشه محلی از آرگومان‌های تسک برای دکمه «رفتن به پوشه»
         local_ref_path: Path | None = None
         for arg in task.args:
             if isinstance(arg, Path) and arg.exists():
@@ -290,7 +328,6 @@ class QueueManager:
             elif isinstance(arg, list) and arg and isinstance(arg[0], Path) and arg[0].exists():
                 local_ref_path = arg[0]
 
-        # ۱. نوتیفیکیشن آپلود
         if task.queue_type == "upload":
             target_dir = local_ref_path.parent if (local_ref_path and local_ref_path.is_file()) else local_ref_path
             kb = self._build_notification_kb("upload", target_file=local_ref_path, target_dir=target_dir)
@@ -315,7 +352,6 @@ class QueueManager:
                 )
             return
 
-        # ۲. نوتیفیکیشن دانلود، سافت‌ساب و هاردساب/انکود
         out_path: Path | None = None
         if isinstance(res, Path):
             out_path = res
@@ -458,36 +494,43 @@ class QueueManager:
                 task.running_asyncio_task = None
 
     async def _worker_supervisor(self, queue_type: str, worker_idx: int):
-        """اگر حلقه Worker به هر دلیل غیرمنتظره متوقف شد، آن را خودکار بالا می‌آورد."""
         while True:
             try:
                 await self._worker_loop(queue_type, worker_idx)
-                logging.error("Worker %s/%s exited unexpectedly; restarting.", queue_type, worker_idx)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logging.exception("Worker %s/%s crashed; restarting in 2 seconds.", queue_type, worker_idx)
-            await asyncio.sleep(2)
+                logging.exception("Worker %s/%s crashed; restarting in 1 second.", queue_type, worker_idx)
+                await asyncio.sleep(1)
 
     def start_workers(self):
-        # Workerهای مرده را حذف کن؛ وجود یک Task قدیمی نباید مانع ساخت Worker جایگزین شود.
-        self._workers = [w for w in self._workers if not w.done()]
-        if not hasattr(self, "_worker_meta"):
-            self._worker_meta = {}
-
-        # پس از reload، Workerهای قدیمی ممکن است هنوز فعال باشند اما metadata جدید ندارند.
-        # تا زمان پایان آن‌ها Worker موازی اضافه نکن؛ وگرنه ظرفیت پردازش ناخواسته دوبرابر می‌شود.
-        untracked_live = [w for w in self._workers if w not in self._worker_meta and not w.done()]
-        if untracked_live:
-            logging.info("Preserving %d active pre-reload workers; skipping duplicate startup.", len(untracked_live))
+        """استارت تضمینی ورکرهای هر ۴ صف و بیدار کردن فوری تسک‌های در انتظار"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
             return
 
+        self._ensure_internal_structures()
+        self._workers = [w for w in self._workers if not w.done()]
+        self._worker_meta = {w: meta for w, meta in self._worker_meta.items() if not w.done()}
+
+        # اگر از قبلِ Hot-Reload ورکری بدون متادیتا مانده و هیچ تسکی در حال اجرا نیست، آن را پاک کن تا ورکر تمیز ساخته شود
+        untracked = [w for w in self._workers if w not in self._worker_meta]
+        any_running = any(
+            t.running_asyncio_task is not None and not t.running_asyncio_task.done()
+            for t in self.tasks.values()
+        )
+        if untracked and not any_running:
+            for w in untracked:
+                w.cancel()
+            self._workers = [w for w in self._workers if w in self._worker_meta]
+
         conc = cfg.get("concurrency") or {}
+
         def _count(key: str, default: int) -> int:
             try:
                 return max(1, int(conc.get(key, default)))
             except (TypeError, ValueError):
-                logging.warning("Invalid concurrency.%s; using %s", key, default)
                 return default
 
         counts = {
@@ -496,15 +539,26 @@ class QueueManager:
             "download": _count("download_workers", 1),
             "upload": _count("upload_workers", 1),
         }
+
         for q_type, num in counts.items():
-            active = sum(1 for w in self._workers if self._worker_meta.get(w, (None, None))[0] == q_type)
+            active = sum(
+                1 for w in self._workers
+                if self._worker_meta.get(w, (None, None))[0] == q_type and not w.done()
+            )
             for idx in range(active + 1, num + 1):
-                worker = asyncio.create_task(self._worker_supervisor(q_type, idx))
+                worker = loop.create_task(self._worker_supervisor(q_type, idx))
                 self._workers.append(worker)
                 self._worker_meta[worker] = (q_type, idx)
-                logging.info("Started queue worker %s/%s", q_type, idx)
+                logging.info("🚀 Started queue worker %s/%s", q_type, idx)
+
+        # بیدار کردن فوری تمام صف‌هایی که تسک منتظر دارند
+        self._rebuild_orphaned_pending_lists()
+        for q_type in self.QUEUE_TYPES:
+            if self.pending_lists.get(q_type):
+                self._events[q_type].set()
 
     def restart_workers_for_hot_reload(self):
+        self._ensure_internal_structures()
         any_running = any(
             t.running_asyncio_task is not None and not t.running_asyncio_task.done()
             for t in self.tasks.values()
@@ -514,13 +568,14 @@ class QueueManager:
                 if not worker.done():
                     worker.cancel()
             self._workers.clear()
-            if hasattr(self, "_worker_meta"):
-                self._worker_meta.clear()
-            logging.info("Queue workers will be restarted with updated code.")
-        # حتی اگر تعدادی Worker باقی مانده باشند، Workerهای مفقود نیز ساخته می‌شوند.
+            self._worker_meta.clear()
+            logging.info("🔄 Queue workers restarted cleanly with updated code.")
+
         self.start_workers()
 
     def get_queue_summary(self) -> list[QueueTask]:
+        # هر بار که کاربر صفحه صف را باز می‌کند، از زنده بودن ورکرها و بیدار بودن صف‌ها مطمئن شو
+        self.start_workers()
         return list(self.tasks.values())
 
     def cancel_task(self, task_id: str) -> bool:
@@ -555,4 +610,14 @@ class QueueManager:
         return len(to_del)
 
 
-queue_engine = QueueManager()
+# حفظ تک‌نمونه (Singleton) هنگام Hot-Reload:
+# اگر از قبل queue_engine در حافظه وجود دارد، همان شیء قبلی را نگه دار و فقط کلاسش را به کلاس جدید ارتقا بده!
+_prev_mod = sys.modules.get(__name__)
+_existing_engine = getattr(_prev_mod, "queue_engine", None) if _prev_mod else None
+
+if _existing_engine is not None:
+    _existing_engine.__class__ = QueueManager
+    _existing_engine._ensure_internal_structures()
+    queue_engine = _existing_engine
+else:
+    queue_engine = QueueManager()

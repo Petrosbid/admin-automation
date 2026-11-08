@@ -36,7 +36,7 @@ class AutomationPlan:
     category: str             # 'Series' | 'Anime' | 'Movies'
     base_dir: Path
     series_title: str = ""
-    season_ep_tag: str = ""   # مثلا S02E01
+    season_ep_tag: str = ""   # مثلا S03E01
     source_type: str = "WEB-DL"
     fa_sub_dest_dir: Path = None
     en_sub_dest_dir: Path = None
@@ -50,11 +50,12 @@ class AutomationPlan:
 
 
 class AutomationService:
-    EPISODE_REGEX = re.compile(r"[Ss](\d{1,2})[\s._\-]*[Ee](\d{1,3})")
-    SEASON_DIR_REGEX = re.compile(r"^[Ss](\d{1,2})$")
+    EPISODE_REGEX = re.compile(r"[Ss](\d{1,2})[\s._\-]*[Ee][Pp]?(\d{1,3})")
+    ALT_SXE_REGEX = re.compile(r"\b(\d{1,2})[xX](\d{1,2})\b")
+    SEASON_DIR_REGEX = re.compile(r"^[Ss](?:eason[\s._\-]*)?(\d{1,2})$", re.IGNORECASE)
     ROOT_CATEGORIES = ("Movies", "Series", "Anime")
+    VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"}
 
-    # پوشه‌بندی پیش‌فرض فصل برای سریال‌ها (Series)
     DEFAULT_SERIES_QUALITY_DIRS = (
         "1080p-EBTV",
         "720p-EBTV",
@@ -63,10 +64,8 @@ class AutomationService:
         "1080p-Pahe",
         "720p-Pahe",
         "480p-RMTeam",
-        "FullHD"
     )
 
-    # پوشه‌بندی پیش‌فرض اختصاصی برای انیمه‌ها (Anime) طبق دستور شما
     DEFAULT_ANIME_QUALITY_DIRS = (
         "1080p-EBTV",
         "720p-EBTV",
@@ -74,7 +73,6 @@ class AutomationService:
         "FullHD",
         "1080p-x265-Judas",
     )
-
 
     @classmethod
     def ensure_workspace_root_categories(cls) -> dict[str, Path]:
@@ -125,22 +123,64 @@ class AutomationService:
         return "/English/" + "/".join(parts)
 
     @classmethod
-    def extract_episode_tag(cls, text: str) -> str | None:
-        match = cls.EPISODE_REGEX.search(text)
-        if not match:
+    def extract_season_num_from_dir(cls, folder: Path | None) -> int | None:
+        if not folder:
             return None
-        s_num = int(match.group(1))
-        e_num = int(match.group(2))
-        return f"S{s_num:02d}E{e_num:02d}"
+        for p in (folder, folder.parent, folder.parent.parent if folder.parent else None):
+            if p and p.name:
+                m = cls.SEASON_DIR_REGEX.match(p.name.strip())
+                if m:
+                    return int(m.group(1))
+        return None
+
+    @classmethod
+    def extract_episode_tag(cls, text: str, fallback_season: int | None = None) -> str | None:
+        """
+        استخراج هوشمند تگ SxxEyy:
+        ۱. فرمت استاندارد S03E01 یا s03.e01
+        ۲. فرمت 3x01
+        ۳. اگر fallback_season مشخص باشد (مثلاً داخل پوشه S03 باشیم) و در نام فایل فقط E01 یا EP01 یا - 01 باشد، S03E01 می‌سازد.
+        """
+        match = cls.EPISODE_REGEX.search(text)
+        if match:
+            s_num = int(match.group(1))
+            e_num = int(match.group(2))
+            return f"S{s_num:02d}E{e_num:02d}"
+
+        match_alt = cls.ALT_SXE_REGEX.search(text)
+        if match_alt:
+            s_num = int(match_alt.group(1))
+            e_num = int(match_alt.group(2))
+            return f"S{s_num:02d}E{e_num:02d}"
+
+        if fallback_season is not None:
+            ep_only = cls.extract_episode_number_only(text)
+            if ep_only is not None:
+                return f"S{fallback_season:02d}E{ep_only:02d}"
+
+        return None
 
     @classmethod
     def extract_episode_number_only(cls, text: str) -> int | None:
-        ep_tag = cls.extract_episode_tag(text)
-        if ep_tag:
-            return int(ep_tag.split("E")[1])
-        m = re.search(r"(?:[Ee]p(?:isode)?|[\s._\-\[])E?(\d{1,3})(?:[\s._\-\]]|$)", text)
+        match = cls.EPISODE_REGEX.search(text)
+        if match:
+            return int(match.group(2))
+        match_alt = cls.ALT_SXE_REGEX.search(text)
+        if match_alt:
+            return int(match_alt.group(2))
+
+        # حذف رزولوشن‌ها و کدک‌ها قبل از جستجوی شماره قسمت تکی (برای جلوگیری از اشتباه گرفتن 1080 یا 265)
+        cleaned = re.sub(
+            r"\b(?:2160p|1080p|720p|480p|360p|x264|x265|h264|h265|10bit|8bit|6ch|2ch|ddp5|aac2)\b",
+            "",
+            text,
+            flags=re.IGNORECASE
+        )
+        m = re.search(r"(?:[Ee][Pp]?(?:isode)?[\s._\-]*|\s-\s|[\s._\-\[]E)(\d{1,3})(?:v\d)?(?:[\s._\-\]\[]|$)", cleaned)
         if m:
-            return int(m.group(1))
+            val = int(m.group(1))
+            if 0 <= val <= 999:
+                return val
         return None
 
     @staticmethod
@@ -163,8 +203,44 @@ class AutomationService:
         return cleaned or "Media"
 
     @classmethod
+    def _find_raw_videos_in_dir(cls, directory: Path, recursive: bool = True) -> list[Path]:
+        """
+        پیدا کردن مستقیم تمام فایل‌های ویدئویی خام در یک پوشه کیفیت:
+        - فایل‌هایی که تگ .EBTV دارند را به درستی می‌پذیرد.
+        - فقط فایل‌های موقت (_temp_) و فایل‌هایی که قبلاً SoftSub یا HardSub شده‌اند را رد می‌کند.
+        """
+        if not directory or not directory.exists():
+            return []
+
+        iterator = directory.rglob("*") if recursive else directory.iterdir()
+        videos: list[Path] = []
+
+        for f in iterator:
+            try:
+                if not f.is_file():
+                    continue
+            except Exception:
+                continue
+
+            if f.suffix.lower() not in cls.VIDEO_EXTS:
+                continue
+            low_name = f.name.lower()
+            if low_name.startswith(("_", ".")):
+                continue
+            if ".softsub." in low_name or ".hardsub." in low_name:
+                continue
+            # اگر در حالت recursive زیرپوشه‌ای از نوع SoftSub یا HardSub بود رد کن
+            if recursive and f.parent != directory:
+                parent_low = f.parent.name.lower()
+                if parent_low in ("softsub", "hardsub", "srt", "sub") or parent_low.endswith(("-softsub", "-hardsub")):
+                    continue
+
+            videos.append(f.resolve())
+
+        return sorted(videos, key=lambda x: x.name.lower())
+
+    @classmethod
     async def detect_audio_channels_tag(cls, video_path: Path) -> str:
-        """تشخیص خودکار 6CH یا 2CH بودن صدا از روی مشخصات ترک صوتی فایل یا نام فایل"""
         name_up = video_path.name.upper()
         if any(k in name_up for k in ("6CH", "5.1", "DDP5.1", "DD5.1", "AAC5.1", "7.1", "8CH")):
             return "6CH"
@@ -185,7 +261,6 @@ class AutomationService:
 
     @staticmethod
     def detect_encoder_and_network(filename: str) -> tuple[str, str]:
-        """استخراج نام شبکه (مثل AMZN, NF, ATVP) و نام گروه ریلیز/انکودر برای FullHD"""
         net = "AMZN"
         for cand_net in ("AMZN", "NF", "ATVP", "DSNP", "HMAX", "MAX", "PCOK", "HULU", "PMTP", "STAN", "CRAV", "BBC", "ITV"):
             if re.search(rf"\b{cand_net}\b", filename, flags=re.IGNORECASE):
@@ -215,17 +290,9 @@ class AutomationService:
         season_ep_tag: str | None = None,
         is_series: bool = True
     ) -> str:
-        """
-        تولید نام استاندارد دقیق برای فایل‌های دانلود شده بر اساس پوشه‌ای که در آن قرار دارند:
-        - 1080p-x265-PSA: {name}.SxxEyy.1080p.10bit.WEB-DL.6CH(or 2CH).x265.PSA.EBTV.mkv
-        - 720p-x265-PSA:  {name}.SxxEyy.720p.10bit.WEB-DL.2CH.x265.PSA.EBTV.mkv
-        - 480p-RMTeam:    {name}.SxxEyy.480p.WEB-DL.RMTeam.EBTV.mkv
-        - FullHD:         {name}.SxxEyy.1080p.AMZN.WEB-DL.FullHD.{encode name}.EBTV.mkv
-        - 1080p-EBTV:     {name}.SxxEyy.1080p.WEB-DL.6CH.EBTV.mp4
-        - 720p-EBTV:      {name}.SxxEyy.720p.WEB-DL.EBTV.mp4
-        """
         clean_name = cls.format_clean_title(series_or_movie_title)
-        ep_tag = season_ep_tag or cls.extract_episode_tag(video_path.name) or ""
+        fallback_s = cls.extract_season_num_from_dir(video_path.parent)
+        ep_tag = season_ep_tag or cls.extract_episode_tag(video_path.name, fallback_season=fallback_s) or ""
         src_type = cls.detect_source_type(video_path.name)
         ch_tag = await cls.detect_audio_channels_tag(video_path)
         f_low = folder_name.lower()
@@ -254,12 +321,10 @@ class AutomationService:
             if "480p-ebtv" in f_low:
                 return f"{clean_name}.{ep_tag}.480p.{src_type}.EBTV.mp4"
 
-            # سایر پوشه‌های سفارشی (مثلاً 1080p-Pahe، 720p-Pahe، 2160p-x265-PSA و...)
             custom_parts = [p for p in folder_name.split("-") if p]
             custom_tag = ".".join(custom_parts)
             return f"{clean_name}.{ep_tag}.{src_type}.{custom_tag}.EBTV{orig_ext}"
 
-        # استاندارد نام‌گذاری برای فیلم‌های سینمایی (Movies)
         year_match = re.search(r"\b((?:19|20)\d{2})\b", video_path.name) or re.search(r"\b((?:19|20)\d{2})\b", series_or_movie_title)
         year_str = f".{year_match.group(1)}" if year_match else ""
         res_match = re.search(r"\b(2160p|1080p|720p|480p)\b", video_path.name, flags=re.IGNORECASE)
@@ -281,10 +346,6 @@ class AutomationService:
         server_filenames: list[str],
         new_ep_tag: str
     ) -> str | None:
-        """
-        کپی کردن دقیق نام فایل از قسمت‌های قبلی موجود در همان پوشه در سرور اصلی
-        و جایگزینی فقط بخش Eyy (یا SxxEyy) با قسمت جدید!
-        """
         if not server_filenames or not new_ep_tag:
             return None
 
@@ -296,17 +357,14 @@ class AutomationService:
         if not valid_siblings:
             return None
 
-        # انتخاب آخرین قسمت موجود در سرور به عنوان الگو
         template_name = sorted(valid_siblings)[-1]
-        new_e_only = new_ep_tag.split("E")[1]  # مثلا '05'
+        new_e_only = new_ep_tag.split("E")[1]
 
         def _replacer(match: re.Match) -> str:
-            # حفظ فصل و تغییر فقط شماره قسمت Eyy
             s_part = match.group(1)
             return f"S{int(s_part):02d}E{new_e_only}"
 
-        new_filename = cls.EPISODE_REGEX.sub(_replacer, template_name, count=1)
-        return new_filename
+        return cls.EPISODE_REGEX.sub(_replacer, template_name, count=1)
 
     @classmethod
     def build_standard_subtitle_filename(
@@ -335,8 +393,8 @@ class AutomationService:
     ) -> str:
         clean_name = cls.format_clean_title(series_or_movie_title)
         if season_ep_tag:
-            return f"{clean_name}.{season_ep_tag}.{quality_tag}.{source_type}.HardSub.EBTV.mp4"
-        return f"{clean_name}.{quality_tag}.{source_type}.HardSub.EBTV.mp4"
+            return f"{clean_name}.{season_ep_tag}.{source_type}.{quality_tag}.HardSub.EBTV.mp4"
+        return f"{clean_name}.{source_type}.{quality_tag}.HardSub.EBTV.mp4"
 
     @classmethod
     def build_encode_ass_filename(
@@ -346,16 +404,11 @@ class AutomationService:
         quality_tag: str,
         source_type: str = "WEB-DL"
     ) -> str:
-        """
-        فرمت استاندارد انکود با movie.ass:
-        - 1080p-EBTV: {name}.SxxEyy.1080p.WEB-DL.6CH.EBTV.mp4
-        - 720p-EBTV:  {name}.SxxEyy.720p.WEB-DL.EBTV.mp4
-        """
         clean_name = cls.format_clean_title(series_or_movie_title)
         ch_part = ".6CH" if quality_tag == "1080p" else ""
         if season_ep_tag:
-            return f"{clean_name}.{season_ep_tag}.{quality_tag}.{source_type}{ch_part}.EBTV.mp4"
-        return f"{clean_name}.{quality_tag}.{source_type}{ch_part}.EBTV.mp4"
+            return f"{clean_name}.{season_ep_tag}.{source_type}.{quality_tag}{ch_part}.EBTV.mp4"
+        return f"{clean_name}.{source_type}.{quality_tag}{ch_part}.EBTV.mp4"
 
     @staticmethod
     def clean_stem_for_ebtv(stem: str, target_res: str | None = None) -> str:
@@ -387,7 +440,6 @@ class AutomationService:
 
     @classmethod
     def create_movie_structure(cls, movie_folder: Path) -> dict[str, Path]:
-        """برای فیلم‌ها در ابتدا فقط پوشه اصلی و پوشه srt ساخته می‌شود؛ SoftSub و Hardsub موقع ساخت ایجاد می‌شوند"""
         movie_folder.mkdir(parents=True, exist_ok=True)
         srt_dir = movie_folder / "srt"
         srt_dir.mkdir(parents=True, exist_ok=True)
@@ -400,18 +452,6 @@ class AutomationService:
 
     @classmethod
     def create_series_season_structure(cls, season_folder: Path) -> dict[str, Path]:
-        """
-        پوشه‌بندی پیش‌فرض جدید برای هر فصل سریال:
-        1080p-EBTV
-        720p-EBTV
-        1080p-x265-PSA
-        720p-x265-PSA
-        480p-RMTeam
-        srt/
-           FA
-           EN
-        (پوشه‌های هاردساب و سافت‌ساب متناسب با هر کیفیت فقط در زمان ساخت آن‌ها ایجاد می‌شوند)
-        """
         season_folder.mkdir(parents=True, exist_ok=True)
         for q_dir in cls.DEFAULT_SERIES_QUALITY_DIRS:
             (season_folder / q_dir).mkdir(parents=True, exist_ok=True)
@@ -426,6 +466,22 @@ class AutomationService:
             "srt": season_folder / "srt",
             "srt_fa": srt_fa,
             "srt_en": srt_en,
+        }
+
+    @classmethod
+    def create_anime_season_structure(cls, season_folder: Path) -> dict[str, Path]:
+        season_folder.mkdir(parents=True, exist_ok=True)
+        for q_dir in cls.DEFAULT_ANIME_QUALITY_DIRS:
+            (season_folder / q_dir).mkdir(parents=True, exist_ok=True)
+
+        srt_dir = season_folder / "srt"
+        srt_dir.mkdir(parents=True, exist_ok=True)
+
+        return {
+            "base": season_folder,
+            "srt": srt_dir,
+            "srt_fa": srt_dir,
+            "srt_en": srt_dir,
         }
 
     @classmethod
@@ -461,9 +517,12 @@ class AutomationService:
 
     @classmethod
     def scan_available_episodes_in_season(cls, season_dir: Path) -> list[str]:
+        """اسکن تمام قسمت‌های موجود در زیرپوشه‌های فصل (پشتیبانی از S03E01، E01، 3x01 و - 01)"""
         episodes: set[str] = set()
-        if not season_dir.exists():
+        if not season_dir or not season_dir.exists():
             return []
+
+        fallback_s = cls.extract_season_num_from_dir(season_dir)
 
         for sub in season_dir.iterdir():
             if not sub.is_dir():
@@ -475,12 +534,54 @@ class AutomationService:
                 or low_name.endswith("-hardsub")
             ):
                 continue
-            for vid in DownloaderService.find_video_files(sub, recursive=False):
-                ep = cls.extract_episode_tag(vid.name)
+            for vid in cls._find_raw_videos_in_dir(sub, recursive=True):
+                ep = cls.extract_episode_tag(vid.name, fallback_season=fallback_s)
                 if ep:
                     episodes.add(ep)
 
+        for vid in cls._find_raw_videos_in_dir(season_dir, recursive=False):
+            ep = cls.extract_episode_tag(vid.name, fallback_season=fallback_s)
+            if ep:
+                episodes.add(ep)
+
         return sorted(list(episodes))
+
+    @classmethod
+    def scan_all_episodes_anywhere_in_season(cls, season_dir: Path) -> list[str]:
+        episodes: set[str] = set()
+        if not season_dir or not season_dir.exists():
+            return []
+        fallback_s = cls.extract_season_num_from_dir(season_dir)
+        for f in season_dir.rglob("*"):
+            if f.is_file() and not f.name.startswith("_"):
+                ep = cls.extract_episode_tag(f.name, fallback_season=fallback_s)
+                if ep:
+                    episodes.add(ep)
+        return sorted(list(episodes))
+
+    @classmethod
+    def collect_all_episode_files_for_smart_upload(
+        cls,
+        season_dir: Path,
+        episode_tag: str
+    ) -> list[tuple[Path, str]]:
+        season_dir = season_dir.resolve()
+        ep_up = episode_tag.upper()
+        fallback_s = cls.extract_season_num_from_dir(season_dir)
+        matched_items: list[tuple[Path, str]] = []
+
+        for item in sorted(season_dir.rglob("*"), key=lambda p: p.as_posix().lower()):
+            if not item.is_file():
+                continue
+            if item.name.startswith("_") or item.name.endswith(".aria2"):
+                continue
+
+            item_ep = cls.extract_episode_tag(item.name, fallback_season=fallback_s)
+            if item_ep == ep_up:
+                remote_dir = cls.compute_server_remote_dir_for_local_path(item)
+                matched_items.append((item, remote_dir))
+
+        return matched_items
 
     @classmethod
     def find_matching_workspace_folder_for_sub(cls, sub_filename: str) -> tuple[Path | None, list[str]]:
@@ -552,6 +653,7 @@ class AutomationService:
                 paths = cls.create_series_season_structure(target_dir)
 
             series_title = target_dir.parent.name if cls.SEASON_DIR_REGEX.match(target_dir.name) else target_dir.name
+            fallback_s = cls.extract_season_num_from_dir(target_dir)
             avail_eps = cls.scan_available_episodes_in_season(target_dir)
             if not episode_tag and avail_eps:
                 episode_tag = avail_eps[-1]
@@ -567,13 +669,76 @@ class AutomationService:
                 available_episodes=avail_eps,
             )
 
-            # فقط برای سریال‌های غیر انیمه به دنبال زیرنویس انگلیسی در srt/EN بگرد
             if not is_anime and plan.season_ep_tag and paths["srt_en"].exists():
                 for f in paths["srt_en"].iterdir():
                     if f.is_file() and f.suffix.lower() in (".srt", ".ass"):
-                        if plan.season_ep_tag.lower() in f.name.lower():
+                        f_ep = cls.extract_episode_tag(f.name, fallback_season=fallback_s)
+                        if (f_ep and f_ep == plan.season_ep_tag) or plan.season_ep_tag.lower() in f.name.lower():
                             plan.existing_en_sub = f.resolve()
                             break
+
+            # ۱. اسکن تمام زیرپوشه‌های کیفیت داخل فصل (مانند 1080p-EBTV, 1080p-x265-PSA, FullHD و...)
+            for sub in sorted(target_dir.iterdir(), key=lambda p: p.name.lower()):
+                if not sub.is_dir():
+                    continue
+                low_name = sub.name.lower()
+                if (
+                    low_name in ("srt", "sub", "softsub", "hardsub")
+                    or low_name.endswith("-softsub")
+                    or low_name.endswith("-hardsub")
+                ):
+                    continue
+
+                videos_in_sub = cls._find_raw_videos_in_dir(sub, recursive=True)
+                for vid in videos_in_sub:
+                    vid_ep = cls.extract_episode_tag(vid.name, fallback_season=fallback_s)
+                    if plan.season_ep_tag:
+                        if vid_ep and vid_ep.upper() != plan.season_ep_tag.upper():
+                            continue
+                        if not vid_ep and len(videos_in_sub) > 1:
+                            continue
+
+                    soft_out_dir = target_dir / f"{sub.name}-SoftSub"
+                    soft_out_file = soft_out_dir / cls.build_softsub_filename(vid)
+
+                    plan.softsub_targets.append(
+                        SoftSubTarget(
+                            raw_video=vid.resolve(),
+                            quality_folder_name=sub.name,
+                            output_dir=soft_out_dir,
+                            output_file=soft_out_file,
+                        )
+                    )
+
+                    if low_name == "fullhd":
+                        plan.fullhd_source_video = vid.resolve()
+                        plan.source_type = cls.detect_source_type(vid.name)
+
+            # ۲. اگر کاربر به جای پوشه فصل، مستقیماً یک زیرپوشه کیفیت یا پوشه حاوی ویدئو را انتخاب کرده بود:
+            if not plan.softsub_targets:
+                direct_vids = cls._find_raw_videos_in_dir(target_dir, recursive=False)
+                for vid in direct_vids:
+                    vid_ep = cls.extract_episode_tag(vid.name, fallback_season=fallback_s)
+                    if plan.season_ep_tag and vid_ep and vid_ep.upper() != plan.season_ep_tag.upper():
+                        continue
+                    soft_out_dir = target_dir / "SoftSub"
+                    soft_out_file = soft_out_dir / cls.build_softsub_filename(vid)
+                    plan.softsub_targets.append(
+                        SoftSubTarget(
+                            raw_video=vid.resolve(),
+                            quality_folder_name=target_dir.name,
+                            output_dir=soft_out_dir,
+                            output_file=soft_out_file,
+                        )
+                    )
+
+            if not plan.fullhd_source_video and plan.softsub_targets:
+                ten_eighty = [
+                    t.raw_video for t in plan.softsub_targets
+                    if "1080" in t.quality_folder_name.lower() or "1080" in t.raw_video.name.lower()
+                ]
+                plan.fullhd_source_video = ten_eighty[0] if ten_eighty else plan.softsub_targets[0].raw_video
+                plan.source_type = cls.detect_source_type(plan.fullhd_source_video.name)
 
         else:
             paths = cls.create_movie_structure(target_dir)
@@ -593,13 +758,13 @@ class AutomationService:
                         plan.existing_en_sub = f.resolve()
                         break
 
-            raw_videos = DownloaderService.find_video_files(target_dir, recursive=False)
+            raw_videos = cls._find_raw_videos_in_dir(target_dir, recursive=True)
             for vid in raw_videos:
                 soft_out_file = paths["softsub"] / cls.build_softsub_filename(vid)
                 plan.softsub_targets.append(
                     SoftSubTarget(
                         raw_video=vid.resolve(),
-                        quality_folder_name=vid.name,
+                        quality_folder_name=vid.parent.name if vid.parent != target_dir else vid.name,
                         output_dir=paths["softsub"],
                         output_file=soft_out_file,
                     )
@@ -609,7 +774,7 @@ class AutomationService:
                 plan.fullhd_source_video = raw_videos[0].resolve()
                 plan.source_type = cls.detect_source_type(plan.fullhd_source_video.name)
 
-        if not plan.existing_en_sub and plan.softsub_targets:
+        if plan.category != "Anime" and not plan.existing_en_sub and plan.softsub_targets:
             search_vids = (
                 [plan.fullhd_source_video] + [t.raw_video for t in plan.softsub_targets]
                 if plan.fullhd_source_video
@@ -620,21 +785,20 @@ class AutomationService:
                 if not candidate_vid or str(candidate_vid) in seen_v:
                     continue
                 seen_v.add(str(candidate_vid))
-                if plan.category != "Anime" and not plan.existing_en_sub and plan.softsub_targets:
-                    try:
-                        tracks = await MKVService.list_subtitle_tracks(candidate_vid)
-                        eng_tracks = [
-                            t for t in tracks
-                            if MKVService._is_english_track(t)
-                            and any(k in t["codec"].lower() for k in ("subrip", "srt", "ass", "ssa", "utf8", "text"))
-                        ]
-                        if eng_tracks:
-                            plan.embedded_en_source_video = candidate_vid
-                            plan.embedded_en_track_id = eng_tracks[0]["id"]
-                            plan.embedded_en_codec = eng_tracks[0]["codec"]
-                            break
-                    except Exception:
-                        continue
+                try:
+                    tracks = await MKVService.list_subtitle_tracks(candidate_vid)
+                    eng_tracks = [
+                        t for t in tracks
+                        if MKVService._is_english_track(t)
+                        and any(k in t["codec"].lower() for k in ("subrip", "srt", "ass", "ssa", "utf8", "text"))
+                    ]
+                    if eng_tracks:
+                        plan.embedded_en_source_video = candidate_vid
+                        plan.embedded_en_track_id = eng_tracks[0]["id"]
+                        plan.embedded_en_codec = eng_tracks[0]["codec"]
+                        break
+                except Exception:
+                    continue
 
         return plan
 
@@ -705,10 +869,11 @@ class AutomationService:
             return all_subs
 
         matched = []
+        fallback_s = cls.extract_season_num_from_dir(plan.base_dir)
         target_ep_num = int(plan.season_ep_tag.split("E")[1])
 
         for f in all_subs:
-            sub_ep = cls.extract_episode_tag(f.name)
+            sub_ep = cls.extract_episode_tag(f.name, fallback_season=fallback_s)
             sub_ep_num = cls.extract_episode_number_only(f.name)
 
             if sub_ep:
@@ -734,6 +899,7 @@ class AutomationService:
         if not plans[0].is_series or not plans[0].season_ep_tag:
             return {"MOVIE": candidate_subs[0]} if candidate_subs else {}
 
+        fallback_s = cls.extract_season_num_from_dir(plans[0].base_dir)
         mapping: dict[str, Path] = {}
         used_subs: set[str] = set()
 
@@ -742,7 +908,7 @@ class AutomationService:
             for sub in candidate_subs:
                 if str(sub) in used_subs:
                     continue
-                if cls.extract_episode_tag(sub.name) == ep_tag:
+                if cls.extract_episode_tag(sub.name, fallback_season=fallback_s) == ep_tag:
                     mapping[ep_tag] = sub
                     used_subs.add(str(sub))
                     break
@@ -755,7 +921,7 @@ class AutomationService:
             for sub in candidate_subs:
                 if str(sub) in used_subs:
                     continue
-                explicit_s_e = cls.extract_episode_tag(sub.name)
+                explicit_s_e = cls.extract_episode_tag(sub.name, fallback_season=fallback_s)
                 if explicit_s_e and explicit_s_e != ep_tag:
                     continue
                 if cls.extract_episode_number_only(sub.name) == target_ep_num:
@@ -767,7 +933,7 @@ class AutomationService:
             untagged_subs = [
                 sub for sub in candidate_subs
                 if str(sub) not in used_subs
-                and cls.extract_episode_tag(sub.name) is None
+                and cls.extract_episode_tag(sub.name, fallback_season=fallback_s) is None
                 and cls.extract_episode_number_only(sub.name) is None
             ]
             if len(untagged_subs) == 1:
@@ -831,7 +997,8 @@ class AutomationService:
 
         for vid in source_videos:
             vid = Path(vid).resolve()
-            ep_tag = cls.extract_episode_tag(vid.name) or ""
+            fallback_s = cls.extract_season_num_from_dir(vid.parent)
+            ep_tag = cls.extract_episode_tag(vid.name, fallback_season=fallback_s) or ""
             src_type = cls.detect_source_type(vid.name)
 
             if vid.parent.name.lower() in ("fullhd", "1080p", "720p", "480p") or cls.SEASON_DIR_REGEX.match(vid.parent.parent.name):
@@ -880,7 +1047,6 @@ class AutomationService:
         auto_upload: bool = False,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
-        # پوشه سافت‌ساب متناسب با کیفیت دقیقاً در لحظه ساخت ایجاد می‌شود
         output_file.parent.mkdir(parents=True, exist_ok=True)
         res_path = await MKVService.merge_softsub(
             video_path=raw_video,
@@ -914,7 +1080,6 @@ class AutomationService:
         auto_upload: bool = False,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
-        # پوشه هاردساب / انکود متناسب با کیفیت دقیقاً در لحظه ساخت ایجاد می‌شود
         ht.output_dir.mkdir(parents=True, exist_ok=True)
         if ht.mode == "encode_ass":
             logo_ass = ht.ass_logo_path or cls.get_movie_ass_logo_path()
@@ -960,84 +1125,3 @@ class AutomationService:
                 remote_dir
             )
         return res_path
-
-    @classmethod
-    def create_anime_season_structure(cls, season_folder: Path) -> dict[str, Path]:
-        """
-        ساختار پوشه‌بندی اختصاصی انیمه:
-        - پوشه‌های کیفیت: 1080p-EBTV, 720p-EBTV, 480p-EBTV, FullHD, 1080p-x265-Judas
-        - پوشه زیرنویس: فقط srt/ (بدون هیچ زیرپوشه FA یا EN)
-        """
-        season_folder.mkdir(parents=True, exist_ok=True)
-        for q_dir in cls.DEFAULT_ANIME_QUALITY_DIRS:
-            (season_folder / q_dir).mkdir(parents=True, exist_ok=True)
-
-        srt_dir = season_folder / "srt"
-        srt_dir.mkdir(parents=True, exist_ok=True)
-
-        return {
-            "base": season_folder,
-            "srt": srt_dir,
-            "srt_fa": srt_dir,
-            "srt_en": srt_dir,
-        }
-
-    @staticmethod
-    def iter_files_one_subfolder(root_dir: Path):
-        """
-        فقط فایل‌های مستقیم پوشه انتخاب‌شده و فایل‌های داخل یک سطح زیرپوشه را برمی‌گرداند.
-        از پیمایش نامحدود rglob جلوگیری می‌کند تا فایل‌های پوشه‌های تو در تو وارد عملیات نشوند.
-        """
-        root_dir = Path(root_dir)
-        if not root_dir.is_dir():
-            return
-        for item in sorted(root_dir.iterdir(), key=lambda p: p.name.lower()):
-            if item.is_file():
-                yield item
-            elif item.is_dir() and not item.name.startswith("_"):
-                try:
-                    for child in sorted(item.iterdir(), key=lambda p: p.name.lower()):
-                        if child.is_file():
-                            yield child
-                except (PermissionError, OSError):
-                    continue
-
-    @classmethod
-    def scan_all_episodes_anywhere_in_season(cls, season_dir: Path) -> list[str]:
-        """اسکن فایل‌های فصل و فقط یک سطح زیرپوشه برای یافتن تگ قسمت."""
-        episodes: set[str] = set()
-        if not season_dir.exists():
-            return []
-        for file_path in cls.iter_files_one_subfolder(season_dir):
-            if not file_path.name.startswith("_"):
-                ep = cls.extract_episode_tag(file_path.name)
-                if ep:
-                    episodes.add(ep)
-        return sorted(episodes)
-
-    @classmethod
-    def collect_all_episode_files_for_smart_upload(
-            cls,
-            season_dir: Path,
-            episode_tag: str
-    ) -> list[tuple[Path, str]]:
-        """
-        پیدا کردن تمام فایل‌های مربوط به یک قسمت خاص (مثلاً S02E02) در تمام زیرپوشه‌های فصل
-        (شامل کیفیت‌های خام، سافت‌ساب‌ها، هاردساب‌ها، انکودهای EBTV و زیرنویس‌های داخل srt)
-        و محاسبه آدرس دقیق هر کدام در سرور مقصد!
-        خروجی: لیستی از (مسیر فایل محلی, مسیر پوشه مقصد در سرور)
-        """
-        season_dir = season_dir.resolve()
-        ep_up = episode_tag.upper()
-        matched_items: list[tuple[Path, str]] = []
-
-        for item in cls.iter_files_one_subfolder(season_dir):
-            if item.name.startswith("_") or item.name.endswith(".aria2"):
-                continue
-
-            item_ep = cls.extract_episode_tag(item.name)
-            if item_ep == ep_up:
-                remote_dir = cls.compute_server_remote_dir_for_local_path(item)
-                matched_items.append((item, remote_dir))
-
-        return matched_items
