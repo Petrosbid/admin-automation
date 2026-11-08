@@ -9,6 +9,7 @@ import traceback
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 from aiogram import Bot
@@ -20,6 +21,16 @@ from core.config_loader import cfg
 # کش موقت مسیرها برای دکمه‌های شیشه‌ای نوتیفیکیشن‌ها (حفظ در برابر Hot-Reload)
 NOTIF_PATH_REGISTRY: dict[str, str] = getattr(
     sys.modules.get(__name__), "NOTIF_PATH_REGISTRY", {}
+)
+
+# Context inherited by child asyncio tasks created during an automation job.
+_CURRENT_AUTOMATION_BATCH_ID: ContextVar[str | None] = ContextVar(
+    "current_automation_batch_id",
+    default=None,
+)
+_CURRENT_AUTOMATION_NOTIFY_COMPLETION: ContextVar[bool] = ContextVar(
+    "current_automation_notify_completion",
+    default=True,
 )
 
 
@@ -50,6 +61,8 @@ class QueueTask:
     is_finished: bool = False
     is_cancelled: bool = False
     running_asyncio_task: asyncio.Task | None = None
+    notify_completion: bool = True
+    batch_id: str | None = None
 
     @property
     def elapsed_str(self) -> str:
@@ -132,6 +145,8 @@ class QueueManager:
         func: Callable,
         *args,
         priority_top: bool = False,
+        notify_completion: bool | None = None,
+        batch_id: str | None = None,
         **kwargs
     ) -> QueueTask:
         self._ensure_internal_structures()
@@ -142,13 +157,26 @@ class QueueManager:
         self.start_workers()
 
         task_id = str(uuid.uuid4())[:6]
+        effective_notify_completion = (
+            _CURRENT_AUTOMATION_NOTIFY_COMPLETION.get()
+            if notify_completion is None
+            else bool(notify_completion)
+        )
+        effective_batch_id = (
+            batch_id
+            if batch_id is not None
+            else _CURRENT_AUTOMATION_BATCH_ID.get()
+        )
+
         task = QueueTask(
             task_id=task_id,
             queue_type=queue_type,
             title=title,
             func=func,
             args=args,
-            kwargs=kwargs
+            kwargs=kwargs,
+            notify_completion=effective_notify_completion,
+            batch_id=effective_batch_id,
         )
         self.tasks[task_id] = task
 
@@ -456,6 +484,12 @@ class QueueManager:
             except Exception:
                 kwargs["progress_callback"] = _prog_cb
 
+            task_batch_id = getattr(task, "batch_id", None)
+            task_notify_completion = bool(getattr(task, "notify_completion", True))
+            batch_context_token = _CURRENT_AUTOMATION_BATCH_ID.set(task_batch_id)
+            notify_context_token = _CURRENT_AUTOMATION_NOTIFY_COMPLETION.set(
+                task_notify_completion
+            )
             try:
                 coro = task.func(*task.args, **kwargs)
                 run_task = asyncio.create_task(coro)
@@ -468,7 +502,8 @@ class QueueManager:
                 task.progress = "100%"
                 task.is_finished = True
 
-                await self._send_completion_notification(task, res)
+                if task_notify_completion:
+                    await self._send_completion_notification(task, res)
 
             except asyncio.CancelledError:
                 task.finished_ts = time.time()
@@ -482,16 +517,19 @@ class QueueManager:
                 task.status = "❌ خطا"
                 task.progress = "متوقف شده به دلیل خطا"
                 task.is_finished = True
-                await self._notify_admins(
-                    f"❌ <b>خطا در پردازش!</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🆔 کد: <code>{html.escape(str(task.task_id))}</code>  ▏  ⏱ زمان: <code>{task.elapsed_str}</code>\n"
-                    f"⚙️ بخش: <code>{html.escape(task.queue_type.upper())}</code>\n"
-                    f"📌 عنوان: <code>{html.escape(str(task.title))}</code>\n"
-                    f"⚠️ جزئیات خطا:\n<code>{html.escape(str(e)[:400])}</code>"
-                )
+                if task_notify_completion:
+                    await self._notify_admins(
+                        f"❌ <b>خطا در پردازش!</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🆔 کد: <code>{html.escape(str(task.task_id))}</code>  ▏  ⏱ زمان: <code>{task.elapsed_str}</code>\n"
+                        f"⚙️ بخش: <code>{html.escape(task.queue_type.upper())}</code>\n"
+                        f"📌 عنوان: <code>{html.escape(str(task.title))}</code>\n"
+                        f"⚠️ جزئیات خطا:\n<code>{html.escape(str(e)[:400])}</code>"
+                    )
             finally:
                 task.running_asyncio_task = None
+                _CURRENT_AUTOMATION_NOTIFY_COMPLETION.reset(notify_context_token)
+                _CURRENT_AUTOMATION_BATCH_ID.reset(batch_context_token)
 
     async def _worker_supervisor(self, queue_type: str, worker_idx: int):
         while True:
