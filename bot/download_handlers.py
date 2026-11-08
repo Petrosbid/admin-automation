@@ -1950,7 +1950,7 @@ async def cb_link_purpose(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("lnk:candidate:"))
-async def cb_link_candidate_selected(call: CallbackQuery):
+async def cb_link_candidate_selected(call: CallbackQuery, state: FSMContext):
     parts = call.data.split(":")
     if len(parts) != 4:
         return await call.answer("درخواست نامعتبر است.", show_alert=True)
@@ -1966,6 +1966,61 @@ async def cb_link_candidate_selected(call: CallbackQuery):
 
     info["selected_dir"] = candidate["path"]
     info["selected_label"] = candidate["label"]
+    chosen_dir = Path(candidate["path"]).resolve()
+    category = str(candidate.get("category", "")).strip()
+    reference = str(info.get("reference", "") or "")
+    episode_tag = (
+        candidate.get("episode_tag")
+        or AutomationService.extract_episode_tag(reference)
+        or ""
+    )
+
+    # انتخاب یک پیشنهاد Series/Anime، عنوان را تأیید می‌کند؛
+    # برای جلوگیری از دانلود در ریشه عنوان، ساختار فصل باید ابتدا آماده شود.
+    if category in ("Series", "Anime"):
+        if not AutomationService.SEASON_DIR_REGEX.match(chosen_dir.name):
+            if episode_tag:
+                season_name = f"S{int(episode_tag[1:3]):02d}"
+                chosen_dir = chosen_dir / season_name
+
+        chosen_dir.mkdir(parents=True, exist_ok=True)
+        await call.answer("عنوان تأیید شد؛ ساختار فصل از سرور بررسی و همگام می‌شود.")
+
+        if AutomationService.SEASON_DIR_REGEX.match(chosen_dir.name):
+            await AutomationService.create_season_structure_from_server(
+                chosen_dir,
+                category=category,
+            )
+            # در صورت وجود EBTV روی مقصد، همگام‌سازی FullHD را نیز ایجاد می‌کند.
+            preferred_download_dir = (
+                chosen_dir / "FullHD"
+                if (chosen_dir / "FullHD").is_dir()
+                else chosen_dir
+            )
+            await state.update_data(
+                pending_direct_targets=list(info.get("targets", [])),
+                dl_smart_series_title=candidate.get("name", chosen_dir.parent.name),
+                dl_smart_season=chosen_dir.name,
+                dl_smart_season_dir=str(chosen_dir),
+            )
+            await _render_download_folder_browser(
+                call,
+                state,
+                preferred_download_dir,
+                page=0,
+            )
+            return
+
+        # اگر شماره فصل از لینک قابل تشخیص نبود و سرور هم فصلی را پیشنهاد نکرد،
+        # کاربر باید از داخل پوشه سریال، فصل مناسب را انتخاب کند.
+        await state.update_data(
+            pending_direct_targets=list(info.get("targets", [])),
+            dl_smart_series_title=candidate.get("name", chosen_dir.name),
+        )
+        await _render_download_folder_browser(call, state, chosen_dir, page=0)
+        return
+
+    # برای فیلم سینمایی، همان مسیر عنوان مقصد مستقیم است.
     kb = InlineKeyboardBuilder()
     kb.row(
         InlineKeyboardButton(
@@ -1982,7 +2037,7 @@ async def cb_link_candidate_selected(call: CallbackQuery):
     kb.row(InlineKeyboardButton(text="🔙 بازگشت به پیشنهادها", callback_data=f"lnk:purpose:{token}:download"))
     await call.message.edit_text(
         f"✅ مقصد انتخاب‌شده: <b>{html.escape(candidate['label'])}</b>\n"
-        f"📂 مسیر محلی: <code>{html.escape(candidate['path'])}</code>\n"
+        f"📂 مسیر محلی: <code>{html.escape(str(chosen_dir))}</code>\n"
         f"☁️ مسیر متناظر سرور: <code>{html.escape(candidate['remote_path'])}</code>\n\n"
         "با تأیید زیر دانلود شروع می‌شود.",
         reply_markup=kb.as_markup(),
