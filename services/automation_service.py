@@ -1,3 +1,4 @@
+import asyncio
 import difflib
 import logging
 import re
@@ -803,16 +804,25 @@ class AutomationService:
             "Series": "/English/Series",
             "Anime": "/English/Anime",
         }
-        for category, remote_root in remote_roots.items():
+        async def _inspect_category_root(category_name: str, remote_root: str):
             try:
-                info = await CuteFTPService.inspect_remote_dir(remote_root)
-                if info.get("exists"):
-                    names_by_category[category].update(
-                        str(name) for name in info.get("dirs", [])
-                        if name and not str(name).startswith("_")
-                    )
+                return category_name, await CuteFTPService.inspect_remote_dir(remote_root)
             except Exception as exc:
                 logging.debug("Destination title search failed for %s: %s", remote_root, exc)
+                return category_name, {}
+
+        root_results = await asyncio.gather(
+            *(
+                _inspect_category_root(category, remote_root)
+                for category, remote_root in remote_roots.items()
+            )
+        )
+        for category, info in root_results:
+            if info.get("exists"):
+                names_by_category[category].update(
+                    str(name) for name in info.get("dirs", [])
+                    if name and not str(name).startswith("_")
+                )
 
         ranked: list[tuple[float, str, str]] = []
         for category, names in names_by_category.items():
@@ -847,9 +857,8 @@ class AutomationService:
                 selected_dirs = local_seasons[:3] or [show_dir]
 
             # اگر عنوان فقط روی سرور است، فصل‌های آن را هم برای همان عنوان بررسی کن.
-            if category != "Movies" and (
-                season_name is not None
-                or not any(cls.SEASON_DIR_REGEX.match(path.name) for path in selected_dirs)
+            if category != "Movies" and season_name is None and (
+                not any(cls.SEASON_DIR_REGEX.match(path.name) for path in selected_dirs)
             ):
                 remote_show = f"{remote_roots[category]}/{title_name}"
                 try:
