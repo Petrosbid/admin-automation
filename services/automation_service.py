@@ -847,7 +847,10 @@ class AutomationService:
                 selected_dirs = local_seasons[:3] or [show_dir]
 
             # اگر عنوان فقط روی سرور است، فصل‌های آن را هم برای همان عنوان بررسی کن.
-            if category != "Movies" and (not selected_dirs or (len(selected_dirs) == 1 and selected_dirs[0] == show_dir and season_name)):
+            if category != "Movies" and (
+                season_name is not None
+                or not any(cls.SEASON_DIR_REGEX.match(path.name) for path in selected_dirs)
+            ):
                 remote_show = f"{remote_roots[category]}/{title_name}"
                 try:
                     info = await CuteFTPService.inspect_remote_dir(remote_show)
