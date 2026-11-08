@@ -1006,6 +1006,14 @@ async def handle_new_dl_subfolder_name(message: Message, state: FSMContext):
 
     data = await state.get_data()
     curr_dir = Path(data.get("dl_browser_curr_dir", cfg.get("paths", "workspace_dir"))).resolve()
+
+    # ایجاد فصل جدید از داخل S01 یا زیرپوشه‌های آن باید در کنار S01 انجام شود.
+    if AutomationService.SEASON_DIR_REGEX.match(raw_name):
+        for ancestor in (curr_dir, curr_dir.parent, curr_dir.parent.parent):
+            if ancestor and AutomationService.SEASON_DIR_REGEX.match(ancestor.name):
+                curr_dir = ancestor.parent
+                break
+
     new_dir = (curr_dir / raw_name).resolve()
     new_dir.mkdir(parents=True, exist_ok=True)
 
