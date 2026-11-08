@@ -502,8 +502,19 @@ async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
         is_anime = mk_type == "anime"
         cat_key = "Anime" if is_anime else "Series"
         base_parent = cats[cat_key] if parent_dir == workspace else parent_dir
-        show_dir = base_parent / folder_name
-        new_dir = show_dir / "S01" if not AutomationService.SEASON_DIR_REGEX.match(folder_name) else show_dir
+
+        if AutomationService.SEASON_DIR_REGEX.match(folder_name):
+            # اگر از داخل فصل یا یکی از زیرپوشه‌های آن فصل جدیدی ساخته شود،
+            # فصل جدید باید کنار فصل فعلی ساخته شود، نه داخل آن.
+            show_dir = base_parent
+            for ancestor in (parent_dir, parent_dir.parent, parent_dir.parent.parent):
+                if ancestor and AutomationService.SEASON_DIR_REGEX.match(ancestor.name):
+                    show_dir = ancestor.parent
+                    break
+            new_dir = show_dir / folder_name
+        else:
+            show_dir = base_parent / folder_name
+            new_dir = show_dir / "S01"
 
         await AutomationService.create_season_structure_from_server(
             new_dir,
