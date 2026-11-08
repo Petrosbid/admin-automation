@@ -484,9 +484,11 @@ class QueueManager:
             except Exception:
                 kwargs["progress_callback"] = _prog_cb
 
-            batch_context_token = _CURRENT_AUTOMATION_BATCH_ID.set(task.batch_id)
+            task_batch_id = getattr(task, "batch_id", None)
+            task_notify_completion = bool(getattr(task, "notify_completion", True))
+            batch_context_token = _CURRENT_AUTOMATION_BATCH_ID.set(task_batch_id)
             notify_context_token = _CURRENT_AUTOMATION_NOTIFY_COMPLETION.set(
-                task.notify_completion
+                task_notify_completion
             )
             try:
                 coro = task.func(*task.args, **kwargs)
@@ -500,7 +502,7 @@ class QueueManager:
                 task.progress = "100%"
                 task.is_finished = True
 
-                if task.notify_completion:
+                if task_notify_completion:
                     await self._send_completion_notification(task, res)
 
             except asyncio.CancelledError:
@@ -515,7 +517,7 @@ class QueueManager:
                 task.status = "❌ خطا"
                 task.progress = "متوقف شده به دلیل خطا"
                 task.is_finished = True
-                if task.notify_completion:
+                if task_notify_completion:
                     await self._notify_admins(
                         f"❌ <b>خطا در پردازش!</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
