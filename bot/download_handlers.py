@@ -1,4 +1,6 @@
 import asyncio
+import html
+import logging
 import math
 import re
 import shutil
@@ -29,6 +31,8 @@ router = Router()
 
 # حافظه موقت برای نگهداری آیتم‌هایی که پس از اتمام دانلود منتظر تایید نام یا تصمیم FullHD توسط ادمین هستند
 PENDING_POST_DL_ITEMS: dict[str, dict] = {}
+PENDING_LINK_ACTIONS: dict[str, dict] = {}
+_ACTIVE_FULLHD_BATCH_MONITORS: set[asyncio.Task] = set()
 
 
 class DownloadStates(StatesGroup):
@@ -77,6 +81,13 @@ def _resolve_series_or_movie_context(dest_dir: Path) -> tuple[bool, Path, str]:
     parts_low = [p.lower() for p in dest_dir.parts]
 
     if "movies" in parts_low or "movie" in parts_low:
+        media_quality_dir = (
+            dest_dir.name.casefold() in ("fullhd", "softsub", "hardsub", "srt", "sub")
+            or bool(re.search(r"(?i)(1080p|720p|480p).*EBTV", dest_dir.name))
+        )
+        if media_quality_dir and dest_dir.parent != dest_dir:
+            movie_root = dest_dir.parent
+            return False, movie_root, movie_root.name
         return False, dest_dir, dest_dir.name
 
     if AutomationService.SEASON_DIR_REGEX.match(dest_dir.parent.name):
@@ -256,7 +267,49 @@ async def _smart_download_pipeline_job(
     auto_upload_cfg = bool(cfg.get("cuteftp", "auto_upload_after_download", True))
 
     for vid in new_videos:
-        ep_tag = AutomationService.extract_episode_tag(vid.name) or ""
+        ep_tag = AutomationService.extract_episode_tag(
+            vid.name,
+            fallback_season=AutomationService.extract_season_num_from_dir(season_or_movie_dir),
+        ) or ""
+
+        # FullHD فقط سورس انکود است؛ آن را مانند یک کیفیت خروجی عادی آپلود نکن.
+        # کیفیت‌های مقصد از پوشه فصل/فیلم خوانده می‌شوند و پس از استانداردشدن نام،
+        # هر کیفیت به صورت خودکار انکود و در مقصد متناظر Upload خواهد شد.
+        if dest_dir.name.casefold() == "fullhd":
+            copied_fullhd_name = None
+            if is_series and ep_tag and server_files_in_folder:
+                copied_fullhd_name = AutomationService.match_filename_from_server_siblings(
+                    server_files_in_folder, ep_tag
+                )
+            if copied_fullhd_name:
+                final_path = vid.with_name(copied_fullhd_name)
+                if vid.resolve() != final_path.resolve():
+                    if final_path.exists():
+                        final_path.unlink(missing_ok=True)
+                    vid.rename(final_path)
+                    vid = final_path
+                await _schedule_fullhd_destination_automation(
+                    bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag
+                )
+            else:
+                suggested_std_name = await AutomationService.build_standard_raw_filename_for_folder(
+                    video_path=vid,
+                    folder_name=dest_dir.name,
+                    series_or_movie_title=series_or_movie_title,
+                    season_ep_tag=ep_tag,
+                    is_series=is_series
+                )
+                await _send_standard_name_confirmation_prompt(
+                    bot=bot,
+                    chat_id=chat_id,
+                    vid_path=vid,
+                    suggested_name=suggested_std_name,
+                    remote_folder_path=remote_folder_path,
+                    should_auto_upload=False,
+                    ask_fullhd_e01_question=False,
+                    fullhd_auto_encode=True,
+                )
+            continue
 
         # اگر تنظیمات آپلود خودکار بعد از دانلود روشن است ولی پوشه روی سرور وجود ندارد -> از کاربر بپرس!
         ask_missing_folder_question = (auto_upload_cfg and not remote_folder_exists)
@@ -339,6 +392,377 @@ async def _send_fullhd_e01_prompt(bot: Bot, chat_id: int, vid_path: Path, remote
         reply_markup=kb.as_markup(),
         parse_mode="Markdown"
     )
+
+def _release_fullhd_monitor(task: asyncio.Task):
+    _ACTIVE_FULLHD_BATCH_MONITORS.discard(task)
+    if task.cancelled():
+        return
+    try:
+        error = task.exception()
+    except asyncio.CancelledError:
+        return
+    if error:
+        logging.error(
+            "FullHD automation status monitor failed: %s",
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
+def _fullhd_status_markup():
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="📊 مشاهده صف کامل", callback_data="menu:queues"),
+        InlineKeyboardButton(text="📂 فایل‌منیجر", callback_data="menu:file_mgr"),
+    )
+    kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu:home"))
+    return kb.as_markup()
+
+
+def _build_fullhd_status_text(title: str, tasks: list, notes: list[str], final: bool = False) -> str:
+    running = [
+        t for t in tasks
+        if not t.is_finished and ("اجرا" in str(t.status) or t.running_asyncio_task is not None)
+    ]
+    done = [
+        t for t in tasks
+        if t.is_finished and "خطا" not in str(t.status) and "لغو" not in str(t.status)
+    ]
+    failed = [t for t in tasks if "خطا" in str(t.status) or "لغو" in str(t.status)]
+    pending = [t for t in tasks if not t.is_finished and t not in running]
+
+    if final:
+        stage = "✅ تمام عملیات ثبت‌شده پایان یافت"
+    elif any(t.queue_type == "upload" for t in running):
+        stage = "☁️ آپلود خروجی‌ها به سرور"
+    elif any(t.queue_type == "mkvtoolnix" for t in running):
+        stage = "📎 ساخت نسخه SoftSub"
+    elif any(t.queue_type == "handbrake" for t in running):
+        stage = "🎬 انکود کیفیت‌های EBTV"
+    elif pending:
+        stage = "⏳ انتظار در صف پردازش"
+    else:
+        stage = "🧾 آماده‌سازی گزارش"
+
+    lines = [
+        f"🎬 <b>اتوماسیون FullHD: {html.escape(title)}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📍 <b>{stage}</b>",
+        (
+            f"✅ تکمیل‌شده: <b>{len(done)}</b>  |  "
+            f"⚙️ در حال اجرا: <b>{len(running)}</b>  |  "
+            f"⏳ منتظر: <b>{len(pending)}</b>"
+        ),
+        f"❌ خطا/لغو: <b>{len(failed)}</b>",
+        "",
+        "<b>عملیات:</b>",
+    ]
+
+    for task in tasks[:14]:
+        if "خطا" in str(task.status):
+            icon, detail = "❌", str(task.error or task.progress or "خطا")[:70]
+        elif "لغو" in str(task.status):
+            icon, detail = "🛑", "لغو شد"
+        elif task.is_finished:
+            icon, detail = "✅", "تکمیل شد"
+        elif task in running:
+            icon, detail = "⚙️", str(task.progress or "در حال اجرا")[:70]
+        else:
+            icon, detail = "⏳", "در انتظار"
+        lines.append(
+            f"{icon} <code>#{html.escape(str(task.task_id))} "
+            f"{html.escape(str(task.title)[:85])}</code> — "
+            f"<i>{html.escape(detail)}</i>"
+        )
+
+    if len(tasks) > 14:
+        lines.append(f"<i>... و {len(tasks) - 14} عملیات دیگر</i>")
+
+    if notes:
+        lines.extend(["", "<b>یادداشت‌ها:</b>"])
+        lines.extend(f"▫️ {html.escape(note[:160])}" for note in notes[:6])
+
+    if final and failed:
+        lines.extend(["", "⚠️ <b>اتوماسیون پایان یافت، اما بخشی از عملیات خطا یا لغو شد.</b>"])
+    elif final:
+        lines.extend(["", "🎉 <b>اتوماسیون با موفقیت به پایان رسید.</b>"])
+    return "\n".join(lines)[:3900]
+
+
+async def _watch_fullhd_batch(
+    status_message: Message,
+    batch_id: str,
+    title: str,
+    initial_tasks: list,
+    notes: list[str],
+):
+    known = {task.task_id: task for task in initial_tasks}
+    markup = _fullhd_status_markup()
+    last_text = None
+    stable_cycles = 0
+
+    while True:
+        # زیرتسک‌های Upload که پس از Encode یا SoftSub به صف اضافه می‌شوند، batch را به ارث می‌برند.
+        for task in list(queue_engine.tasks.values()):
+            if getattr(task, "batch_id", None) == batch_id:
+                known[task.task_id] = task
+
+        tasks = list(known.values())
+        complete = bool(tasks) and all(task.is_finished for task in tasks)
+        stable_cycles = stable_cycles + 1 if complete else 0
+        report = _build_fullhd_status_text(
+            title, tasks, notes, final=stable_cycles >= 2
+        )
+        if report != last_text:
+            try:
+                await status_message.edit_text(
+                    report,
+                    reply_markup=markup,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                last_text = report
+            except Exception as exc:
+                if "message is not modified" not in str(exc).lower():
+                    logging.warning("Could not update FullHD automation status: %s", exc)
+
+        if stable_cycles >= 2:
+            return
+        await asyncio.sleep(3)
+
+
+async def _run_fullhd_encode_with_destination_routing(
+    encode_target,
+    fa_sub: Path | None,
+    en_sub: Path | None,
+    brand: str,
+    remote_ebtv_dir: str | None,
+    local_softsub_dir: Path | None,
+    remote_softsub_dir: str | None,
+    progress_callback=None,
+) -> Path:
+    """انکود FullHD؛ در صورت وجود مقصد SoftSub و زیرنویس، Mux وگرنه آپلود EBTV."""
+    encoded = await AutomationService.run_hardsub_or_encode_and_optional_upload(
+        encode_target,
+        fa_sub,
+        en_sub,
+        brand,
+        False,
+        progress_callback,
+    )
+
+    if remote_softsub_dir and local_softsub_dir and fa_sub and fa_sub.exists():
+        soft_file = local_softsub_dir / AutomationService.build_softsub_filename(encoded)
+        await AutomationService.run_softsub_and_optional_upload(
+            encoded,
+            soft_file,
+            fa_sub,
+            en_sub,
+            brand,
+            True,
+            progress_callback,
+        )
+    elif remote_ebtv_dir:
+        await queue_engine.add_task(
+            "upload",
+            f"AutoUpload FullHD Encode [{remote_ebtv_dir}]: {encoded.name}",
+            CuteFTPService.upload_path,
+            encoded,
+            remote_ebtv_dir,
+        )
+    elif remote_softsub_dir:
+        # فایل خام encode شده نباید در پوشه‌ای بارگذاری شود که مخصوص خروجی SoftSub است.
+        logging.warning(
+            "SoftSub destination %s exists but no matching Persian subtitle was found; "
+            "keeping encoded file locally instead of uploading a non-SoftSub file there.",
+            remote_softsub_dir,
+        )
+    return encoded
+
+
+async def _schedule_fullhd_destination_automation(
+    bot: Bot,
+    chat_id: int,
+    vid_path: Path,
+    season_or_movie_dir: Path,
+    is_series: bool,
+    ep_tag: str,
+):
+    """
+    کیفیت‌های تعریف‌شده در مقصد را می‌خواند و فقط همان رزولوشن‌ها را از FullHD انکود می‌کند.
+    وجود پوشه -SoftSub به معنی ساخت نسخه SoftSub در همان مقصد است؛ در غیر این صورت
+    فایل انکودشده به پوشه EBTV متناظر Upload می‌شود.
+    """
+    if not vid_path.exists():
+        return
+
+    remote_root = AutomationService.compute_server_remote_dir_for_local_path(season_or_movie_dir)
+    try:
+        remote_info = await CuteFTPService.inspect_remote_dir(remote_root)
+    except Exception as exc:
+        await bot.send_message(
+            chat_id,
+            f"⚠️ بررسی پوشه‌های کیفیت مقصد ناموفق بود؛ انکود خودکار انجام نشد.\n"
+            f"مسیر: <code>{html.escape(remote_root)}</code>\n"
+            f"خطا: <code>{html.escape(str(exc)[:250])}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if not remote_info.get("exists"):
+        await bot.send_message(
+            chat_id,
+            f"⚠️ پوشه مقصد قابل بررسی نیست یا دسترسی FTP تنظیم نشده است؛ "
+            f"کیفیت‌های EBTV برای <code>{html.escape(remote_root)}</code> شناسایی نشدند.",
+            parse_mode="HTML",
+        )
+        return
+
+    quality_map: dict[str, dict[str, str]] = {}
+    for remote_name in remote_info.get("dirs", []):
+        name = str(remote_name).strip()
+        low = name.casefold()
+        match = re.search(r"(?i)(1080p|720p|480p)", name)
+        if not match:
+            continue
+        q_tag = match.group(1).lower()
+        if not (
+            re.search(r"(?i)(?:^|[-._\s])EBTV$", name)
+            or re.search(r"(?i)(?:^|[-._\s])EBTV-SoftSub$", name)
+        ):
+            continue
+
+        bucket = quality_map.setdefault(q_tag, {})
+        if re.search(r"(?i)(?:^|[-._\s])EBTV-SoftSub$", name):
+            bucket["soft"] = name
+        else:
+            bucket["base"] = name
+
+    if not quality_map:
+        await bot.send_message(
+            chat_id,
+            f"ℹ️ در مسیر <code>{html.escape(remote_root)}</code> هیچ پوشه‌ای با پسوند "
+            "<code>EBTV</code> یا <code>EBTV-SoftSub</code> پیدا نشد؛ "
+            "فایل FullHD در Workspace باقی ماند.",
+            parse_mode="HTML",
+        )
+        return
+
+    if not AutomationService.get_movie_ass_logo_path().exists():
+        await bot.send_message(
+            chat_id,
+            "❌ فایل <code>movie.ass</code> برای انکود/واترمارک در مسیر presets یا کنار برنامه پیدا نشد؛ "
+            "انکود خودکار انجام نشد.",
+            parse_mode="HTML",
+        )
+        return
+
+    plan = await AutomationService.analyze_and_build_plan(
+        season_or_movie_dir,
+        ep_tag if is_series and ep_tag else None,
+    )
+    fa_sub = None
+    en_sub = plan.existing_en_sub if plan.existing_en_sub and plan.existing_en_sub.exists() else None
+    try:
+        candidates = AutomationService.find_local_fa_subtitles(plan)
+        key = plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
+        matched = AutomationService.match_subtitles_to_episodes([plan], candidates)
+        candidate = matched.get(key)
+        if candidate and candidate.exists():
+            fa_sub = candidate
+    except Exception as exc:
+        logging.warning("Could not match FullHD subtitle: %s", exc)
+
+    qualities = sorted(
+        quality_map,
+        key=lambda q: {"1080p": 1, "720p": 2, "480p": 3}.get(q, 9),
+    )
+    targets = AutomationService.build_manual_encode_ass_targets([vid_path], qualities)
+    if not is_series:
+        source_type = AutomationService.detect_source_type(vid_path.name)
+        for target in targets:
+            movie_output_name = AutomationService.build_encode_ass_filename(
+                season_or_movie_dir.name,
+                "",
+                target.quality_tag,
+                source_type,
+            )
+            target.output_file = target.output_file.with_name(movie_output_name)
+    targets_by_quality = {target.quality_tag: target for target in targets}
+    batch_id = uuid.uuid4().hex[:10]
+    tasks = []
+    notes: list[str] = []
+
+    for q_tag in qualities:
+        target = targets_by_quality.get(q_tag)
+        if not target:
+            notes.append(f"{q_tag}: preset انکود متناظر ساخته نشد.")
+            continue
+
+        names = quality_map[q_tag]
+        base_name = names.get("base", f"{q_tag}-EBTV")
+        soft_name = names.get("soft")
+
+        local_encode_dir = season_or_movie_dir / base_name
+        local_encode_dir.mkdir(parents=True, exist_ok=True)
+        target.output_dir = local_encode_dir
+        target.output_file = local_encode_dir / target.output_file.name
+
+        local_soft_dir = (season_or_movie_dir / soft_name) if soft_name else None
+        if local_soft_dir:
+            local_soft_dir.mkdir(parents=True, exist_ok=True)
+
+        remote_base = f"{remote_root.rstrip('/')}/{base_name}" if "base" in names else None
+        remote_soft = f"{remote_root.rstrip('/')}/{soft_name}" if soft_name else None
+
+        if soft_name and (not fa_sub or not fa_sub.exists()):
+            notes.append(
+                f"{q_tag}: پوشه SoftSub مقصد وجود دارد اما زیرنویس فارسی این عنوان/قسمت پیدا نشد؛ "
+                "در صورت وجود پوشه EBTV اصلی، خروجی انکودشده به آن ارسال می‌شود."
+            )
+
+        task = await queue_engine.add_task(
+            "handbrake",
+            f"FullHD Encode [{q_tag}]: {target.output_file.name}",
+            _run_fullhd_encode_with_destination_routing,
+            target,
+            fa_sub,
+            en_sub,
+            cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::."),
+            remote_base,
+            local_soft_dir,
+            remote_soft,
+            batch_id=batch_id,
+            notify_completion=False,
+        )
+        tasks.append(task)
+
+    if not tasks:
+        return await bot.send_message(
+            chat_id,
+            "⚠️ کیفیت مناسب برای انکود در صف قرار نگرفت.",
+            parse_mode="HTML",
+        )
+
+    status_title = (
+        season_or_movie_dir.parent.name
+        if is_series and AutomationService.SEASON_DIR_REGEX.match(season_or_movie_dir.name)
+        else season_or_movie_dir.name
+    )
+    status_message = await bot.send_message(
+        chat_id,
+        _build_fullhd_status_text(status_title, tasks, notes),
+        reply_markup=_fullhd_status_markup(),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    monitor = asyncio.create_task(
+        _watch_fullhd_batch(status_message, batch_id, status_title, tasks, notes),
+        name=f"fullhd-status-{batch_id}",
+    )
+    _ACTIVE_FULLHD_BATCH_MONITORS.add(monitor)
+    monitor.add_done_callback(_release_fullhd_monitor)
+
 
 async def _check_and_prompt_auto_softsub_for_new_quality(
     bot: Bot,
@@ -513,7 +937,8 @@ async def _send_standard_name_confirmation_prompt(
     suggested_name: str,
     remote_folder_path: str,
     should_auto_upload: bool,
-    ask_fullhd_e01_question: bool
+    ask_fullhd_e01_question: bool,
+    fullhd_auto_encode: bool = False
 ):
     token = uuid.uuid4().hex[:6]
     PENDING_POST_DL_ITEMS[token] = {
@@ -523,6 +948,7 @@ async def _send_standard_name_confirmation_prompt(
         "remote_dir": remote_folder_path,
         "should_auto_upload": should_auto_upload,
         "ask_fullhd_e01": ask_fullhd_e01_question,
+        "fullhd_auto_encode": fullhd_auto_encode,
     }
     kb = InlineKeyboardBuilder()
     kb.row(
@@ -637,6 +1063,21 @@ async def _finalize_post_dl_rename_and_upload(
     remote_dir = info["remote_dir"]
     bot = msg_or_call.bot
     chat_id = msg_or_call.message.chat.id if isinstance(msg_or_call, CallbackQuery) else msg_or_call.chat.id
+
+    if info.get("fullhd_auto_encode"):
+        confirmation = f"✅ نام فایل FullHD نهایی شد: <code>{html.escape(vid_path.name)}</code>"
+        if isinstance(msg_or_call, CallbackQuery):
+            await msg_or_call.message.edit_text(confirmation, parse_mode="HTML")
+        else:
+            await msg_or_call.answer(confirmation, parse_mode="HTML")
+        is_ser, season_or_movie_dir, _ = _resolve_series_or_movie_context(vid_path.parent)
+        ep_tag = AutomationService.extract_episode_tag(
+            vid_path.name,
+            fallback_season=AutomationService.extract_season_num_from_dir(season_or_movie_dir),
+        ) or ""
+        return await _schedule_fullhd_destination_automation(
+            bot, chat_id, vid_path, season_or_movie_dir, is_ser, ep_tag
+        )
 
     if info.get("ask_fullhd_e01"):
         if isinstance(msg_or_call, CallbackQuery):
@@ -919,9 +1360,8 @@ async def handle_direct_link_input(message: Message, state: FSMContext):
     else:
         return await message.answer("⚠️ لطفاً لینک یا فایل `.torrent` ارسال کنید:")
 
-    await state.update_data(pending_direct_targets=targets)
-    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-    await _render_download_folder_browser(message, state, workspace, page=0)
+    await state.clear()
+    await _show_link_purpose_prompt(message, targets)
 
 
 @router.callback_query(DownloadStates.browsing_download_folder, F.data.startswith("dlnav:page:"))
@@ -1353,6 +1793,230 @@ async def handle_link_for_sub_extract(message: Message, state: FSMContext):
     )
 
 
+async def _show_link_purpose_prompt(
+    message: Message,
+    targets: list[str],
+):
+    token = uuid.uuid4().hex[:8]
+    PENDING_LINK_ACTIONS[token] = {
+        "targets": list(targets),
+        "reference": targets[0] if targets else "",
+    }
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text="⬇️ دانلود فیلم / سریال",
+            callback_data=f"lnk:purpose:{token}:download",
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="📤 استخراج زیرنویس از فایل ویدئویی",
+            callback_data=f"lnk:purpose:{token}:extract",
+        )
+    )
+    await message.answer(
+        "🔗 لینک دریافت شد. می‌خواهید با آن چه کاری انجام شود؟\n\n"
+        "• برای دانلود، نام فیلم/سریال از روی نام فایل یا متن لینک استخراج می‌شود و "
+        "پوشه‌های محتمل Workspace و سرور مقصد پیشنهاد داده می‌شوند.\n"
+        "• برای استخراج، ویدئو دانلود و ترک‌های زیرنویس آن استخراج و در همین چت ارسال می‌شوند.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("lnk:purpose:"))
+async def cb_link_purpose(call: CallbackQuery, state: FSMContext):
+    parts = call.data.split(":")
+    if len(parts) != 4:
+        return await call.answer("درخواست نامعتبر است.", show_alert=True)
+
+    token, purpose = parts[2], parts[3]
+    info = PENDING_LINK_ACTIONS.get(token)
+    if not info:
+        return await call.answer("این درخواست منقضی شده است؛ لینک را دوباره ارسال کنید.", show_alert=True)
+
+    targets = list(info.get("targets", []))
+    if not targets:
+        PENDING_LINK_ACTIONS.pop(token, None)
+        return await call.answer("لینکی برای پردازش ثبت نشده است.", show_alert=True)
+
+    await state.clear()
+
+    if purpose == "extract":
+        PENDING_LINK_ACTIONS.pop(token, None)
+        task_ids = []
+        for target in targets:
+            job_uid = uuid.uuid4().hex[:6]
+            temp_dir = Path(cfg.get("paths", "workspace_dir")) / f"SubExtract_{job_uid}"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            task = await queue_engine.add_task(
+                "download",
+                f"دانلود + استخراج زیرنویس ({job_uid})",
+                _download_and_extract_subs_job,
+                call.bot,
+                call.message.chat.id,
+                target,
+                temp_dir,
+            )
+            task_ids.append(task.task_id)
+
+        ids = ", ".join(f"<code>{html.escape(str(tid))}</code>" for tid in task_ids)
+        await call.message.edit_text(
+            f"📤 تعداد <b>{len(task_ids)}</b> عملیات دانلود و استخراج زیرنویس در صف قرار گرفت.\n"
+            f"شناسه‌ها: {ids}",
+            parse_mode="HTML",
+        )
+        return await call.answer("در صف قرار گرفت.")
+
+    if purpose != "download":
+        return await call.answer("نوع عملیات نامعتبر است.", show_alert=True)
+
+    wait_msg = await call.message.edit_text(
+        "🔎 در حال جستجوی عنوان لینک در پوشه‌های Workspace و سرور مقصد..."
+    )
+    candidates = []
+    query = ""
+    try:
+        query = AutomationService.extract_media_title_query(info.get("reference", ""))
+        candidates = await AutomationService.search_media_destination_candidates(
+            info.get("reference", ""),
+            limit=7,
+        )
+    except Exception as exc:
+        logging.exception("Destination suggestion search failed")
+        await wait_msg.edit_text(
+            f"⚠️ جستجوی پیشنهادها انجام نشد: <code>{html.escape(str(exc)[:250])}</code>\n"
+            "می‌توانید مقصد را دستی انتخاب کنید.",
+            parse_mode="HTML",
+        )
+
+    PENDING_LINK_ACTIONS[token]["candidates"] = candidates
+    kb = InlineKeyboardBuilder()
+
+    if candidates:
+        lines = [
+            f"<b>{idx + 1}.</b> {html.escape(item['label'])} "
+            f"— <code>{html.escape(item['category'])}</code> "
+            f"({'محلی' if item.get('exists_local') else 'فقط در سرور'})"
+            for idx, item in enumerate(candidates)
+        ]
+        for idx, item in enumerate(candidates):
+            kb.row(
+                InlineKeyboardButton(
+                    text=f"📁 {item['label'][:42]}",
+                    callback_data=f"lnk:candidate:{token}:{idx}",
+                )
+            )
+        body = (
+            f"🔎 عنوان استخراج‌شده: <b>{html.escape(query or 'قابل تشخیص نبود')}</b>\n\n"
+            "پوشه‌های پیشنهادی؛ مقصد مناسب را انتخاب کنید:\n"
+            + "\n".join(lines)
+        )
+    else:
+        body = (
+            f"🔎 عنوان استخراج‌شده: <b>{html.escape(query or 'قابل تشخیص نبود')}</b>\n\n"
+            "پوشهٔ مطمئنی در Workspace یا فهرست پوشه‌های سرور پیدا نشد. "
+            "می‌توانید مقصد را به‌صورت دستی از Workspace انتخاب کنید."
+        )
+
+    kb.row(
+        InlineKeyboardButton(
+            text="📂 انتخاب دستی مقصد",
+            callback_data=f"lnk:manual:{token}",
+        )
+    )
+    kb.row(InlineKeyboardButton(text="❌ لغو", callback_data=f"lnk:cancel:{token}"))
+    await wait_msg.edit_text(
+        body[:3900],
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data.startswith("lnk:candidate:"))
+async def cb_link_candidate_selected(call: CallbackQuery):
+    parts = call.data.split(":")
+    if len(parts) != 4:
+        return await call.answer("درخواست نامعتبر است.", show_alert=True)
+    token, idx_text = parts[2], parts[3]
+    info = PENDING_LINK_ACTIONS.get(token)
+    if not info:
+        return await call.answer("این پیشنهاد منقضی شده است.", show_alert=True)
+
+    try:
+        candidate = info.get("candidates", [])[int(idx_text)]
+    except (IndexError, ValueError, TypeError):
+        return await call.answer("پوشهٔ انتخاب‌شده معتبر نیست.", show_alert=True)
+
+    info["selected_dir"] = candidate["path"]
+    info["selected_label"] = candidate["label"]
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text="⬇️ شروع دانلود در این پوشه",
+            callback_data=f"lnk:start:{token}",
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="📂 انتخاب دستی پوشه دیگر",
+            callback_data=f"lnk:manual:{token}",
+        )
+    )
+    kb.row(InlineKeyboardButton(text="🔙 بازگشت به پیشنهادها", callback_data=f"lnk:purpose:{token}:download"))
+    await call.message.edit_text(
+        f"✅ مقصد انتخاب‌شده: <b>{html.escape(candidate['label'])}</b>\n"
+        f"📂 مسیر محلی: <code>{html.escape(candidate['path'])}</code>\n"
+        f"☁️ مسیر متناظر سرور: <code>{html.escape(candidate['remote_path'])}</code>\n\n"
+        "با تأیید زیر دانلود شروع می‌شود.",
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("lnk:start:"))
+async def cb_link_start_download(call: CallbackQuery, state: FSMContext):
+    token = call.data.split(":")[2]
+    info = PENDING_LINK_ACTIONS.pop(token, None)
+    if not info or not info.get("selected_dir"):
+        return await call.answer("اطلاعات مقصد منقضی شده است.", show_alert=True)
+
+    targets = list(info.get("targets", []))
+    chosen_dir = Path(info["selected_dir"]).resolve()
+    chosen_dir.mkdir(parents=True, exist_ok=True)
+    task_ids = await _enqueue_batch_downloads(call.bot, call.message.chat.id, targets, chosen_dir)
+    await state.clear()
+    remote_eq = AutomationService.compute_server_remote_dir_for_local_path(chosen_dir)
+    await call.message.edit_text(
+        f"✅ تعداد <b>{len(task_ids)}</b> دانلود در صف قرار گرفت.\n"
+        f"📂 مقصد: <code>{html.escape(str(chosen_dir))}</code>\n"
+        f"☁️ مسیر سرور: <code>{html.escape(remote_eq)}</code>\n"
+        f"🆔 شناسه‌ها: {', '.join(html.escape(str(x)) for x in task_ids)}",
+        reply_markup=main_menu_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("lnk:manual:"))
+async def cb_link_manual_destination(call: CallbackQuery, state: FSMContext):
+    token = call.data.split(":")[2]
+    info = PENDING_LINK_ACTIONS.pop(token, None)
+    if not info:
+        return await call.answer("این درخواست منقضی شده است.", show_alert=True)
+
+    await state.update_data(pending_direct_targets=list(info.get("targets", [])))
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    await _render_download_folder_browser(call, state, workspace, page=0)
+
+
+@router.callback_query(F.data.startswith("lnk:cancel:"))
+async def cb_link_cancel(call: CallbackQuery):
+    token = call.data.split(":")[2]
+    PENDING_LINK_ACTIONS.pop(token, None)
+    await call.message.edit_text("⏭ عملیات لینک لغو شد.", reply_markup=main_menu_kb())
+
+
 @router.message(StateFilter(None), F.document)
 async def receive_download_torrent(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -1375,6 +2039,4 @@ async def catch_direct_links_in_chat(message: Message, state: FSMContext):
     targets = _extract_batch_links(message.text or "")
     if not targets:
         return
-    await state.update_data(pending_direct_targets=targets)
-    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-    await _render_download_folder_browser(message, state, workspace, page=0)
+    await _show_link_purpose_prompt(message, targets)

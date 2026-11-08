@@ -1,6 +1,9 @@
+import asyncio
+import difflib
 import logging
 import re
 import time
+from urllib.parse import parse_qs, unquote, urlparse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -692,6 +695,208 @@ class AutomationService:
                 matched_items.append((item, remote_dir))
 
         return matched_items
+
+    @classmethod
+    def extract_media_title_query(cls, reference: str) -> str:
+        """
+        استخراج عنوان احتمالی فیلم/سریال از نام فایل، لینک دانلود یا Magnet URI.
+        تگ فصل/قسمت، رزولوشن، کدک و عبارت‌های انتشار حذف می‌شوند.
+        """
+        raw = unquote(str(reference or "")).strip()
+        if not raw:
+            return ""
+
+        try:
+            parsed = urlparse(raw)
+            if parsed.scheme in ("http", "https", "magnet"):
+                query = parse_qs(parsed.query)
+                for key in ("dn", "filename", "file", "name", "title"):
+                    values = query.get(key)
+                    if values and values[0].strip():
+                        raw = unquote(values[0]).strip()
+                        break
+                else:
+                    raw = Path(unquote(parsed.path)).name or raw
+        except Exception:
+            pass
+
+        raw = raw.replace("\\", "/").rsplit("/", 1)[-1]
+        raw = re.sub(r"\.(?:mkv|mp4|avi|mov|m4v|webm|ts|srt|ass|ssa|sub|idx|zip|rar|7z|torrent)$", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"(?i)\b(?:subs?|subtitle|subtitles|farsi|persian|english|multi|dual|proper|repack|internal)\b", " ", raw)
+
+        episode_match = re.search(
+            r"(?i)(?:[._ -]S\d{1,2}[._ -]*E\d{1,3}|[._ -]\d{1,2}x\d{1,3}|[._ -]E(?:P)?\d{1,3})",
+            raw,
+        )
+        if episode_match:
+            raw = raw[:episode_match.start()]
+
+        release_markers = re.search(
+            r"(?i)[._ -](?:2160p|1080p|720p|480p|360p|4k|8k|web[._ -]?(?:dl|rip)|blu[._ -]?ray|bdrip|brrip|hdtv|x264|x265|h264|h265|hevc|av1|10bit|8bit|aac|ddp|dts|proper|repack)\b",
+            raw,
+        )
+        if release_markers:
+            raw = raw[:release_markers.start()]
+
+        raw = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", raw)
+        raw = re.sub(r"[^\w\s'-]", " ", raw, flags=re.UNICODE)
+        raw = re.sub(r"[._-]+", " ", raw)
+        raw = re.sub(r"\s+", " ", raw).strip(" -_")
+        return raw[:100].strip()
+
+    @staticmethod
+    def _media_title_similarity(query: str, candidate: str) -> float:
+        def normalize(value: str) -> str:
+            value = re.sub(r"[^\w]+", " ", str(value or "").casefold(), flags=re.UNICODE)
+            return " ".join(value.split())
+
+        q_norm = normalize(query)
+        c_norm = normalize(candidate)
+        if not q_norm or not c_norm:
+            return 0.0
+
+        q_tokens = set(q_norm.split())
+        c_tokens = set(c_norm.split())
+        overlap = len(q_tokens & c_tokens) / max(1, len(q_tokens))
+        sequence = difflib.SequenceMatcher(None, q_norm, c_norm).ratio()
+
+        if q_norm in c_norm or c_norm in q_norm:
+            sequence = max(sequence, 0.86)
+
+        return min(1.0, max(sequence, overlap * 0.92))
+
+    @classmethod
+    async def search_media_destination_candidates(
+        cls,
+        reference: str,
+        limit: int = 8,
+    ) -> list[dict]:
+        """
+        جستجوی عنوان در Workspace و پوشه‌های سطح اول سرور مقصد.
+        خروجی path محلی متناظر دارد؛ اگر فولدر فقط روی سرور باشد، هنگام انتخاب ساخته می‌شود.
+        برای سریال، در صورت وجود SxxEyy فصل مرتبط پیشنهاد می‌شود.
+        """
+        query = cls.extract_media_title_query(reference)
+        if not query:
+            return []
+
+        ws = Path(cfg.get("paths", "workspace_dir", "./workspace")).resolve()
+        category_names = ("Movies", "Series", "Anime")
+        category_roots = cls.ensure_workspace_root_categories()
+        episode_tag = cls.extract_episode_tag(reference)
+        season_name = f"S{int(episode_tag[1:3]):02d}" if episode_tag else None
+
+        # فهرست پوشه‌های محلی و سرور در سطح عنوان.
+        names_by_category: dict[str, set[str]] = {name: set() for name in category_names}
+        for category, root in category_roots.items():
+            try:
+                names_by_category[category].update(
+                    p.name for p in root.iterdir()
+                    if p.is_dir() and not p.name.startswith("_")
+                    and p.name.lower() not in ("browser_profile", "srt", "softsub", "hardsub", "fullhd")
+                    and not p.name.lower().endswith(("-softsub", "-hardsub"))
+                )
+            except OSError:
+                continue
+
+        remote_roots = {
+            "Movies": "/English/Movies",
+            "Series": "/English/Series",
+            "Anime": "/English/Anime",
+        }
+        async def _inspect_category_root(category_name: str, remote_root: str):
+            try:
+                return category_name, await CuteFTPService.inspect_remote_dir(remote_root)
+            except Exception as exc:
+                logging.debug("Destination title search failed for %s: %s", remote_root, exc)
+                return category_name, {}
+
+        root_results = await asyncio.gather(
+            *(
+                _inspect_category_root(category, remote_root)
+                for category, remote_root in remote_roots.items()
+            )
+        )
+        for category, info in root_results:
+            if info.get("exists"):
+                names_by_category[category].update(
+                    str(name) for name in info.get("dirs", [])
+                    if name and not str(name).startswith("_")
+                )
+
+        ranked: list[tuple[float, str, str]] = []
+        for category, names in names_by_category.items():
+            for title_name in names:
+                score = cls._media_title_similarity(query, title_name)
+                if score >= 0.24:
+                    ranked.append((score, category, title_name))
+
+        ranked.sort(key=lambda item: (-item[0], item[1], item[2].casefold()))
+
+        results: list[dict] = []
+        seen_paths: set[str] = set()
+        for score, category, title_name in ranked[:max(limit * 2, limit)]:
+            category_root = category_roots[category]
+            show_dir = category_root / title_name
+            selected_dirs: list[Path] = []
+
+            if category == "Movies":
+                selected_dirs = [show_dir]
+            elif season_name:
+                selected_dirs = [show_dir / season_name]
+            else:
+                local_seasons = []
+                if show_dir.is_dir():
+                    try:
+                        local_seasons = sorted(
+                            [p for p in show_dir.iterdir() if p.is_dir() and cls.SEASON_DIR_REGEX.match(p.name)],
+                            key=lambda p: p.name.casefold(),
+                        )
+                    except OSError:
+                        pass
+                selected_dirs = local_seasons[:3] or [show_dir]
+
+            # اگر عنوان فقط روی سرور است، فصل‌های آن را هم برای همان عنوان بررسی کن.
+            if category != "Movies" and season_name is None and (
+                not any(cls.SEASON_DIR_REGEX.match(path.name) for path in selected_dirs)
+            ):
+                remote_show = f"{remote_roots[category]}/{title_name}"
+                try:
+                    info = await CuteFTPService.inspect_remote_dir(remote_show)
+                    remote_seasons = [
+                        str(name) for name in info.get("dirs", [])
+                        if cls.SEASON_DIR_REGEX.match(str(name))
+                    ] if info.get("exists") else []
+                    if season_name:
+                        selected_dirs = [show_dir / season_name]
+                    elif remote_seasons:
+                        selected_dirs = [show_dir / name for name in sorted(remote_seasons, key=str.casefold)[:3]]
+                except Exception:
+                    pass
+
+            for candidate_path in selected_dirs:
+                normalized = str(candidate_path.resolve()).casefold()
+                if normalized in seen_paths:
+                    continue
+                seen_paths.add(normalized)
+
+                label = title_name
+                if category != "Movies" and cls.SEASON_DIR_REGEX.match(candidate_path.name):
+                    label = f"{title_name} · {candidate_path.name}"
+                results.append({
+                    "name": title_name,
+                    "label": label,
+                    "category": category,
+                    "path": str(candidate_path.resolve()),
+                    "remote_path": cls.compute_server_remote_dir_for_local_path(candidate_path),
+                    "score": round(score, 3),
+                    "exists_local": candidate_path.exists(),
+                    "episode_tag": episode_tag or "",
+                })
+                if len(results) >= limit:
+                    return results
+
+        return results
 
     @classmethod
     def find_matching_workspace_folder_for_sub(cls, sub_filename: str) -> tuple[Path | None, list[str]]:
