@@ -315,17 +315,65 @@ def extract_credentials_from_open_cuteftp() -> dict[str, str]:
     }
 
 
+def _get_ftp_inspection_config() -> dict:
+    """
+    پیکربندی جدید cuteftp بر تنظیمات قدیمی ftp اولویت دارد.
+    مقادیر خالی یا placeholder در cuteftp اطلاعات معتبر ftp را از بین نمی‌برند.
+    """
+    legacy_cfg = cfg.get("ftp") or {}
+    current_cfg = cfg.get("cuteftp") or {}
+
+    merged = dict(legacy_cfg) if isinstance(legacy_cfg, dict) else {}
+    if isinstance(current_cfg, dict):
+        placeholders = {
+            "ftppassword",
+            "your_ftp_password",
+            "change_me",
+            "changeme",
+            "replace_me",
+        }
+        for key, value in current_cfg.items():
+            if value is None:
+                continue
+            value_text = str(value).strip()
+            if not value_text:
+                continue
+            if key.lower() == "password" and value_text.casefold() in placeholders:
+                continue
+            merged[key] = value
+
+    if not merged.get("remote_base_dir"):
+        merged["remote_base_dir"] = merged.get("root_remote_dir", "/English/Movies")
+    if not merged.get("port"):
+        merged["port"] = 21
+    if not merged.get("protocol"):
+        merged["protocol"] = "FTP"
+
+    return merged
+
+
 def list_ftp_dir_entries(remote_dir: str) -> dict[str, list[str]]:
     """اتصال به سرور FTP و دریافت لیست فایل‌ها و زیرپوشه‌های موجود در مسیر remote_dir"""
     result = {"files": [], "dirs": [], "exists": False}
-    ftp_cfg = cfg.get("cuteftp") or {}
+    ftp_cfg = _get_ftp_inspection_config()
     protocol = str(ftp_cfg.get("protocol", "FTP")).strip().upper()
     host = str(ftp_cfg.get("host", "")).strip()
     port = int(ftp_cfg.get("port", 21) or 21)
     username = str(ftp_cfg.get("username", "")).strip()
     password = str(ftp_cfg.get("password", "")).strip()
 
-    if not host or not username or not password or password == "ftppassword":
+    if (
+        not host
+        or not username
+        or not password
+        or password.strip().casefold() in {
+            "ftppassword",
+            "your_ftp_password",
+            "change_me",
+            "changeme",
+            "replace_me",
+        }
+    ):
         return result
 
     norm_dir = _normalize_remote_path(remote_dir)

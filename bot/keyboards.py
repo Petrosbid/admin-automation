@@ -48,69 +48,75 @@ def _append_pagination_row(
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
+    """منوی اصلی گروه‌بندی‌شده با برچسب‌های کوتاه‌تر و چیدمان سازگار با موبایل."""
     builder = InlineKeyboardBuilder()
 
+    # عملیات اصلی
     builder.row(
         InlineKeyboardButton(
-            text="🚀 اتوماسیون کامل و هوشمند (فیلم / سریال SxxEyy)",
+            text="🚀 اتوماسیون هوشمند",
             callback_data="menu:smart_auto"
         )
     )
 
+    # پایش و وضعیت سیستم
     builder.row(
         InlineKeyboardButton(
-            text="📡 مانیتورینگ خودکار (۵ سایت فیلم و سریال)",
+            text="📡 مانیتورینگ",
             callback_data="menu:monitor"
-        )
-    )
-
-    builder.row(
-        InlineKeyboardButton(
-            text="📁 ساخت پوشه (فیلم / سریال / انیمه)",
-            callback_data="menu:create_folder"
         ),
         InlineKeyboardButton(
-            text="📥 آپلود زیرنویس (SRT/ASS/ZIP)",
-            callback_data="menu:upload_sub_target"
+            text="📊 صف و پردازش‌ها",
+            callback_data="menu:queues"
         )
     )
 
+    # دریافت محتوا
     builder.row(
         InlineKeyboardButton(
-            text="🔍 ۱. جستجو در سایت‌ها",
+            text="🔎 جستجو",
             callback_data="menu:search"
         ),
         InlineKeyboardButton(
-            text="📥 ۲. دانلود لینک / تورنت (Batch)",
+            text="⬇️ دانلود لینک / تورنت",
             callback_data="menu:direct_dl"
         )
     )
 
+    # مدیریت فایل و پوشه
     builder.row(
         InlineKeyboardButton(
-            text="📤 ۳. استخراج زیرنویس (از پوشه / لینک)",
-            callback_data="menu:link_extract_sub"
+            text="📁 ساخت پوشه",
+            callback_data="menu:create_folder"
         ),
         InlineKeyboardButton(
-            text="🎬 ۴. سافت‌ساب / هاردساب / انکود دستی",
-            callback_data="menu:sub_to_files"
-        )
-    )
-
-    builder.row(
-        InlineKeyboardButton(
-            text="📂 ۵. فایل‌منیجر (انتخاب چندتایی / اکسترکت ZIP / CuteFTP)",
+            text="🗂 فایل‌منیجر",
             callback_data="menu:file_mgr"
         )
     )
 
+    # زیرنویس و پردازش ویدئو
     builder.row(
         InlineKeyboardButton(
-            text="📊 وضعیت صف و پراسس‌ها",
-            callback_data="menu:queues"
+            text="📤 آپلود زیرنویس",
+            callback_data="menu:upload_sub_target"
         ),
         InlineKeyboardButton(
-            text="⚙️ تنظیمات کانفیگ (/settings)",
+            text="📝 استخراج زیرنویس",
+            callback_data="menu:link_extract_sub"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🎬 SoftSub / HardSub / Encode",
+            callback_data="menu:sub_to_files"
+        )
+    )
+
+    # تنظیمات
+    builder.row(
+        InlineKeyboardButton(
+            text="⚙️ تنظیمات",
             callback_data="menu:settings"
         )
     )
@@ -595,14 +601,14 @@ def folder_structure_choice_kb() -> InlineKeyboardMarkup:
 
     builder.row(
         InlineKeyboardButton(
-            text="📺 سریال در Series/ (همراه با فصل S01 و پوشه‌های استاندارد)",
+            text="📺 سریال در Series/ (پوشه‌های کیفیت از سرور)",
             callback_data="mktype:series"
         )
     )
 
     builder.row(
         InlineKeyboardButton(
-            text="🎌 انیمه در Anime/ (همراه با فصل S01 و پوشه‌های استاندارد)",
+            text="🎌 انیمه در Anime/ (پوشه‌های کیفیت از سرور)",
             callback_data="mktype:anime"
         )
     )
@@ -1065,38 +1071,60 @@ def queue_management_kb(
             any(k in status_str for k in ("تکمیل", "خطا", "لغو"))
         )
         is_pending = "انتظار" in status_str
+        task_id = t.task_id
+        task_title = smart_middle_truncate(getattr(t, "title", "بدون عنوان"), 34)
 
         if is_done:
             builder.row(
                 InlineKeyboardButton(
-                    text=f"🗑 حذف #{t.task_id} | {smart_middle_truncate(t.title, 28)}",
-                    callback_data=f"qdel:{t.task_id}:{page}"
+                    text=f"✅ #{task_id} · {task_title}",
+                    callback_data="qnoop"
+                )
+            )
+            builder.row(
+                InlineKeyboardButton(
+                    text="🗑 حذف از فهرست",
+                    callback_data=f"qdel:{task_id}:{page}"
                 )
             )
         elif is_pending:
             builder.row(
                 InlineKeyboardButton(
-                    text=f"⏫ صدر #{t.task_id}",
-                    callback_data=f"qprio:top:{t.task_id}:{page}"
+                    text=f"⏳ #{task_id} · {task_title}",
+                    callback_data="qnoop"
+                )
+            )
+            builder.row(
+                InlineKeyboardButton(
+                    text="⏫ انتقال به ابتدا",
+                    callback_data=f"qprio:top:{task_id}:{page}"
                 ),
                 InlineKeyboardButton(
+                    text="✖️ لغو",
+                    callback_data=f"qcancel:{task_id}:{page}"
+                )
+            )
+            builder.row(
+                InlineKeyboardButton(
                     text="⬆️ بالاتر",
-                    callback_data=f"qprio:up:{t.task_id}:{page}"
+                    callback_data=f"qprio:up:{task_id}:{page}"
                 ),
                 InlineKeyboardButton(
                     text="⬇️ پایین‌تر",
-                    callback_data=f"qprio:down:{t.task_id}:{page}"
-                ),
-                InlineKeyboardButton(
-                    text="🛑 لغو",
-                    callback_data=f"qcancel:{t.task_id}:{page}"
-                ),
+                    callback_data=f"qprio:down:{task_id}:{page}"
+                )
             )
         else:
             builder.row(
                 InlineKeyboardButton(
-                    text=f"🛑 توقف در حال اجرا #{t.task_id} | {smart_middle_truncate(t.title, 22)}",
-                    callback_data=f"qcancel:{t.task_id}:{page}"
+                    text=f"⚙️ در حال اجرا · #{task_id} · {task_title}",
+                    callback_data="qnoop"
+                )
+            )
+            builder.row(
+                InlineKeyboardButton(
+                    text="🛑 توقف پردازش",
+                    callback_data=f"qcancel:{task_id}:{page}"
                 )
             )
 
