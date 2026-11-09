@@ -511,7 +511,9 @@ def sync_upload_cuteftp(
                     progress_prefix="",
                     progress_callback=progress_callback
                 )
-                uploaded_urls.append(_build_public_url(target_remote_dir, local_target.name))
+                public_url = _build_public_url(target_remote_dir, local_target.name)
+                if public_url:
+                    uploaded_urls.append(public_url)
                 logging.info(f"✅ [FTP UPLOAD DONE] File: {local_target.name}")
 
             else:
@@ -559,7 +561,9 @@ def sync_upload_cuteftp(
                         progress_prefix=prefix_str,
                         progress_callback=progress_callback
                     )
-                    uploaded_urls.append(_build_public_url(dest_folder, file_p.name))
+                    public_url = _build_public_url(dest_folder, file_p.name)
+                    if public_url:
+                        uploaded_urls.append(public_url)
 
                 logging.info(f"✅ [FTP FOLDER UPLOAD DONE] Folder: {local_target.name} ({total_files} files)")
 
