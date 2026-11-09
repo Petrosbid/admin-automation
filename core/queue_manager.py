@@ -591,6 +591,7 @@ class QueueManager:
                     server_choices = list(getattr(e, "servers", []) or [])
                     if server_choices:
                         task.awaiting_server_selection = True
+                        task.finished_ts = time.time()
                         task.status = "⏳ در انتظار انتخاب سرور"
                         task.progress = "پوشه روی چند سرور پیدا شد؛ منتظر انتخاب مقصد"
                         PENDING_SERVER_SELECTIONS[task.task_id] = {
