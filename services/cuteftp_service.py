@@ -27,8 +27,14 @@ class ServerSelectionRequired(RuntimeError):
 
     requires_server_selection = True
 
-    def __init__(self, remote_dir: str, servers: list[dict]):
+    def __init__(
+        self,
+        remote_dir: str,
+        servers: list[dict],
+        unavailable_servers: list[dict] | None = None,
+    ):
         self.remote_dir = str(remote_dir or "/")
+        self.unavailable_servers = list(unavailable_servers or [])
         self.servers = [
             {
                 "id": str(item.get("id", "")),
@@ -297,10 +303,20 @@ class CuteFTPService:
             return selected
 
         results = await cls.inspect_remote_dir_all(remote_subpath)
+        pairs = list(zip(servers, results))
         matches = [
             (server, result)
-            for server, result in zip(servers, results)
+            for server, result in pairs
             if result.get("exists")
+        ]
+        unavailable = [
+            {
+                "id": server["id"],
+                "name": server["name"],
+                "error": str(result.get("error") or "اتصال برقرار نشد"),
+            }
+            for server, result in pairs
+            if not result.get("checked", False) and not result.get("exists")
         ]
         if len(matches) > 1:
             choices = [
@@ -313,12 +329,26 @@ class CuteFTPService:
                     f"{result['server_name']}: {result['remote_dir']}"
                     for _, result in matches
                 )
-            raise ServerSelectionRequired(display_path, choices)
+            raise ServerSelectionRequired(display_path, choices, unavailable_servers=unavailable)
         if matches:
             return matches[0][0]
 
-        # اگر پوشه روی هیچ سروری وجود نداشته باشد، ساخت آن روی سرور اول انجام می‌شود.
-        return servers[0]
+        # وقتی هیچ پوشه‌ای پیدا نشده، فقط روی اولین سروری ایجاد می‌کنیم که واقعاً بررسی شده است.
+        reachable = [
+            server for server, result in pairs
+            if result.get("checked", False)
+        ]
+        if reachable:
+            return reachable[0]
+
+        # اگر هیچ سروری بررسی نشده باشد، مقصد را حدس نمی‌زنیم تا فایل در سرور اشتباه آپلود نشود.
+        errors = "; ".join(
+            f"{item['name']}: {item['error'][:120]}" for item in unavailable
+        )
+        raise RuntimeError(
+            "هیچ‌یک از سرورهای FTP قابل بررسی نبودند؛ برای جلوگیری از آپلود اشتباه عملیات متوقف شد. "
+            + errors
+        )
 
     @classmethod
     async def upload_path(
