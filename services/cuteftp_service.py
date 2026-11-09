@@ -274,6 +274,7 @@ class CuteFTPService:
         if not results:
             return {"files": [], "dirs": [], "exists": False, "matches": []}
 
+        existing_results = [item for item in results if item.get("exists")]
         matches = [
             {
                 "id": item["server_id"],
@@ -281,11 +282,38 @@ class CuteFTPService:
                 "remote_dir": item["remote_dir"],
                 "public_url": item.get("public_url", ""),
             }
-            for item in results if item.get("exists")
+            for item in existing_results
         ]
-        selected = next((item for item in results if item.get("exists")), results[0])
+        selected = existing_results[0] if existing_results else results[0]
         response = dict(selected)
+
+        # فهرست فایل‌ها و پوشه‌ها را از تمام سرورهای قابل‌دسترسی ادغام می‌کنیم
+        # تا جست‌وجوی عنوان/فصل و همگام‌سازی ساختار، محتوای سرورهای پشتیبان را هم ببیند.
+        def _unique_names(key: str) -> list[str]:
+            found: dict[str, str] = {}
+            for item in existing_results:
+                for raw_name in item.get(key, []) or []:
+                    name = str(raw_name).strip()
+                    if name and name not in (".", ".."):
+                        found.setdefault(name.casefold(), name)
+            return sorted(found.values(), key=str.casefold)
+
+        response["dirs"] = _unique_names("dirs")
+        response["files"] = _unique_names("files")
+        response["exists"] = bool(existing_results)
+        response["checked"] = any(item.get("checked", False) for item in results)
         response["matches"] = matches
+        response["server_ids"] = [item["server_id"] for item in existing_results]
+        response["server_names"] = [item["server_name"] for item in existing_results]
+        response["unavailable_servers"] = [
+            {
+                "id": item["server_id"],
+                "name": item["server_name"],
+                "error": str(item.get("error") or "اتصال برقرار نشد"),
+            }
+            for item in results
+            if not item.get("checked", False) and not item.get("exists")
+        ]
         return response
 
     @classmethod
