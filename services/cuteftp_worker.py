@@ -355,7 +355,7 @@ def _get_ftp_inspection_config() -> dict:
 
 def list_ftp_dir_entries(remote_dir: str, server_config: dict | None = None) -> dict[str, list[str]]:
     """اتصال به یک سرور مشخص و دریافت فایل‌ها و زیرپوشه‌های مسیر remote_dir"""
-    result = {"files": [], "dirs": [], "exists": False}
+    result = {"files": [], "dirs": [], "exists": False, "checked": False}
     ftp_cfg = dict(server_config) if isinstance(server_config, dict) else _get_ftp_inspection_config()
     protocol = str(ftp_cfg.get("protocol", "FTP")).strip().upper()
     host = str(ftp_cfg.get("host", "")).strip()
@@ -375,6 +375,7 @@ def list_ftp_dir_entries(remote_dir: str, server_config: dict | None = None) -> 
             "replace_me",
         }
     ):
+        result["error"] = "مشخصات اتصال FTP کامل نیست."
         return result
 
     norm_dir = _normalize_remote_path(remote_dir)
@@ -389,6 +390,7 @@ def list_ftp_dir_entries(remote_dir: str, server_config: dict | None = None) -> 
             timeout=int(ftp_cfg.get("timeout", 30) or 30),
             passive_mode=bool(ftp_cfg.get("passive_mode", True)),
         )
+        result["checked"] = True
         try:
             ftp.cwd(norm_dir)
             result["exists"] = True
@@ -424,6 +426,7 @@ def list_ftp_dir_entries(remote_dir: str, server_config: dict | None = None) -> 
 
         return result
     except Exception as e:
+        result["error"] = str(e)
         logging.warning(f"FTP inspect warning for {norm_dir}: {e}")
         return result
     finally:
