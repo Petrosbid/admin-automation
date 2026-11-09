@@ -1205,6 +1205,13 @@ def _build_automation_batch_status_text(
     return "\n".join(lines)[:3900]
 
 
+import asyncio
+import logging
+import time
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.types import Message
+
+
 async def _watch_smart_automation_batch(
     status_message: Message,
     batch_id: str,
@@ -1213,14 +1220,17 @@ async def _watch_smart_automation_batch(
     skipped_items: list[str],
     auto_upload: bool,
 ):
-    """پیام وضعیت واحد را هر چند ثانیه ویرایش می‌کند؛ برای هر فایل پیام جداگانه نمی‌فرستد."""
+    """پیام وضعیت واحد را با کنترل دقیق محدودیت تلگرام (Flood Wait) ویرایش می‌کند."""
     known_tasks = {task.task_id: task for task in initial_tasks}
     markup = _automation_batch_status_markup()
     last_rendered = None
     stable_completed_cycles = 0
 
+    last_edit_time = 0.0
+    MIN_EDIT_INTERVAL = 4.5  # حداقل فاصله امن (ثانیه) بین دو ویرایش موفق پیام
+
     while True:
-        # کارهای Upload که از داخل پردازش SoftSub/HardSub ساخته می‌شوند نیز batch_id را به ارث می‌برند.
+        # دریافت تسک‌های جدید هم‌گروه (مانند کارهای Upload خودکار)
         for task in list(queue_engine.tasks.values()):
             if getattr(task, "batch_id", None) == batch_id:
                 known_tasks[task.task_id] = task
@@ -1229,15 +1239,19 @@ async def _watch_smart_automation_batch(
         is_complete = bool(tasks) and all(task.is_finished for task in tasks)
         stable_completed_cycles = stable_completed_cycles + 1 if is_complete else 0
 
+        is_final = stable_completed_cycles >= 2
+
         report = _build_automation_batch_status_text(
             title=title,
             tasks=tasks,
             skipped_items=skipped_items,
             auto_upload=auto_upload,
-            final=stable_completed_cycles >= 2,
+            final=is_final,
         )
 
-        if report != last_rendered:
+        now = time.monotonic()
+        # فقط در صورتی پیام ویرایش شود که متن تغییر کرده باشد و حداقل ۴.۵ ثانیه گذشته باشد (یا پیام نهایی باشد)
+        if report != last_rendered and (is_final or (now - last_edit_time) >= MIN_EDIT_INTERVAL):
             try:
                 await status_message.edit_text(
                     report,
@@ -1246,15 +1260,29 @@ async def _watch_smart_automation_batch(
                     disable_web_page_preview=True,
                 )
                 last_rendered = report
+                last_edit_time = time.monotonic()
+            except TelegramRetryAfter as exc:
+                wait_sec = float(getattr(exc, "retry_after", 15))
+                logging.warning(
+                    "Telegram FloodWait hit in status watcher. Backing off for %.1f seconds.",
+                    wait_sec,
+                )
+                # در صورت دریافت خطای Flood، تا اتمام مدت زمان اعلام‌شده توسط تلگرام صبر کن تا محدودیت برداشته شود
+                await asyncio.sleep(wait_sec + 1.0)
+                last_edit_time = time.monotonic()
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    last_rendered = report
+                else:
+                    logging.warning("TelegramBadRequest updating status message: %s", exc)
             except Exception as exc:
-                if "message is not modified" not in str(exc).lower():
-                    logging.warning("Could not update automation status message: %s", exc)
+                logging.warning("Could not update automation status message: %s", exc)
 
-        if stable_completed_cycles >= 2:
+        if is_final:
             return
 
-        await asyncio.sleep(3)
-
+        # فاصله استراحت امن بین هر دور بررسی
+        await asyncio.sleep(4)
 
 async def _execute_smart_automation_batch(
     call: CallbackQuery,

@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+
 from core.config_loader import cfg
 from core.queue_manager import queue_engine
 from services.downloader_service import DownloaderService
@@ -55,6 +56,12 @@ class AutomationPlan:
 
 
 class AutomationService:
+    # کش‌های حافظه برای جلوگیری از اتصال تکراری به FTP و اجرای تکراری mkvmerge -J در اتوماسیون چندقسمتی
+    _MIRRORED_DIRS_CACHE: dict[str, float] = {}
+    _EMBEDDED_EN_CACHE: dict[str, tuple[int | None, str]] = {}
+    REMOTE_STRUCTURE_CACHE_TTL = 45
+    _remote_structure_cache: dict[str, tuple[float, bool, list[str]]] = {}
+
     EPISODE_REGEX = re.compile(r"[Ss](\d{1,2})[\s._\-]*[Ee][Pp]?(\d{1,3})")
     ALT_SXE_REGEX = re.compile(r"\b(\d{1,2})[xX](\d{1,2})\b")
     SEASON_DIR_REGEX = re.compile(r"^[Ss](?:eason[\s._\-]*)?(\d{1,2})$", re.IGNORECASE)
@@ -140,12 +147,6 @@ class AutomationService:
 
     @classmethod
     def extract_episode_tag(cls, text: str, fallback_season: int | None = None) -> str | None:
-        """
-        استخراج هوشمند تگ SxxEyy:
-        ۱. فرمت استاندارد S03E01 یا s03.e01
-        ۲. فرمت 3x01
-        ۳. اگر fallback_season مشخص باشد (مثلاً داخل پوشه S03 باشیم) و در نام فایل فقط E01 یا EP01 یا - 01 باشد، S03E01 می‌سازد.
-        """
         match = cls.EPISODE_REGEX.search(text)
         if match:
             s_num = int(match.group(1))
@@ -174,7 +175,6 @@ class AutomationService:
         if match_alt:
             return int(match_alt.group(2))
 
-        # حذف رزولوشن‌ها و کدک‌ها قبل از جستجوی شماره قسمت تکی (برای جلوگیری از اشتباه گرفتن 1080 یا 265)
         cleaned = re.sub(
             r"\b(?:2160p|1080p|720p|480p|360p|x264|x265|h264|h265|10bit|8bit|6ch|2ch|ddp5|aac2)\b",
             "",
@@ -209,11 +209,6 @@ class AutomationService:
 
     @classmethod
     def _find_raw_videos_in_dir(cls, directory: Path, recursive: bool = True) -> list[Path]:
-        """
-        پیدا کردن مستقیم تمام فایل‌های ویدئویی خام در یک پوشه کیفیت:
-        - فایل‌هایی که تگ .EBTV دارند را به درستی می‌پذیرد.
-        - فقط فایل‌های موقت (_temp_) و فایل‌هایی که قبلاً SoftSub یا HardSub شده‌اند را رد می‌کند.
-        """
         if not directory or not directory.exists():
             return []
 
@@ -234,7 +229,6 @@ class AutomationService:
                 continue
             if ".softsub." in low_name or ".hardsub." in low_name:
                 continue
-            # اگر در حالت recursive زیرپوشه‌ای از نوع SoftSub یا HardSub بود رد کن
             if recursive and f.parent != directory:
                 parent_low = f.parent.name.lower()
                 if parent_low in ("softsub", "hardsub", "srt", "sub") or parent_low.endswith(("-softsub", "-hardsub")):
@@ -455,18 +449,8 @@ class AutomationService:
             "srt": srt_dir,
         }
 
-    REMOTE_STRUCTURE_CACHE_TTL = 45
-    _remote_structure_cache: dict[str, tuple[float, bool, list[str]]] = {}
-
     @classmethod
     def normalize_server_quality_directories(cls, remote_dirs: list[str]) -> list[str]:
-        """
-        تبدیل پوشه‌های مستقیم سرور به نام پوشه‌های مجاز در Workspace.
-
-        - پوشه‌های SoftSub روی مبدا نیز ساخته می‌شوند.
-        - برای هر پوشه *-SoftSub، پوشه مبدأ بدون پسوند SoftSub را نیز می‌سازد.
-        - اگر نام یکی از پوشه‌های مقصد شامل EBTV باشد، FullHD را نیز تضمین می‌کند.
-        """
         local_names: set[str] = set()
 
         for raw_name in remote_dirs or []:
@@ -493,15 +477,38 @@ class AutomationService:
         return sorted(local_names, key=str.casefold)
 
     @classmethod
+    async def _mirror_remote_dirs_once(cls, target_dir: Path, force: bool = False):
+        """
+        همگام‌سازی پوشه‌های سرور مقصد با پوشه لوکال فقط ۱ بار در هر ۵ دقیقه برای هر پوشه فصل
+        (جلوگیری از اتصال مکرر FTP و تکرار لاگ Mirrored destination folders به ازای هر قسمت).
+        """
+        key = str(target_dir.resolve())
+        now = time.monotonic()
+        if not force and key in cls._MIRRORED_DIRS_CACHE and (now - cls._MIRRORED_DIRS_CACHE[key] < 300):
+            return
+
+        cls._MIRRORED_DIRS_CACHE[key] = now
+        try:
+            remote_path = cls.compute_server_remote_dir_for_local_path(target_dir)
+            info = await CuteFTPService.inspect_remote_dir(remote_path)
+            if info.get("exists") and info.get("dirs"):
+                normalized_dirs = cls.normalize_server_quality_directories(info["dirs"])
+                count = 0
+                for d_name in normalized_dirs:
+                    if d_name not in (".", ".."):
+                        (target_dir / d_name).mkdir(parents=True, exist_ok=True)
+                        count += 1
+                if count > 0:
+                    logging.info("Mirrored %d destination folders from %s into %s", count, remote_path, target_dir)
+        except Exception as exc:
+            logging.debug("Could not mirror remote directory once: %s", exc)
+
+    @classmethod
     async def create_season_structure_from_server(
         cls,
         season_folder: Path,
         category: str = "Series"
     ) -> dict[str, Path]:
-        """
-        ساخت ساختار محلی فصل بر اساس زیرپوشه‌های همان مسیر در سرور مقصد.
-        درخواست FTP در thread جدا اجرا می‌شود تا حلقه اصلی ربات مسدود نشود.
-        """
         season_folder = Path(season_folder).resolve()
         remote_dir = cls.compute_server_remote_dir_for_local_path(season_folder)
         cache_key = remote_dir.casefold()
@@ -630,7 +637,6 @@ class AutomationService:
 
     @classmethod
     def scan_available_episodes_in_season(cls, season_dir: Path) -> list[str]:
-        """اسکن تمام قسمت‌های موجود در زیرپوشه‌های فصل (پشتیبانی از S03E01، E01، 3x01 و - 01)"""
         episodes: set[str] = set()
         if not season_dir or not season_dir.exists():
             return []
@@ -698,10 +704,6 @@ class AutomationService:
 
     @classmethod
     def extract_media_title_query(cls, reference: str) -> str:
-        """
-        استخراج عنوان احتمالی فیلم/سریال از نام فایل، لینک دانلود یا Magnet URI.
-        تگ فصل/قسمت، رزولوشن، کدک و عبارت‌های انتشار حذف می‌شوند.
-        """
         raw = unquote(str(reference or "")).strip()
         if not raw:
             return ""
@@ -771,11 +773,6 @@ class AutomationService:
         reference: str,
         limit: int = 8,
     ) -> list[dict]:
-        """
-        جستجوی عنوان در Workspace و پوشه‌های سطح اول سرور مقصد.
-        خروجی path محلی متناظر دارد؛ اگر فولدر فقط روی سرور باشد، هنگام انتخاب ساخته می‌شود.
-        برای سریال، در صورت وجود SxxEyy فصل مرتبط پیشنهاد می‌شود.
-        """
         query = cls.extract_media_title_query(reference)
         if not query:
             return []
@@ -786,7 +783,6 @@ class AutomationService:
         episode_tag = cls.extract_episode_tag(reference)
         season_name = f"S{int(episode_tag[1:3]):02d}" if episode_tag else None
 
-        # فهرست پوشه‌های محلی و سرور در سطح عنوان.
         names_by_category: dict[str, set[str]] = {name: set() for name in category_names}
         for category, root in category_roots.items():
             try:
@@ -856,7 +852,6 @@ class AutomationService:
                         pass
                 selected_dirs = local_seasons[:3] or [show_dir]
 
-            # اگر عنوان فقط روی سرور است، فصل‌های آن را هم برای همان عنوان بررسی کن.
             if category != "Movies" and season_name is None and (
                 not any(cls.SEASON_DIR_REGEX.match(path.name) for path in selected_dirs)
             ):
@@ -954,18 +949,23 @@ class AutomationService:
     async def analyze_and_build_plan(
         cls,
         target_dir: Path,
-        episode_tag: str | None = None
+        episode_tag: str | None = None,
+        skip_heavy_probes: bool = False,
+        _skip_mirror: bool = False
     ) -> AutomationPlan:
         target_dir = target_dir.resolve()
+        if not _skip_mirror and not skip_heavy_probes:
+            await cls._mirror_remote_dirs_once(target_dir)
+
         category = cls.detect_category_from_path(target_dir)
         is_series = cls.is_series_season_dir(target_dir) or bool(episode_tag) or category in ("Series", "Anime")
 
         if is_series:
             is_anime = (category == "Anime")
-            paths = await cls.create_season_structure_from_server(
-                target_dir,
-                category="Anime" if is_anime else "Series",
-            )
+            if is_anime:
+                paths = cls.create_anime_season_structure(target_dir)
+            else:
+                paths = cls.create_series_season_structure(target_dir)
 
             series_title = target_dir.parent.name if cls.SEASON_DIR_REGEX.match(target_dir.name) else target_dir.name
             fallback_s = cls.extract_season_num_from_dir(target_dir)
@@ -992,7 +992,6 @@ class AutomationService:
                             plan.existing_en_sub = f.resolve()
                             break
 
-            # ۱. اسکن تمام زیرپوشه‌های کیفیت داخل فصل (مانند 1080p-EBTV, 1080p-x265-PSA, FullHD و...)
             for sub in sorted(target_dir.iterdir(), key=lambda p: p.name.lower()):
                 if not sub.is_dir():
                     continue
@@ -1029,7 +1028,6 @@ class AutomationService:
                         plan.fullhd_source_video = vid.resolve()
                         plan.source_type = cls.detect_source_type(vid.name)
 
-            # ۲. اگر کاربر به جای پوشه فصل، مستقیماً یک زیرپوشه کیفیت یا پوشه حاوی ویدئو را انتخاب کرده بود:
             if not plan.softsub_targets:
                 direct_vids = cls._find_raw_videos_in_dir(target_dir, recursive=False)
                 for vid in direct_vids:
@@ -1089,31 +1087,36 @@ class AutomationService:
                 plan.fullhd_source_video = raw_videos[0].resolve()
                 plan.source_type = cls.detect_source_type(plan.fullhd_source_video.name)
 
-        if plan.category != "Anime" and not plan.existing_en_sub and plan.softsub_targets:
-            search_vids = (
-                [plan.fullhd_source_video] + [t.raw_video for t in plan.softsub_targets]
-                if plan.fullhd_source_video
-                else [t.raw_video for t in plan.softsub_targets]
-            )
-            seen_v = set()
-            for candidate_vid in search_vids:
-                if not candidate_vid or str(candidate_vid) in seen_v:
-                    continue
-                seen_v.add(str(candidate_vid))
-                try:
-                    tracks = await MKVService.list_subtitle_tracks(candidate_vid)
-                    eng_tracks = [
-                        t for t in tracks
-                        if MKVService._is_english_track(t)
-                        and any(k in t["codec"].lower() for k in ("subrip", "srt", "ass", "ssa", "utf8", "text"))
-                    ]
-                    if eng_tracks:
-                        plan.embedded_en_source_video = candidate_vid
-                        plan.embedded_en_track_id = eng_tracks[0]["id"]
-                        plan.embedded_en_codec = eng_tracks[0]["codec"]
-                        break
-                except Exception:
-                    continue
+        # بررسی ترک زیرنویس انگلیسی داخل فیلم با کش حافظه و در صورت عدم درخواست skip_heavy_probes
+        if not skip_heavy_probes and plan.category != "Anime" and not plan.existing_en_sub and plan.softsub_targets:
+            primary_vid = plan.fullhd_source_video or plan.softsub_targets[0].raw_video
+            if primary_vid:
+                vid_key = str(primary_vid.resolve())
+                if vid_key in cls._EMBEDDED_EN_CACHE:
+                    cached_tid, cached_codec = cls._EMBEDDED_EN_CACHE[vid_key]
+                    if cached_tid is not None:
+                        plan.embedded_en_source_video = primary_vid
+                        plan.embedded_en_track_id = cached_tid
+                        plan.embedded_en_codec = cached_codec
+                else:
+                    try:
+                        tracks = await MKVService.list_subtitle_tracks(primary_vid)
+                        eng_tracks = [
+                            t for t in tracks
+                            if MKVService._is_english_track(t)
+                            and any(k in t["codec"].lower() for k in ("subrip", "srt", "ass", "ssa", "utf8", "text"))
+                        ]
+                        if eng_tracks:
+                            tid = eng_tracks[0]["id"]
+                            codec = eng_tracks[0]["codec"]
+                            cls._EMBEDDED_EN_CACHE[vid_key] = (tid, codec)
+                            plan.embedded_en_source_video = primary_vid
+                            plan.embedded_en_track_id = tid
+                            plan.embedded_en_codec = codec
+                        else:
+                            cls._EMBEDDED_EN_CACHE[vid_key] = (None, "")
+                    except Exception:
+                        pass
 
         return plan
 
@@ -1121,15 +1124,25 @@ class AutomationService:
     async def analyze_multi_episodes_plan(
         cls,
         target_dir: Path,
-        episode_tags: list[str]
+        episode_tags: list[str],
+        skip_heavy_probes: bool = False
     ) -> list[AutomationPlan]:
+        target_dir = target_dir.resolve()
+        # همگام‌سازی پوشه‌های سرور فقط ۱ بار قبل از حلقه
+        if not skip_heavy_probes:
+            await cls._mirror_remote_dirs_once(target_dir)
+
         if not episode_tags:
-            single = await cls.analyze_and_build_plan(target_dir, None)
+            single = await cls.analyze_and_build_plan(
+                target_dir, None, skip_heavy_probes=skip_heavy_probes, _skip_mirror=True
+            )
             return [single] if single.softsub_targets else []
 
         plans: list[AutomationPlan] = []
         for ep in sorted(set(episode_tags)):
-            p = await cls.analyze_and_build_plan(target_dir, ep)
+            p = await cls.analyze_and_build_plan(
+                target_dir, ep, skip_heavy_probes=skip_heavy_probes, _skip_mirror=True
+            )
             if p.softsub_targets:
                 plans.append(p)
         return plans

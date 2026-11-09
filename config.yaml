@@ -1,7 +1,7 @@
 telegram:
-  bot_token: "telegramtoken"
+  bot_token: "9194234248:AAGGkeiVf7E8v0BAL_Ft1R-VUvS6oh2ESME"
   admin_ids:
-    - 12345
+    - 815777731
   progress_update_interval: 3.0
 proxy:
   enabled: true
@@ -71,29 +71,29 @@ subtitle_style:
   shadow_depth: 1.0
 
 ftp:
-  host: "ftp1.example.com"
+  host: "185.130.50.130"
   port: 21
   protocol: "FTP"
-  username: "FTP_USERNAME_1"
-  password: "FTP_PASSWORD_1"
+  username: "hamid@dl15.cdnzed.sbs"
+  password: "p7vBKuwz8dFW4pRNjYJp"
   passive_mode: true
   timeout: 120
   remote_base_dir: "/English/Movies"
-  public_base_url: "https://download1.example.com"
+  public_base_url: "https://dl15.cdnzed.sbs/"
 
   servers:
     - id: primary
-      name: "سرور اصلی"
+      name: "سرور dl15"
       use_legacy: true
 
     - id: backup
-      name: "سرور دوم"
-      host: "ftp2.example.com"
+      name: "سرور dl16"
+      host: "185.130.50.50"
       port: 21
       protocol: "FTP"
-      username: "FTP_USERNAME_2"
-      password: "FTP_PASSWORD_2"
+      username: "ali@dl16.cdnzed.sbs"
+      password: "p7vBKuwz8dFW4pRNjYJp"
       passive_mode: true
       timeout: 120
       remote_base_dir: "/English/Movies"
-      public_base_url: "https://download2.example.com"
+      public_base_url: "https://dl16.cdnzed.sbs/"

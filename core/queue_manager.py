@@ -17,7 +17,62 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.config_loader import cfg
+import time
+import logging
+from aiogram.types import Message
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 
+# نگهداری زمان آخرین ویرایش برای هر پیام: {(chat_id, message_id): (last_time, last_text)}
+_MESSAGE_EDIT_CACHE: dict[tuple[int, int], tuple[float, str]] = {}
+
+
+async def safe_throttled_edit_text(
+    msg: Message,
+    new_text: str,
+    min_interval_sec: float = 4.5,
+    force: bool = False,
+    **kwargs
+) -> bool:
+    """
+    جلوگیری از خطای Too Many Requests (FloodWait) در تلگرام هنگام آپدیت وضعیت اتوماسیون:
+    - بین هر دو ویرایش روی یک پیام حداقل 4.5 ثانیه فاصله می‌اندازد (مگر اینکه force=True برای پیام پایان کار باشد).
+    - اگر متن تغییری نکرده باشد، درخواست تکراری به تلگرام نمی‌فرستد.
+    """
+    if not msg:
+        return False
+
+    key = (msg.chat.id, msg.message_id)
+    now = time.monotonic()
+    last_time, last_text = _MESSAGE_EDIT_CACHE.get(key, (0.0, ""))
+
+    # ۱. اگر متن دقیقاً همان متن قبلی است، اصلاً درخواست نفرست
+    if new_text == last_text:
+        return False
+
+    # ۲. اگر هنوز ۴.۵ ثانیه از آخرین آپدیت نگذشته و پیام پایانی (force) نیست، رد کن
+    if not force and (now - last_time) < min_interval_sec:
+        return False
+
+    try:
+        await msg.edit_text(new_text[:4000], **kwargs)
+        _MESSAGE_EDIT_CACHE[key] = (time.monotonic(), new_text)
+        return True
+
+    except TelegramRetryAfter as e:
+        # اگر تلگرام محدودیت Flood داد، زمان بعدی مجاز را به اندازه retry_after عقب ببر تا حلقه اسپم نکند
+        wait_s = float(getattr(e, "retry_after", 15))
+        _MESSAGE_EDIT_CACHE[key] = (time.monotonic() + wait_s, last_text)
+        logging.warning(f"⏳ Flood control on message {key}: pausing updates for {wait_s}s.")
+        return False
+
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            _MESSAGE_EDIT_CACHE[key] = (now, new_text)
+        return False
+
+    except Exception as e:
+        logging.debug(f"Could not update status message: {e}")
+        return False
 # کش موقت مسیرها برای دکمه‌های شیشه‌ای نوتیفیکیشن‌ها (حفظ در برابر Hot-Reload)
 NOTIF_PATH_REGISTRY: dict[str, str] = getattr(
     sys.modules.get(__name__), "NOTIF_PATH_REGISTRY", {}
