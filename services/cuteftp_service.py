@@ -1,7 +1,7 @@
 import asyncio
 import re
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import quote
 
 from core.config_loader import cfg
@@ -265,10 +265,10 @@ class CuteFTPService:
         ]
 
     @classmethod
-    async def inspect_remote_dir(cls, remote_dir: str) -> dict[str, list[str]]:
+    async def inspect_remote_dir(cls, remote_dir: str) -> dict[str, Any]:
         """
-        سازگاری با فراخوانی‌های قدیمی: اولین سروری که پوشه را دارد برگردانده می‌شود.
-        اطلاعات تمام سرورهای دارای پوشه نیز در کلید matches قرار می‌گیرد.
+        سازگاری با فراخوانی‌های قدیمی: فایل‌ها و پوشه‌های تمام سرورهای دارای مقصد
+        ادغام می‌شود و ترتیب اولویت در فهرست matches حفظ خواهد شد.
         """
         results = await cls.inspect_remote_dir_all(remote_dir)
         if not results:
