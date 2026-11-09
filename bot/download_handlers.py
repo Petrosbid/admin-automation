@@ -160,7 +160,7 @@ async def _send_missing_remote_folder_upload_prompt(
     """وقتی بعد از دانلود می‌خواهد فایلی را آپلود کند اما پوشه‌اش روی سرور نیست، از کاربر سوال می‌پرسد"""
     token = uuid.uuid4().hex[:6]
     PENDING_POST_DL_ITEMS[token] = {
-        "type": "fullhd_e01",
+        "type": "missing_remote_folder",
         "vid_path": str(vid_path.resolve()),
         "remote_dir": remote_folder_path,
     }
@@ -291,6 +291,19 @@ async def _smart_download_pipeline_job(
                 await _schedule_fullhd_destination_automation(
                     bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag
                 )
+                if remote_folder_exists:
+                    if auto_upload_cfg:
+                        await queue_engine.add_task(
+                            "upload",
+                            f"AutoUpload [{remote_folder_path}]: {vid.name}",
+                            CuteFTPService.upload_path,
+                            vid,
+                            remote_folder_path,
+                        )
+                else:
+                    await _send_missing_remote_folder_upload_prompt(
+                        bot, chat_id, vid, remote_folder_path
+                    )
             else:
                 suggested_std_name = await AutomationService.build_standard_raw_filename_for_folder(
                     video_path=vid,
@@ -305,14 +318,14 @@ async def _smart_download_pipeline_job(
                     vid_path=vid,
                     suggested_name=suggested_std_name,
                     remote_folder_path=remote_folder_path,
-                    should_auto_upload=False,
-                    ask_fullhd_e01_question=False,
+                    should_auto_upload=(auto_upload_cfg and remote_folder_exists),
+                    ask_fullhd_e01_question=(not remote_folder_exists),
                     fullhd_auto_encode=True,
                 )
             continue
 
         # اگر تنظیمات آپلود خودکار بعد از دانلود روشن است ولی پوشه روی سرور وجود ندارد -> از کاربر بپرس!
-        ask_missing_folder_question = (auto_upload_cfg and not remote_folder_exists)
+        ask_missing_folder_question = not remote_folder_exists
         should_auto_upload = (auto_upload_cfg and remote_folder_exists)
 
         copied_server_name = None
@@ -370,27 +383,9 @@ async def _smart_download_pipeline_job(
 
 
 async def _send_fullhd_e01_prompt(bot: Bot, chat_id: int, vid_path: Path, remote_folder_path: str):
-    token = uuid.uuid4().hex[:6]
-    PENDING_POST_DL_ITEMS[token] = {
-        "type": "fullhd_e01",
-        "vid_path": str(vid_path.resolve()),
-        "remote_dir": remote_folder_path,
-    }
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="✅ بله، پوشه FullHD در سرور ساخته و آپلود شود", callback_data=f"pdl:fhdyes:{token}"),
-        InlineKeyboardButton(text="❌ خیر، فقط در لوکال بماند", callback_data=f"pdl:fhdno:{token}"),
-    )
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"❓ **سوال درباره آپلود پوشه `FullHD` (قسمت اول فصل):**\n\n"
-            f"📄 فایل: `{vid_path.name}`\n"
-            f"پوشه `FullHD` در حال حاضر روی سرور اصلی (`{remote_folder_path}`) وجود ندارد، اما این فایل **قسمت اول فصل (`E01`)** است.\n\n"
-            "آیا می‌خواهید پوشه `FullHD` روی سرور اصلی هم ساخته و آپلود شود؟"
-        ),
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown"
+    # سازگاری با callbackهای قدیمی؛ سوال اکنون برای هر پوشه مقصدی استفاده می‌شود.
+    return await _send_missing_remote_folder_upload_prompt(
+        bot, chat_id, vid_path, remote_folder_path
     )
 
 def _release_fullhd_monitor(task: asyncio.Task):
@@ -1022,7 +1017,7 @@ async def cb_pdl_fullhd_upload_yes(call: CallbackQuery):
         remote_dir
     )
     await call.message.edit_text(
-        f"☁️ آپلود فایل `FullHD` (`{vid_path.name}`) به مسیر `{remote_dir}` در صف قرار گرفت! (کد: `{task.task_id}`)",
+        f"☁️ پوشه مقصد ساخته و آپلود فایل `{vid_path.name}` به مسیر `{remote_dir}` در صف قرار گرفت! (کد: `{task.task_id}`)",
         parse_mode="Markdown"
     )
 
@@ -1033,7 +1028,7 @@ async def cb_pdl_fullhd_upload_no(call: CallbackQuery):
     info = PENDING_POST_DL_ITEMS.pop(token, None)
     vid_name = Path(info["vid_path"]).name if info else "FullHD"
     await call.message.edit_text(
-        f"✅ فایل `{vid_name}` بدون آپلود به سرور، در پوشه `FullHD` لوکال(مبدا) برای هاردساب/انکود نگه داشته شد.",
+        f"✅ فایل `{vid_name}` در Workspace باقی ماند و به سرور آپلود نشد.",
         parse_mode="Markdown"
     )
 
@@ -1075,16 +1070,37 @@ async def _finalize_post_dl_rename_and_upload(
             vid_path.name,
             fallback_season=AutomationService.extract_season_num_from_dir(season_or_movie_dir),
         ) or ""
-        return await _schedule_fullhd_destination_automation(
+        await _schedule_fullhd_destination_automation(
             bot, chat_id, vid_path, season_or_movie_dir, is_ser, ep_tag
         )
+        if info.get("ask_fullhd_e01"):
+            return await _send_missing_remote_folder_upload_prompt(
+                bot, chat_id, vid_path, remote_dir
+            )
+        if info.get("should_auto_upload"):
+            task = await queue_engine.add_task(
+                "upload",
+                f"AutoUpload [{remote_dir}]: {vid_path.name}",
+                CuteFTPService.upload_path,
+                vid_path,
+                remote_dir,
+            )
+            return await bot.send_message(
+                chat_id,
+                f"☁️ فایل FullHD نیز به دلیل موجود بودن پوشه مقصد، بدون نیاز به تأیید در صف آپلود قرار گرفت. کد: <code>{task.task_id}</code>",
+                parse_mode="HTML",
+            )
+        return
 
     if info.get("ask_fullhd_e01"):
+        confirmation = f"✅ نام فایل نهایی شد: <code>{html.escape(vid_path.name)}</code>"
         if isinstance(msg_or_call, CallbackQuery):
-            await msg_or_call.message.edit_text(f"✅ نام فایل به `{vid_path.name}` تغییر یافت.", parse_mode="Markdown")
+            await msg_or_call.message.edit_text(confirmation, parse_mode="HTML")
         else:
-            await msg_or_call.answer(f"✅ نام فایل به `{vid_path.name}` تغییر یافت.", parse_mode="Markdown")
-        return await _send_fullhd_e01_prompt(bot, chat_id, vid_path, remote_dir)
+            await msg_or_call.answer(confirmation, parse_mode="HTML")
+        return await _send_missing_remote_folder_upload_prompt(
+            bot, chat_id, vid_path, remote_dir
+        )
 
     if info.get("should_auto_upload", True):
         task = await queue_engine.add_task(
@@ -1100,13 +1116,8 @@ async def _finalize_post_dl_rename_and_upload(
     else:
         done_txt = (
             f"✅ نام فایل به:\n`{vid_path.name}`\nتغییر یافت.\n"
-            f"ℹ️ *(چون پوشه `FullHD` در سرور اصلی نیست، فقط در لوکال ذخیره شد)*"
+            "ℹ️ آپلود خودکار غیرفعال است؛ فایل در Workspace باقی ماند."
         )
-
-    if isinstance(msg_or_call, CallbackQuery):
-        await msg_or_call.message.edit_text(done_txt, parse_mode="Markdown")
-    else:
-        await msg_or_call.answer(done_txt, parse_mode="Markdown")
 
     if isinstance(msg_or_call, CallbackQuery):
         await msg_or_call.message.edit_text(done_txt, parse_mode="Markdown")
@@ -1378,7 +1389,15 @@ async def cb_dlnav_open_subfolder(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     subfolders = data.get("dl_browser_subfolders", [])
     if idx < len(subfolders):
-        await _render_download_folder_browser(call, state, Path(subfolders[idx]), page=0)
+        target_dir = Path(subfolders[idx]).resolve()
+        if AutomationService.SEASON_DIR_REGEX.match(target_dir.name):
+            parts_low = [part.casefold() for part in target_dir.parts]
+            category = "Anime" if "anime" in parts_low else "Series"
+            await AutomationService.create_season_structure_from_server(
+                target_dir,
+                category=category,
+            )
+        await _render_download_folder_browser(call, state, target_dir, page=0)
 
 
 @router.callback_query(DownloadStates.browsing_download_folder, F.data == "dlnav:up")
@@ -1935,7 +1954,7 @@ async def cb_link_purpose(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("lnk:candidate:"))
-async def cb_link_candidate_selected(call: CallbackQuery):
+async def cb_link_candidate_selected(call: CallbackQuery, state: FSMContext):
     parts = call.data.split(":")
     if len(parts) != 4:
         return await call.answer("درخواست نامعتبر است.", show_alert=True)
@@ -1951,6 +1970,63 @@ async def cb_link_candidate_selected(call: CallbackQuery):
 
     info["selected_dir"] = candidate["path"]
     info["selected_label"] = candidate["label"]
+    chosen_dir = Path(candidate["path"]).resolve()
+    category = str(candidate.get("category", "")).strip()
+    reference = str(info.get("reference", "") or "")
+    episode_tag = (
+        candidate.get("episode_tag")
+        or AutomationService.extract_episode_tag(reference)
+        or ""
+    )
+
+    # انتخاب یک پیشنهاد Series/Anime، عنوان را تأیید می‌کند؛
+    # برای جلوگیری از دانلود در ریشه عنوان، ساختار فصل باید ابتدا آماده شود.
+    if category in ("Series", "Anime"):
+        if not AutomationService.SEASON_DIR_REGEX.match(chosen_dir.name):
+            if episode_tag:
+                season_name = f"S{int(episode_tag[1:3]):02d}"
+                chosen_dir = chosen_dir / season_name
+
+        chosen_dir.mkdir(parents=True, exist_ok=True)
+        await call.answer("عنوان تأیید شد؛ ساختار فصل از سرور بررسی و همگام می‌شود.")
+
+        if AutomationService.SEASON_DIR_REGEX.match(chosen_dir.name):
+            await AutomationService.create_season_structure_from_server(
+                chosen_dir,
+                category=category,
+            )
+            # در صورت وجود EBTV روی مقصد، همگام‌سازی FullHD را نیز ایجاد می‌کند.
+            preferred_download_dir = (
+                chosen_dir / "FullHD"
+                if (chosen_dir / "FullHD").is_dir()
+                else chosen_dir
+            )
+            await state.update_data(
+                pending_direct_targets=list(info.get("targets", [])),
+                dl_smart_series_title=candidate.get("name", chosen_dir.parent.name),
+                dl_smart_season=chosen_dir.name,
+                dl_smart_season_dir=str(chosen_dir),
+            )
+            PENDING_LINK_ACTIONS.pop(token, None)
+            await _render_download_folder_browser(
+                call,
+                state,
+                preferred_download_dir,
+                page=0,
+            )
+            return
+
+        # اگر شماره فصل از لینک قابل تشخیص نبود و سرور هم فصلی را پیشنهاد نکرد،
+        # کاربر باید از داخل پوشه سریال، فصل مناسب را انتخاب کند.
+        await state.update_data(
+            pending_direct_targets=list(info.get("targets", [])),
+            dl_smart_series_title=candidate.get("name", chosen_dir.name),
+        )
+        PENDING_LINK_ACTIONS.pop(token, None)
+        await _render_download_folder_browser(call, state, chosen_dir, page=0)
+        return
+
+    # برای فیلم سینمایی، همان مسیر عنوان مقصد مستقیم است.
     kb = InlineKeyboardBuilder()
     kb.row(
         InlineKeyboardButton(
@@ -1967,7 +2043,7 @@ async def cb_link_candidate_selected(call: CallbackQuery):
     kb.row(InlineKeyboardButton(text="🔙 بازگشت به پیشنهادها", callback_data=f"lnk:purpose:{token}:download"))
     await call.message.edit_text(
         f"✅ مقصد انتخاب‌شده: <b>{html.escape(candidate['label'])}</b>\n"
-        f"📂 مسیر محلی: <code>{html.escape(candidate['path'])}</code>\n"
+        f"📂 مسیر محلی: <code>{html.escape(str(chosen_dir))}</code>\n"
         f"☁️ مسیر متناظر سرور: <code>{html.escape(candidate['remote_path'])}</code>\n\n"
         "با تأیید زیر دانلود شروع می‌شود.",
         reply_markup=kb.as_markup(),

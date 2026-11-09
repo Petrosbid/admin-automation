@@ -22,6 +22,9 @@ from core.config_loader import cfg
 NOTIF_PATH_REGISTRY: dict[str, str] = getattr(
     sys.modules.get(__name__), "NOTIF_PATH_REGISTRY", {}
 )
+PENDING_SERVER_SELECTIONS: dict[str, dict] = getattr(
+    sys.modules.get(__name__), "PENDING_SERVER_SELECTIONS", {}
+)
 
 # Context inherited by child asyncio tasks created during an automation job.
 _CURRENT_AUTOMATION_BATCH_ID: ContextVar[str | None] = ContextVar(
@@ -63,6 +66,7 @@ class QueueTask:
     running_asyncio_task: asyncio.Task | None = None
     notify_completion: bool = True
     batch_id: str | None = None
+    awaiting_server_selection: bool = False
 
     @property
     def elapsed_str(self) -> str:
@@ -229,7 +233,12 @@ class QueueManager:
         آن را خودکار به لیست نوبت برمی‌گرداند تا هرگز تسکی در حالت انتظار قفل نشود.
         """
         for tid, t in list(self.tasks.items()):
-            if not t.is_finished and not t.is_cancelled and "انتظار" in str(t.status):
+            if (
+                not t.is_finished
+                and not t.is_cancelled
+                and not getattr(t, "awaiting_server_selection", False)
+                and "انتظار" in str(t.status)
+            ):
                 q_type = t.queue_type if t.queue_type in self.QUEUE_TYPES else "download"
                 if tid not in self.pending_lists[q_type]:
                     self.pending_lists[q_type].append(tid)
@@ -242,7 +251,13 @@ class QueueManager:
                 while self.pending_lists[queue_type]:
                     tid = self.pending_lists[queue_type].pop(0)
                     t = self.tasks.get(tid)
-                    if t and not t.is_cancelled and not t.is_finished and t.running_asyncio_task is None:
+                    if (
+                        t
+                        and not t.is_cancelled
+                        and not t.is_finished
+                        and not getattr(t, "awaiting_server_selection", False)
+                        and t.running_asyncio_task is None
+                    ):
                         # اگر هنوز تسک دیگری در لیست هست، Event را روشن نگه دار تا ورکر موازی بعدی هم بلافاصله بردارد
                         if self.pending_lists[queue_type]:
                             self._events[queue_type].set()
@@ -307,6 +322,67 @@ class QueueManager:
             )
         )
         return builder.as_markup()
+
+    @staticmethod
+    def _build_server_selection_kb(task_id: str, servers: list[dict]) -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        for server in servers:
+            server_id = str(server.get("id", "")).strip()
+            server_name = str(server.get("name") or server_id or "سرور").strip()
+            if not server_id:
+                continue
+            buttons = [
+                InlineKeyboardButton(
+                    text=f"✅ انتخاب {server_name[:24]}",
+                    callback_data=f"qsv:{task_id}:{server_id}",
+                )
+            ]
+            public_url = str(server.get("public_url") or "").strip()
+            if public_url.startswith(("http://", "https://")):
+                buttons.append(
+                    InlineKeyboardButton(
+                        text="🔗 لینک پوشه",
+                        url=public_url,
+                    )
+                )
+            builder.row(*buttons)
+        builder.row(InlineKeyboardButton(text="📊 مشاهده صف‌ها", callback_data="menu:queues"))
+        return builder.as_markup()
+
+    async def resume_task_with_server(self, task_id: str, server_id: str) -> bool:
+        """Resume a paused upload task after an administrator selects one of its matching servers."""
+        task = self.tasks.get(str(task_id))
+        pending = PENDING_SERVER_SELECTIONS.get(str(task_id))
+        if (
+            not task
+            or not pending
+            or not getattr(task, "awaiting_server_selection", False)
+            or task.is_finished
+            or task.is_cancelled
+        ):
+            return False
+
+        allowed_ids = {
+            str(item.get("id", ""))
+            for item in pending.get("servers", [])
+            if item.get("id")
+        }
+        if str(server_id) not in allowed_ids:
+            return False
+
+        async with self._locks[task.queue_type]:
+            task.kwargs["server_id"] = str(server_id)
+            task.awaiting_server_selection = False
+            task.status = "⏳ در انتظار"
+            task.progress = f"مقصد انتخاب شد: {server_id}"
+            task.started_ts = 0.0
+            task.finished_ts = 0.0
+            task.is_finished = False
+            task.is_cancelled = False
+            PENDING_SERVER_SELECTIONS.pop(str(task_id), None)
+            self.pending_lists[task.queue_type].append(str(task_id))
+            self._events[task.queue_type].set()
+        return True
 
     async def _notify_admins(self, html_text: str, reply_markup: InlineKeyboardMarkup | None = None):
         if not self._bot:
@@ -511,6 +587,43 @@ class QueueManager:
                 task.progress = "متوقف شده توسط کاربر"
                 task.is_finished = True
             except Exception as e:
+                if getattr(e, "requires_server_selection", False):
+                    server_choices = list(getattr(e, "servers", []) or [])
+                    if server_choices:
+                        task.awaiting_server_selection = True
+                        task.finished_ts = time.time()
+                        task.status = "⏳ در انتظار انتخاب سرور"
+                        task.progress = "پوشه روی چند سرور پیدا شد؛ منتظر انتخاب مقصد"
+                        PENDING_SERVER_SELECTIONS[task.task_id] = {
+                            "servers": server_choices,
+                            "remote_dir": str(getattr(e, "remote_dir", "")),
+                            "task_title": task.title,
+                        }
+                        safe_path = html.escape(str(getattr(e, "remote_dir", "")))
+                        safe_title = html.escape(str(task.title))
+                        unavailable = list(getattr(e, "unavailable_servers", []) or [])
+                        unavailable_note = ""
+                        if unavailable:
+                            names = "، ".join(
+                                html.escape(str(item.get("name") or item.get("id") or "سرور"))
+                                for item in unavailable
+                            )
+                            unavailable_note = (
+                                f"\n⚠️ بررسی این سرورها به دلیل خطای اتصال کامل نشد: <b>{names}</b>\n"
+                            )
+                        await self._notify_admins(
+                            f"⚠️ <b>پوشه مقصد روی چند سرور وجود دارد</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🆔 کد تسک: <code>{html.escape(task.task_id)}</code>\n"
+                            f"📌 عملیات: <code>{safe_title}</code>\n"
+                            f"📂 مسیر: <code>{safe_path}</code>\n"
+                            f"{unavailable_note}\n"
+                            "لطفاً سرور موردنظر را انتخاب کنید. لینک مستقیم هر پوشه نیز کنار گزینه آن قرار دارد؛ "
+                            "پس از انتخاب، همین تسک دوباره در صف اجرا می‌شود.",
+                            reply_markup=self._build_server_selection_kb(task.task_id, server_choices),
+                        )
+                        continue
+
                 task.finished_ts = time.time()
                 logging.error(f"Task {task.task_id} failed:\n{traceback.format_exc()}")
                 task.error = str(e)
@@ -621,6 +734,8 @@ class QueueManager:
         if not t:
             return False
         t.is_cancelled = True
+        t.awaiting_server_selection = False
+        PENDING_SERVER_SELECTIONS.pop(str(task_id), None)
         if t.queue_type in self.pending_lists and task_id in self.pending_lists[t.queue_type]:
             self.pending_lists[t.queue_type].remove(task_id)
         if t.running_asyncio_task and not t.running_asyncio_task.done():
@@ -634,6 +749,7 @@ class QueueManager:
             t = self.tasks[task_id]
             if t.queue_type in self.pending_lists and task_id in self.pending_lists[t.queue_type]:
                 self.pending_lists[t.queue_type].remove(task_id)
+            PENDING_SERVER_SELECTIONS.pop(str(task_id), None)
             del self.tasks[task_id]
             return True
         return False

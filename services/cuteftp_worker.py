@@ -6,7 +6,7 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from core.config_loader import cfg
 
@@ -49,7 +49,8 @@ def _create_ftp_connection(
     username: str,
     password: str,
     protocol: str = "FTP",
-    timeout: int = 120
+    timeout: int = 120,
+    passive_mode: bool = True
 ) -> FTP:
     """ایجاد اتصال پایدار FTP یا FTPS با استفاده از مشخصات ثبت‌شده در config.yaml"""
     use_tls = str(protocol).strip().upper() in ("FTPS", "FTPES", "TLS", "SSL")
@@ -63,7 +64,7 @@ def _create_ftp_connection(
     if use_tls and isinstance(ftp, FTP_TLS):
         ftp.prot_p()
 
-    ftp.set_pasv(True)
+    ftp.set_pasv(bool(passive_mode))
     return ftp
 
 
@@ -352,10 +353,10 @@ def _get_ftp_inspection_config() -> dict:
     return merged
 
 
-def list_ftp_dir_entries(remote_dir: str) -> dict[str, list[str]]:
-    """اتصال به سرور FTP و دریافت لیست فایل‌ها و زیرپوشه‌های موجود در مسیر remote_dir"""
-    result = {"files": [], "dirs": [], "exists": False}
-    ftp_cfg = _get_ftp_inspection_config()
+def list_ftp_dir_entries(remote_dir: str, server_config: dict | None = None) -> dict[str, Any]:
+    """اتصال به یک سرور مشخص و دریافت فایل‌ها و زیرپوشه‌های مسیر remote_dir"""
+    result = {"files": [], "dirs": [], "exists": False, "checked": False}
+    ftp_cfg = dict(server_config) if isinstance(server_config, dict) else _get_ftp_inspection_config()
     protocol = str(ftp_cfg.get("protocol", "FTP")).strip().upper()
     host = str(ftp_cfg.get("host", "")).strip()
     port = int(ftp_cfg.get("port", 21) or 21)
@@ -374,14 +375,22 @@ def list_ftp_dir_entries(remote_dir: str) -> dict[str, list[str]]:
             "replace_me",
         }
     ):
+        result["error"] = "مشخصات اتصال FTP کامل نیست."
         return result
 
     norm_dir = _normalize_remote_path(remote_dir)
     ftp = None
     try:
         ftp = _create_ftp_connection(
-            host=host, port=port, username=username, password=password, protocol=protocol, timeout=30
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            protocol=protocol,
+            timeout=int(ftp_cfg.get("timeout", 30) or 30),
+            passive_mode=bool(ftp_cfg.get("passive_mode", True)),
         )
+        result["checked"] = True
         try:
             ftp.cwd(norm_dir)
             result["exists"] = True
@@ -417,6 +426,7 @@ def list_ftp_dir_entries(remote_dir: str) -> dict[str, list[str]]:
 
         return result
     except Exception as e:
+        result["error"] = str(e)
         logging.warning(f"FTP inspect warning for {norm_dir}: {e}")
         return result
     finally:
@@ -426,27 +436,40 @@ def list_ftp_dir_entries(remote_dir: str) -> dict[str, list[str]]:
 def sync_upload_cuteftp(
     local_target: Path,
     remote_subpath: str = "__CURRENT__",
-    progress_callback: Callable[[str], None] | None = None
+    progress_callback: Callable[[str], None] | None = None,
+    server_config: dict | None = None,
 ) -> list[str]:
     local_target = Path(local_target).resolve()
     if not local_target.exists():
         raise FileNotFoundError(f"فایل یا پوشه مورد نظر برای آپلود وجود ندارد: {local_target}")
 
     with _FTP_SERIAL_LOCK:
-        ftp_cfg = cfg.get("cuteftp") or {}
+        ftp_cfg = dict(server_config) if isinstance(server_config, dict) else _get_ftp_inspection_config()
         protocol = str(ftp_cfg.get("protocol", "FTP")).strip().upper()
         host = str(ftp_cfg.get("host", "")).strip()
         port = int(ftp_cfg.get("port", 21) or 21)
         username = str(ftp_cfg.get("username", "")).strip()
         password = str(ftp_cfg.get("password", "")).strip()
 
-        if not host or not username or not password or password == "ftppassword":
+        if (
+            not host
+            or not username
+            or not password
+            or password.strip().casefold() in {
+                "ftppassword", "your_ftp_password", "change_me",
+                "changeme", "replace_me", "your_password"
+            }
+        ):
             raise RuntimeError(
                 "مشخصات اتصال FTP (فیلدهای host، username یا password) در config.yaml تنظیم نشده است!\n"
                 "لطفاً دستور /settings را در ربات بزنید و رمز عبور سرور را ثبت کنید."
             )
 
-        base_url = str(ftp_cfg.get("base_download_url", "https://dl15.cdnzed.sbs")).rstrip("/")
+        base_url = str(
+            ftp_cfg.get("base_download_url")
+            or ftp_cfg.get("public_base_url")
+            or ""
+        ).rstrip("/")
         if ("dl.example.com" in base_url or not base_url) and username.startswith("@"):
             base_url = f"https://{username.lstrip('@')}"
 
@@ -463,7 +486,8 @@ def sync_upload_cuteftp(
             "username": username,
             "password": password,
             "protocol": protocol,
-            "timeout": 120,
+            "timeout": int(ftp_cfg.get("timeout", 120) or 120),
+            "passive_mode": bool(ftp_cfg.get("passive_mode", True)),
         }
 
         ftp_holder: list[FTP | None] = [None]
@@ -476,7 +500,7 @@ def sync_upload_cuteftp(
                     clean_sub = clean_sub[len(pub_prefix):]
             clean_sub = clean_sub.strip("/")
             rel_url = f"{clean_sub}/{filename}".lstrip("/")
-            return f"{base_url}/{urllib.parse.quote(rel_url)}"
+            return f"{base_url}/{urllib.parse.quote(rel_url)}" if base_url else ""
 
         try:
             if local_target.is_file():
@@ -490,7 +514,9 @@ def sync_upload_cuteftp(
                     progress_prefix="",
                     progress_callback=progress_callback
                 )
-                uploaded_urls.append(_build_public_url(target_remote_dir, local_target.name))
+                public_url = _build_public_url(target_remote_dir, local_target.name)
+                if public_url:
+                    uploaded_urls.append(public_url)
                 logging.info(f"✅ [FTP UPLOAD DONE] File: {local_target.name}")
 
             else:
@@ -538,7 +564,9 @@ def sync_upload_cuteftp(
                         progress_prefix=prefix_str,
                         progress_callback=progress_callback
                     )
-                    uploaded_urls.append(_build_public_url(dest_folder, file_p.name))
+                    public_url = _build_public_url(dest_folder, file_p.name)
+                    if public_url:
+                        uploaded_urls.append(public_url)
 
                 logging.info(f"✅ [FTP FOLDER UPLOAD DONE] Folder: {local_target.name} ({total_files} files)")
 

@@ -490,6 +490,7 @@ async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
     folder_name = data["new_folder_name"].replace("_", ".")
 
     cats = AutomationService.ensure_workspace_root_categories()
+    extra_structure_info = ""
 
     if mk_type in ("movie", "standard"):
         base_parent = cats["Movies"] if parent_dir == workspace else parent_dir
@@ -497,21 +498,46 @@ async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
         AutomationService.create_movie_structure(new_dir)
         sub_target = new_dir / "srt"
         desc = "در شاخه `Movies` با ساختار استاندارد فیلم (`SoftSub`, `Hardsub`, `srt`)"
-    elif mk_type in ("series"):
-        cat_key = "Anime" if mk_type == "anime" else "Series"
+    elif mk_type in ("series", "anime"):
+        is_anime = mk_type == "anime"
+        cat_key = "Anime" if is_anime else "Series"
         base_parent = cats[cat_key] if parent_dir == workspace else parent_dir
-        show_dir = base_parent / folder_name
-        new_dir = show_dir / "S01" if not AutomationService.SEASON_DIR_REGEX.match(folder_name) else show_dir
-        AutomationService.create_series_season_structure(new_dir)
-        sub_target = new_dir / "srt" / "FA"
-        desc = f"در شاخه `{cat_key}` همراه با پوشه‌های پیش‌فرض فصل (`1080p-EBTV`, `720p-EBTV`, `1080p-x265-PSA`, `720p-x265-PSA`, `480p-RMTeam`, `srt/FA`, `srt/EN`)"
-    elif mk_type == "anime":
-        base_parent = cats["Anime"] if parent_dir == workspace else parent_dir
-        show_dir = base_parent / folder_name
-        new_dir = show_dir / "S01" if not AutomationService.SEASON_DIR_REGEX.match(folder_name) else show_dir
-        AutomationService.create_anime_season_structure(new_dir)
-        sub_target = new_dir / "srt"
-        desc = "در شاخه `Anime` همراه با پوشه‌های استاندارد (`1080p-EBTV`, `720p-EBTV`, `480p-EBTV`, `FullHD`, `1080p-x265-Judas`, `srt`)"
+
+        if AutomationService.SEASON_DIR_REGEX.match(folder_name):
+            # اگر از داخل فصل یا یکی از زیرپوشه‌های آن فصل جدیدی ساخته شود،
+            # فصل جدید باید کنار فصل فعلی ساخته شود، نه داخل آن.
+            show_dir = base_parent
+            for ancestor in (parent_dir, parent_dir.parent, parent_dir.parent.parent):
+                if ancestor and AutomationService.SEASON_DIR_REGEX.match(ancestor.name):
+                    show_dir = ancestor.parent
+                    break
+            new_dir = show_dir / folder_name
+        else:
+            show_dir = base_parent / folder_name
+            new_dir = show_dir / "S01"
+
+        await AutomationService.create_season_structure_from_server(
+            new_dir,
+            category=cat_key,
+        )
+        sub_target = new_dir / "srt" if is_anime else new_dir / "srt" / "FA"
+        desc = f"در شاخه `{cat_key}`؛ پوشه‌های کیفیت از مسیر متناظر سرور همگام شدند"
+
+        synced_quality_dirs = sorted(
+            p.name for p in new_dir.iterdir()
+            if p.is_dir() and p.name.casefold() != "srt"
+        )
+        if synced_quality_dirs:
+            extra_structure_info = (
+                "🗂 **پوشه‌های کیفیت همگام‌شده:**\n"
+                + "\n".join(f"• `{name}`" for name in synced_quality_dirs)
+                + "\n\n"
+            )
+        else:
+            extra_structure_info = (
+                "ℹ️ در مسیر متناظر سرور پوشه کیفیتی برای همگام‌سازی پیدا نشد "
+                "یا دسترسی FTP در دسترس نبود؛ پوشه‌های زیرنویس ساخته شدند.\n\n"
+            )
     else:
         new_dir = parent_dir / folder_name
         new_dir.mkdir(parents=True, exist_ok=True)
@@ -529,7 +555,8 @@ async def cb_create_folder_finalize(call: CallbackQuery, state: FSMContext):
 
     await call.message.edit_text(
         f"✅ پوشه جدید {desc} ساخته شد!\n\n"
-        f"📂 مسیر در سرور:\n`{new_dir}`\n"
+        f"📂 مسیر محلی:\n`{new_dir}`\n"
+        f"{extra_structure_info}"
         f"☁️ مسیر معادل در هاست دانلود:\n`{AutomationService.compute_server_remote_dir_for_local_path(new_dir)}`",
         reply_markup=kb.as_markup(),
         parse_mode="Markdown"
@@ -1240,6 +1267,33 @@ async def cb_notif_run_smart_auto_on_folder(call: CallbackQuery, state: FSMConte
     folder_p = target_p if target_p.is_dir() else target_p.parent
     await state.update_data(sauto_selected_eps=[])
     await _render_smart_auto_browser(call, state, folder_p, page=0)
+
+
+@router.callback_query(F.data.startswith("qsv:"))
+async def cb_queue_choose_upload_server(call: CallbackQuery):
+    """ادامه‌دادن تسک آپلود پس از انتخاب یکی از سرورهای دارای پوشه مقصد."""
+    parts = (call.data or "").split(":", 2)
+    if len(parts) != 3:
+        return await call.answer("درخواست انتخاب سرور معتبر نیست.", show_alert=True)
+
+    _, task_id, server_id = parts
+    resumed = await queue_engine.resume_task_with_server(task_id, server_id)
+    if not resumed:
+        return await call.answer(
+            "این انتخاب منقضی شده یا تسک قبلاً توسط ادمین دیگری تعیین تکلیف شده است.",
+            show_alert=True,
+        )
+
+    try:
+        await call.message.edit_text(
+            f"✅ سرور انتخاب شد: <code>{server_id}</code>\n"
+            f"🆔 تسک <code>{task_id}</code> دوباره در صف آپلود قرار گرفت.",
+            parse_mode="HTML",
+            reply_markup=main_menu_kb(),
+        )
+    except Exception:
+        pass
+    await call.answer("تسک برای اجرای مجدد در صف قرار گرفت.")
 
 
 @router.callback_query(F.data.startswith("ntf:up:"))
