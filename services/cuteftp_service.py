@@ -110,6 +110,11 @@ class CuteFTPService:
             or "/English/Movies"
         ).strip()
 
+        try:
+            timeout = max(5, int(server.get("timeout", 120) or 120))
+        except (TypeError, ValueError):
+            timeout = 120
+
         server.update({
             "id": server_id,
             "name": str(server.get("name") or f"سرور {index + 1}").strip(),
@@ -118,7 +123,7 @@ class CuteFTPService:
             "username": username,
             "password": password,
             "protocol": str(server.get("protocol") or "FTP").strip().upper(),
-            "timeout": int(server.get("timeout", 120) or 120),
+            "timeout": timeout,
             "passive_mode": bool(server.get("passive_mode", True)),
             "remote_base_dir": cls._normalize_remote_path(remote_base),
             "base_download_url": base_url,
@@ -302,7 +307,13 @@ class CuteFTPService:
                 cls._public_server_info(server, result["remote_dir"])
                 for server, result in matches
             ]
-            raise ServerSelectionRequired(remote_subpath, choices)
+            display_path = remote_subpath
+            if not display_path or display_path == "__CURRENT__":
+                display_path = " | ".join(
+                    f"{result['server_name']}: {result['remote_dir']}"
+                    for _, result in matches
+                )
+            raise ServerSelectionRequired(display_path, choices)
         if matches:
             return matches[0][0]
 
