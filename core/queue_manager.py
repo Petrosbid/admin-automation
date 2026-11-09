@@ -591,7 +591,7 @@ class QueueManager:
                     server_choices = list(getattr(e, "servers", []) or [])
                     if server_choices:
                         task.awaiting_server_selection = True
-                        task.status = "⏸ انتخاب سرور"
+                        task.status = "⏳ در انتظار انتخاب سرور"
                         task.progress = "پوشه روی چند سرور پیدا شد؛ منتظر انتخاب مقصد"
                         PENDING_SERVER_SELECTIONS[task.task_id] = {
                             "servers": server_choices,
@@ -737,6 +737,7 @@ class QueueManager:
             t = self.tasks[task_id]
             if t.queue_type in self.pending_lists and task_id in self.pending_lists[t.queue_type]:
                 self.pending_lists[t.queue_type].remove(task_id)
+            PENDING_SERVER_SELECTIONS.pop(str(task_id), None)
             del self.tasks[task_id]
             return True
         return False
