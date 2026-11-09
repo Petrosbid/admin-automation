@@ -1,7 +1,6 @@
 telegram:
-  bot_token: "9194234248:AAGGkeiVf7E8v0BAL_Ft1R-VUvS6oh2ESME"
-  admin_ids:
-    - 815777731
+  bot_token: "PUT_YOUR_NEW_TELEGRAM_BOT_TOKEN_HERE"
+  admin_ids: []
   progress_update_interval: 3.0
 proxy:
   enabled: true
@@ -71,6 +70,26 @@ subtitle_style:
   shadow_depth: 1.0
 
 ftp:
+  # ترتیب اعضای ftp.servers همان ترتیب بررسی و اولویت سرورهاست.
+  # برای حفظ تنظیمات قدیمی و افزودن سرور دوم، نمونه زیر را فعال کنید.
+  servers: []
+  #
+  # نمونه تنظیم چند سرور:
+  # servers:
+  #   - id: primary
+  #     name: "سرور اول"
+  #     use_legacy: true
+  #   - id: backup
+  #     name: "سرور دوم"
+  #     host: "ftp2.example.com"
+  #     port: 21
+  #     protocol: "FTP"       # یا FTPS
+  #     username: "FTP_USER"
+  #     password: "FTP_PASSWORD"
+  #     passive_mode: true
+  #     timeout: 120
+  #     remote_base_dir: "/English/Movies"
+  #     public_base_url: "https://download2.example.com"
   host: "dl15.cdnzed.sbs"           # آدرس هاست یا IP سرور دانلود
   port: 21                          # پورت FTP
   username: "3443"                  # نام کاربری استخراج شده
