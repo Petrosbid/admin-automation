@@ -6,7 +6,7 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from core.config_loader import cfg
 
@@ -353,7 +353,7 @@ def _get_ftp_inspection_config() -> dict:
     return merged
 
 
-def list_ftp_dir_entries(remote_dir: str, server_config: dict | None = None) -> dict[str, list[str]]:
+def list_ftp_dir_entries(remote_dir: str, server_config: dict | None = None) -> dict[str, Any]:
     """اتصال به یک سرور مشخص و دریافت فایل‌ها و زیرپوشه‌های مسیر remote_dir"""
     result = {"files": [], "dirs": [], "exists": False, "checked": False}
     ftp_cfg = dict(server_config) if isinstance(server_config, dict) else _get_ftp_inspection_config()
