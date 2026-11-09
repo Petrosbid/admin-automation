@@ -600,12 +600,23 @@ class QueueManager:
                         }
                         safe_path = html.escape(str(getattr(e, "remote_dir", "")))
                         safe_title = html.escape(str(task.title))
+                        unavailable = list(getattr(e, "unavailable_servers", []) or [])
+                        unavailable_note = ""
+                        if unavailable:
+                            names = "، ".join(
+                                html.escape(str(item.get("name") or item.get("id") or "سرور"))
+                                for item in unavailable
+                            )
+                            unavailable_note = (
+                                f"\n⚠️ بررسی این سرورها به دلیل خطای اتصال کامل نشد: <b>{names}</b>\n"
+                            )
                         await self._notify_admins(
                             f"⚠️ <b>پوشه مقصد روی چند سرور وجود دارد</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━\n"
                             f"🆔 کد تسک: <code>{html.escape(task.task_id)}</code>\n"
                             f"📌 عملیات: <code>{safe_title}</code>\n"
-                            f"📂 مسیر: <code>{safe_path}</code>\n\n"
+                            f"📂 مسیر: <code>{safe_path}</code>\n"
+                            f"{unavailable_note}\n"
                             "لطفاً سرور موردنظر را انتخاب کنید. لینک مستقیم هر پوشه نیز کنار گزینه آن قرار دارد؛ "
                             "پس از انتخاب، همین تسک دوباره در صف اجرا می‌شود.",
                             reply_markup=self._build_server_selection_kb(task.task_id, server_choices),
