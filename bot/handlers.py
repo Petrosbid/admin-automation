@@ -1269,6 +1269,33 @@ async def cb_notif_run_smart_auto_on_folder(call: CallbackQuery, state: FSMConte
     await _render_smart_auto_browser(call, state, folder_p, page=0)
 
 
+@router.callback_query(F.data.startswith("qsv:"))
+async def cb_queue_choose_upload_server(call: CallbackQuery):
+    """ادامه‌دادن تسک آپلود پس از انتخاب یکی از سرورهای دارای پوشه مقصد."""
+    parts = (call.data or "").split(":", 2)
+    if len(parts) != 3:
+        return await call.answer("درخواست انتخاب سرور معتبر نیست.", show_alert=True)
+
+    _, task_id, server_id = parts
+    resumed = await queue_engine.resume_task_with_server(task_id, server_id)
+    if not resumed:
+        return await call.answer(
+            "این انتخاب منقضی شده یا تسک قبلاً توسط ادمین دیگری تعیین تکلیف شده است.",
+            show_alert=True,
+        )
+
+    try:
+        await call.message.edit_text(
+            f"✅ سرور انتخاب شد: <code>{server_id}</code>\n"
+            f"🆔 تسک <code>{task_id}</code> دوباره در صف آپلود قرار گرفت.",
+            parse_mode="HTML",
+            reply_markup=main_menu_kb(),
+        )
+    except Exception:
+        pass
+    await call.answer("تسک برای اجرای مجدد در صف قرار گرفت.")
+
+
 @router.callback_query(F.data.startswith("ntf:up:"))
 async def cb_notif_quick_upload_file(call: CallbackQuery):
     """آپلود سریع فایل تولیدشده به مسیر متناظر سرور با ۱ کلیک از روی نوتیفیکیشن"""
