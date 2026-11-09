@@ -47,8 +47,8 @@ paths:
 
 qbittorrent:
   webui_url: "http://127.0.0.1:8080"
-  username: "admin"
-  password: "adminpassword"
+  username: "YOUR_QBITTORRENT_USERNAME"
+  password: "YOUR_QBITTORRENT_PASSWORD"
 
 
 branding:
@@ -92,7 +92,7 @@ ftp:
   #     public_base_url: "https://download2.example.com"
   host: "dl15.cdnzed.sbs"           # آدرس هاست یا IP سرور دانلود
   port: 21                          # پورت FTP
-  username: "3443"                  # نام کاربری استخراج شده
+  username: "YOUR_FTP_USERNAME"                  # نام کاربری استخراج شده
   password: "YOUR_FTP_PASSWORD"     # رمز عبور استخراج شده
   passive_mode: true                # حالت Passive (پیشنهادی برای عبور از فایروال)
   timeout: 60                       # تایم‌اوت سوکت به ثانیه
