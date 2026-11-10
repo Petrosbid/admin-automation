@@ -894,57 +894,167 @@ class AutomationService:
         return results
 
     @classmethod
-    def find_matching_workspace_folder_for_sub(cls, sub_filename: str) -> tuple[Path | None, list[str]]:
+    def _normalize_title_for_match(cls, text: str) -> tuple[str, list[str]]:
+        """نرمال‌سازی دقیق نام زیرنویس یا پوشه برای تطبیق ۱۰۰٪ (حذف آپوستروف، سال، کیفیت و تگ‌های اضافی)"""
+        # حذف پسوند فایل
+        stem = Path(text).stem if "." in text else text
+        # حذف آپوستروف تا All's با Alls یکی شود
+        stem = stem.replace("'", "").replace("’", "").replace("`", "")
+        # بریدن از محل تگ فصل/قسمت یا سال یا کیفیت به بعد
+        stem = re.split(
+            r"[\s._\-\[\(]+(?:[Ss]\d{1,2}[\s._\-]*[Ee][Pp]?\d{1,3}|\d{1,2}[xX]\d{1,2}|[Ss]eason[\s._\-]*\d+|(?:19|20)\d{2}|2160p|1080p|720p|480p|WEB-DL|WEBRip|BluRay|BDRip|DVDRip|Sub|FA|EN|Per|Eng)\b",
+            stem,
+            maxsplit=1,
+            flags=re.IGNORECASE
+        )[0]
+        tokens = [
+            t for t in re.sub(r"[^a-zA-Z0-9]+", " ", stem).lower().split()
+            if t and not t.isdigit()
+        ]
+        compact = "".join(tokens)
+        return compact, tokens
+
+    @classmethod
+    def find_matching_workspace_folder_for_sub(cls, sub_filenames: list[str] | str) -> tuple[Path | None, list[str]]:
+        """
+        تشخیص هوشمند پوشه فیلم، سریال یا انیمه و قسمت‌های مربوطه از روی نام فایل (یا فایل‌های داخل زیپ) زیرنویس
+        """
         ws = Path(cfg.get("paths", "workspace_dir", "./workspace")).resolve()
         if not ws.exists():
             return None, []
 
-        ep_tag = cls.extract_episode_tag(sub_filename)
-        clean_sub = re.sub(r"[^a-zA-Z0-9]+", " ", Path(sub_filename).stem).lower().split()
-        title_tokens = [t for t in clean_sub if len(t) > 2 and not cls.EPISODE_REGEX.match(t)]
+        if isinstance(sub_filenames, (str, Path)):
+            names_list = [Path(sub_filenames).name]
+        else:
+            names_list = [Path(n).name for n in sub_filenames if n]
 
-        candidate_roots = []
+        if not names_list:
+            return None, []
+
+        # استخراج تمام تگ‌های SxxEyy موجود در فایل‌های زیرنویس ارسالی
+        detected_ep_tags = sorted({
+            ep for name in names_list
+            if (ep := cls.extract_episode_tag(name))
+        })
+        first_ep_tag = detected_ep_tags[0] if detected_ep_tags else None
+        ep_only_num = cls.extract_episode_number_only(names_list[0]) if not first_ep_tag else int(
+            first_ep_tag.split("E")[1])
+
+        # استخراج کلمات کلیدی عنوان از نام فایل‌ها
+        sub_compacts = []
+        sub_token_sets = []
+        for name in names_list[:5]:
+            comp, toks = cls._normalize_title_for_match(name)
+            if comp:
+                sub_compacts.append(comp)
+            if toks:
+                sub_token_sets.append(toks)
+
+        if not sub_compacts:
+            return None, []
+
+        # جمع‌آوری تمام پوشه‌های فیلم، سریال و انیمه در Workspace
+        candidate_roots: list[Path] = []
         for d in ws.iterdir():
             if not d.is_dir() or d.name.startswith("_") or d.name == "browser_profile":
                 continue
             if d.name in cls.ROOT_CATEGORIES or d.name.lower() in ("movie", "movies", "serie", "series", "anime"):
-                candidate_roots.extend([sub for sub in d.iterdir() if sub.is_dir()])
+                candidate_roots.extend([sub for sub in d.iterdir() if sub.is_dir() and not sub.name.startswith("_")])
             else:
                 candidate_roots.append(d)
 
-        best_folder = None
-        best_score = 0
-        matched_eps: list[str] = []
+        best_dir: Path | None = None
+        best_score: float = 0.0
+        best_eps: list[str] = []
 
-        for top_dir in candidate_roots:
-            top_tokens = set(re.sub(r"[^a-zA-Z0-9]+", " ", top_dir.name).lower().split())
-            overlap = sum(1 for t in title_tokens[:4] if t in top_tokens)
+        for show_or_movie_dir in candidate_roots:
+            dir_compact, dir_tokens = cls._normalize_title_for_match(show_or_movie_dir.name)
+            if not dir_compact:
+                continue
 
-            if ep_tag:
-                s_num = int(ep_tag[1:3])
+            # محاسبه امتیاز شباهت نام پوشه با نام زیرنویس
+            title_score = 0.0
+            for s_comp, s_toks in zip(sub_compacts, sub_token_sets):
+                if s_comp == dir_compact:
+                    title_score = max(title_score, 100.0)
+                elif dir_compact in s_comp or s_comp in dir_compact:
+                    ratio = min(len(dir_compact), len(s_comp)) / max(1, max(len(dir_compact), len(s_comp)))
+                    if ratio >= 0.6:
+                        title_score = max(title_score, 75.0 * ratio)
+
+                overlap = sum(1 for t in dir_tokens if t in s_toks)
+                if overlap > 0:
+                    tok_ratio = overlap / max(len(dir_tokens), len(s_toks))
+                    title_score = max(title_score, 60.0 * tok_ratio + (overlap * 8.0))
+
+            # اگر هیچ شباهت اسمی معناداری ندارد رد کن
+            if title_score < 25.0:
+                continue
+
+            # بررسی اینکه آیا این پوشه سریال/انیمه است یا فیلم
+            is_movie_cat = show_or_movie_dir.parent.name.lower() in ("movie", "movies")
+
+            if first_ep_tag and not is_movie_cat:
+                s_num = int(first_ep_tag[1:3])
                 season_candidates = [
-                    top_dir / f"S{s_num:02d}",
-                    top_dir / f"S{s_num}",
-                    top_dir,
+                    show_or_movie_dir / f"S{s_num:02d}",
+                    show_or_movie_dir / f"S{s_num}",
+                    show_or_movie_dir / f"Season {s_num}",
+                    show_or_movie_dir / f"Season.{s_num:02d}",
+                    show_or_movie_dir,
                 ]
                 for s_cand in season_candidates:
-                    if s_cand.is_dir():
-                        eps = cls.scan_available_episodes_in_season(s_cand)
-                        if ep_tag in eps:
-                            score = overlap + 10
-                            if score > best_score:
-                                best_score = score
-                                best_folder = s_cand
-                                matched_eps = [ep_tag]
+                    if not s_cand.is_dir():
+                        continue
+                    avail_eps = cls.scan_available_episodes_in_season(s_cand)
+                    matched_in_season = [ep for ep in detected_ep_tags if ep in avail_eps]
+                    if matched_in_season:
+                        total_score = title_score + 50.0
+                        if total_score > best_score:
+                            best_score = total_score
+                            best_dir = s_cand
+                            best_eps = matched_in_season
+                    elif avail_eps or s_cand != show_or_movie_dir:
+                        # پوشه فصل وجود دارد؛ حتی اگر فقط همین قسمت مدنظر باشد
+                        total_score = title_score + 20.0
+                        if total_score > best_score:
+                            best_score = total_score
+                            best_dir = s_cand
+                            best_eps = detected_ep_tags
             else:
-                for sub_d in [top_dir] + [d for d in top_dir.iterdir() if d.is_dir() and cls.SEASON_DIR_REGEX.match(d.name)]:
-                    if overlap > best_score:
-                        best_score = overlap
-                        best_folder = sub_d
-                        matched_eps = cls.scan_available_episodes_in_season(sub_d)
+                # یا فیلم سینمایی است یا زیرنویس فقط شماره قسمت دارد (مثل E05 بدون Sxx)
+                season_subdirs = [
+                    sub_d for sub_d in show_or_movie_dir.iterdir()
+                    if sub_d.is_dir() and cls.SEASON_DIR_REGEX.match(sub_d.name)
+                ]
+                if season_subdirs and not is_movie_cat:
+                    for s_sub in sorted(season_subdirs):
+                        avail_eps = cls.scan_available_episodes_in_season(s_sub)
+                        if ep_only_num is not None:
+                            s_num = cls.extract_season_num_from_dir(s_sub) or 1
+                            cand_tag = f"S{s_num:02d}E{ep_only_num:02d}"
+                            if cand_tag in avail_eps:
+                                total_score = title_score + 40.0
+                                if total_score > best_score:
+                                    best_score = total_score
+                                    best_dir = s_sub
+                                    best_eps = [cand_tag]
+                                continue
+                        if title_score > best_score:
+                            best_score = title_score
+                            best_dir = s_sub
+                            best_eps = avail_eps
+                else:
+                    # فیلم سینمایی در Movies/
+                    raw_vids = cls._find_raw_videos_in_dir(show_or_movie_dir, recursive=True)
+                    bonus = 30.0 if raw_vids else 0.0
+                    total_score = title_score + bonus
+                    if total_score > best_score:
+                        best_score = total_score
+                        best_dir = show_or_movie_dir
+                        best_eps = []
 
-        return best_folder, matched_eps
-
+        return best_dir, best_eps
     @classmethod
     async def analyze_and_build_plan(
         cls,

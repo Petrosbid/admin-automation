@@ -114,6 +114,57 @@ class HandBrakeService:
 
         return None
 
+    @staticmethod
+    async def _build_all_audio_cli_flags(
+            video_path: Path,
+            target_resolution: str | None = None
+    ) -> list[str]:
+        """
+        شناسایی تمام ترک‌های صوتی فایل ورودی و ساخت فلگ‌های HandBrakeCLI
+        برای حفظ و انکود تمامی ترک‌های صوتی (بدون حذف دوبله یا زبان‌های دیگر).
+        """
+        from services.mkv_service import MKVService
+
+        audio_tracks_channels: list[int] = []
+        try:
+            info = await MKVService.inspect_tracks(video_path)
+            for t in info.get("tracks", []):
+                if t.get("type") == "audio":
+                    ch = int(t.get("properties", {}).get("audio_channels", 2) or 2)
+                    audio_tracks_channels.append(ch)
+        except Exception:
+            pass
+
+        # اگر به هر دلیلی تعداد ترک‌ها خوانده نشد، فلگ --all-audio به تنهایی همه را انتخاب می‌کند
+        if not audio_tracks_channels:
+            return ["--all-audio"]
+
+        num_tracks = len(audio_tracks_channels)
+        track_indices = ",".join(str(i) for i in range(1, num_tracks + 1))
+
+        # اگر کیفیت 1080p است و ترک صدای 6 کاناله (5.1) دارد، 5point1 حفظ شود؛ در غیر این صورت stereo
+        is_1080 = (target_resolution == "1080p") or ("1080" in video_path.name)
+
+        encoders = []
+        bitrates = []
+        mixdowns = []
+
+        for ch in audio_tracks_channels:
+            encoders.append("av_aac")
+            if is_1080 and ch >= 6:
+                mixdowns.append("5point1")
+                bitrates.append("320")
+            else:
+                mixdowns.append("stereo")
+                bitrates.append("160" if is_1080 else "128")
+
+        return [
+            "--audio", track_indices,
+            "--aencoder", ",".join(encoders),
+            "--ab", ",".join(bitrates),
+            "--mixdown", ",".join(mixdowns),
+        ]
+
     @classmethod
     async def encode_hardsub(
         cls,
@@ -206,7 +257,10 @@ class HandBrakeService:
                 custom_brand=brand,
                 sync_mode="none"
             )
-
+            audio_cli_flags = await cls._build_all_audio_cli_flags(
+                video_path=video_path,
+                target_resolution=target_resolution
+            )
             # اگر قرار است بعد از انکود، زیرنویس انگلیسی به صورت سافت‌ساب اضافه شود، خروجی HandBrake را در فایل موقت بریز
             hb_target_out = temp_hb_encoded if (is_ass_format and ready_en_srt) else output_media_path
 
@@ -215,6 +269,7 @@ class HandBrakeService:
                 "--preset-import-file", preset_json_path,
                 "--preset", preset_name,
                 "--input", str(temp_mkv),
+                *audio_cli_flags,
                 "--output", str(hb_target_out),
             ]
 

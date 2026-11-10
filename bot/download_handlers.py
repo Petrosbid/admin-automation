@@ -2093,20 +2093,22 @@ async def cb_link_cancel(call: CallbackQuery):
     await call.message.edit_text("⏭ عملیات لینک لغو شد.", reply_markup=main_menu_kb())
 
 
-@router.message(StateFilter(None), F.document)
+@router.message(
+    StateFilter(None),
+    F.document,
+    F.document.file_name.lower().endswith(".torrent")
+)
 async def receive_download_torrent(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    if message.document.file_name and message.document.file_name.lower().endswith(".torrent"):
-        temp_dir = Path(cfg.get("paths", "workspace_dir")) / "_incoming_torrents"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        t_path = temp_dir / message.document.file_name
-        await message.bot.download(message.document, destination=t_path)
+    temp_dir = Path(cfg.get("paths", "workspace_dir")) / "_incoming_torrents"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    t_path = temp_dir / message.document.file_name
+    await message.bot.download(message.document, destination=t_path)
 
-        await state.update_data(pending_direct_targets=[str(t_path.resolve())])
-        workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-        await _render_download_folder_browser(message, state, workspace, page=0)
-
+    await state.update_data(pending_direct_targets=[str(t_path.resolve())])
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    await _render_download_folder_browser(message, state, workspace, page=0)
 
 @router.message(StateFilter(None), F.text.regexp(r"(magnet:\?xt=|https?://)"))
 async def catch_direct_links_in_chat(message: Message, state: FSMContext):
