@@ -37,6 +37,7 @@ router = Router()
 # نگه‌داشتن reference تسک‌های مانیتور تا زمان پایان آن‌ها.
 _ACTIVE_AUTOMATION_MONITORS: set[asyncio.Task] = set()
 PENDING_INCOMING_SUBTITLES: dict[str, dict] = {}
+_PENDING_SUBTITLE_ALBUMS: dict[tuple[int, int, str, str], dict[str, Any]] = {}
 
 
 def _release_automation_monitor(task: asyncio.Task):
@@ -53,6 +54,173 @@ def _release_automation_monitor(task: asyncio.Task):
             error,
             exc_info=(type(error), error, error.__traceback__),
         )
+
+
+async def _collect_subtitle_documents(
+    messages: list[Message],
+    destination_root: Path,
+) -> tuple[list[Path], Path]:
+    """Download one Telegram document/album into isolated staging folders and extract subtitle archives."""
+    batch_root = destination_root / "_incoming_subs" / uuid.uuid4().hex[:10]
+    batch_root.mkdir(parents=True, exist_ok=True)
+    candidates: list[Path] = []
+
+    for index, message in enumerate(sorted(messages, key=lambda item: item.message_id), start=1):
+        document = message.document
+        if not document:
+            continue
+
+        raw_name = document.file_name or f"subtitle_{index}.srt"
+        safe_name = re.sub(r'[<>:"/\\\\|?*]', "_", raw_name.replace("\\\\", "/").split("/")[-1]).strip()
+        if not safe_name:
+            safe_name = f"subtitle_{index}.srt"
+
+        file_path = batch_root / f"file_{index:02d}" / safe_name
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        suffix = file_path.suffix.lower()
+
+        if suffix not in SubtitleService.SUB_EXTENSIONS and suffix not in SubtitleService.ARCHIVE_EXTENSIONS:
+            continue
+
+        await message.bot.download(document, destination=file_path)
+
+        if suffix in SubtitleService.ARCHIVE_EXTENSIONS:
+            extracted = SubtitleService.extract_archive(
+                file_path,
+                file_path.parent,
+                remove_archive=True,
+            )
+            candidates.extend(
+                Path(item).resolve()
+                for item in extracted
+                if Path(item).suffix.lower() in SubtitleService.SUB_EXTENSIONS
+            )
+        else:
+            candidates.append(file_path.resolve())
+
+    valid: list[Path] = []
+    for subtitle_path in candidates:
+        if not subtitle_path.exists() or subtitle_path.suffix.lower() not in SubtitleService.SUB_EXTENSIONS:
+            continue
+        try:
+            SubtitleService.normalize_subtitle_file(subtitle_path)
+        except Exception as exc:
+            logging.warning("Could not normalize incoming subtitle %s: %s", subtitle_path.name, exc)
+        valid.append(subtitle_path.resolve())
+
+    fallback_season = AutomationService.extract_season_num_from_dir(destination_root)
+    valid.sort(
+        key=lambda item: _subtitle_episode_sort_key(item, fallback_season)
+    )
+
+    if not valid:
+        shutil.rmtree(batch_root, ignore_errors=True)
+        raise ValueError("هیچ فایل زیرنویس معتبری در فایل‌های ارسالی یا آرشیوها پیدا نشد.")
+
+    return valid, batch_root
+
+
+def _subtitle_episode_sort_key(subtitle_path: Path, fallback_season: int | None = None) -> tuple:
+    episode_tag = AutomationService.extract_episode_tag(
+        subtitle_path.name,
+        fallback_season=fallback_season,
+    )
+    if episode_tag:
+        match = re.search(r"S(\\d{1,2})E(\\d{1,3})", episode_tag, flags=re.IGNORECASE)
+        if match:
+            return (0, int(match.group(1)), int(match.group(2)), subtitle_path.name.casefold())
+    episode_number = AutomationService.extract_episode_number_only(subtitle_path.name)
+    if episode_number is not None:
+        return (0, fallback_season or 0, episode_number, subtitle_path.name.casefold())
+    return (1, 999, 999, subtitle_path.name.casefold())
+
+
+def _persist_matched_subtitles(
+    matched: dict[str, Path],
+    destination_dir: Path,
+    batch_root: Path,
+) -> dict[str, Path]:
+    """Move only matched items out of the temporary album folder; keep FSM paths stable for partial batches."""
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    persisted: dict[str, Path] = {}
+    for episode_key, source_path in matched.items():
+        source_path = Path(source_path)
+        if not source_path.exists():
+            continue
+        target_path = destination_dir / source_path.name
+        if target_path.exists() and target_path.resolve() != source_path.resolve():
+            target_path = destination_dir / f"{source_path.stem}__{uuid.uuid4().hex[:6]}{source_path.suffix}"
+        if source_path.resolve() != target_path.resolve():
+            shutil.move(str(source_path), str(target_path))
+        persisted[episode_key] = target_path.resolve()
+
+    shutil.rmtree(batch_root, ignore_errors=True)
+    return persisted
+
+
+async def _queue_sauto_subtitle_album(
+    message: Message,
+    state: FSMContext,
+    language: str,
+) -> bool:
+    """Collect Telegram document-album updates and process the whole album once it has arrived."""
+    media_group_id = message.media_group_id
+    if not media_group_id:
+        return False
+
+    user_id = message.from_user.id if message.from_user else 0
+    key = (message.chat.id, user_id, str(media_group_id), language)
+    current_state = await state.get_state()
+    entry = _PENDING_SUBTITLE_ALBUMS.get(key)
+
+    if entry is None:
+        entry = {
+            "messages": [],
+            "state": current_state,
+            "fsm": state,
+            "task": None,
+        }
+        _PENDING_SUBTITLE_ALBUMS[key] = entry
+
+    if all(item.message_id != message.message_id for item in entry["messages"]):
+        entry["messages"].append(message)
+
+    old_task = entry.get("task")
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    async def flush_album():
+        try:
+            # Telegram delivers each document in an album as a separate update with the same media_group_id.
+            await asyncio.sleep(1.35)
+            active = _PENDING_SUBTITLE_ALBUMS.get(key)
+            if active is not entry:
+                return
+            _PENDING_SUBTITLE_ALBUMS.pop(key, None)
+
+            messages = sorted(entry["messages"], key=lambda item: item.message_id)
+            fsm = entry["fsm"]
+            if await fsm.get_state() != entry["state"]:
+                await messages[0].answer(
+                    "⚠️ مرحله اتوماسیون هنگام دریافت آلبوم تغییر کرده است؛ فایل‌ها پردازش نشدند. دوباره در مرحله زیرنویس ارسال کنید."
+                )
+                return
+
+            if language == "FA":
+                await _process_sauto_fa_sub_messages(messages, fsm)
+            else:
+                await _process_sauto_en_sub_messages(messages, fsm)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Failed to process %s subtitle album", language)
+            try:
+                await message.answer("❌ پردازش دسته‌ای زیرنویس‌ها با خطا مواجه شد. لطفاً دوباره ارسال کنید.")
+            except Exception:
+                pass
+
+    entry["task"] = asyncio.create_task(flush_album())
+    return True
 
 
 class SubtitleStates(StatesGroup):
@@ -453,45 +621,56 @@ async def cb_sauto_pick_existing_fa(call: CallbackQuery, state: FSMContext):
     await _place_and_ask_fa_sub_names(call, state, plans, {key: chosen_fa})
 
 
-@router.message(SubtitleStates.sauto_waiting_fa_sub, F.document)
-async def handle_sauto_fa_sub_upload(message: Message, state: FSMContext):
+async def _process_sauto_fa_sub_messages(messages: list[Message], state: FSMContext):
+    message = messages[0]
     data = await state.get_data()
     target_dir = Path(data["sauto_target_dir"])
     ep_tags = data.get("sauto_ep_tags", [])
     plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
+    if not plans:
+        return await message.answer("❌ برای این مسیر، پلن اتوماسیون معتبری پیدا نشد.")
 
     fa_dir = plans[0].fa_sub_dest_dir
-    fa_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        new_subs, batch_root = await _collect_subtitle_documents(messages, fa_dir)
+    except Exception as exc:
+        return await message.answer(f"❌ دریافت زیرنویس‌ها ناموفق بود: {html.escape(str(exc))}")
 
-    orig_name = message.document.file_name or "subtitle.FA.srt"
-    temp_dest = fa_dir / orig_name
-    await message.bot.download(message.document, destination=temp_dest)
-
-    new_subs: list[Path] = []
-    if temp_dest.suffix.lower() in SubtitleService.ARCHIVE_EXTENSIONS:
-        extracted = SubtitleService.extract_archive(temp_dest, fa_dir, remove_archive=True)
-        new_subs = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
-        if not new_subs:
-            return await message.answer("❌ هیچ فایل زیرنویسی داخل فایل فشرده یافت نشد! لطفاً فایل دیگری بفرستید:")
-    else:
-        if temp_dest.suffix.lower() == ".srt":
-            SubtitleService.normalize_srt_utf8(temp_dest)
-        new_subs = [temp_dest]
-
+    fallback_season = AutomationService.extract_season_num_from_dir(plans[0].base_dir)
+    new_subs.sort(key=lambda item: _subtitle_episode_sort_key(item, fallback_season))
     matched_map = AutomationService.match_subtitles_to_episodes(plans, new_subs)
+
     if len(plans) == 1 and len(new_subs) == 1 and not matched_map:
         only_key = plans[0].season_ep_tag if (plans[0].is_series and plans[0].season_ep_tag) else "MOVIE"
         matched_map[only_key] = new_subs[0]
 
-    partial_prev = {k: Path(v) for k, v in data.get("sauto_partial_fa_map", {}).items() if Path(v).exists()}
-    partial_prev.update(matched_map)
+    persisted_map = _persist_matched_subtitles(matched_map, fa_dir, batch_root)
+    partial_prev = {
+        key: Path(value)
+        for key, value in data.get("sauto_partial_fa_map", {}).items()
+        if Path(value).exists()
+    }
+    partial_prev.update(persisted_map)
 
     required_keys = ep_tags if ep_tags else ["MOVIE"]
-    if all(k in partial_prev for k in required_keys):
-        return await _place_and_ask_fa_sub_names(message, state, plans, partial_prev)
+    if all(key in partial_prev for key in required_keys):
+        ordered_map = {key: partial_prev[key] for key in required_keys}
+        return await _place_and_ask_fa_sub_names(message, state, plans, ordered_map)
 
-    await state.update_data(sauto_partial_fa_map={k: str(v) for k, v in partial_prev.items()})
-    missing_keys = [k for k in required_keys if k not in partial_prev]
+    await state.update_data(
+        sauto_partial_fa_map={key: str(value) for key, value in partial_prev.items()}
+    )
+    missing_keys = [key for key in required_keys if key not in partial_prev]
+    matched_lines = [
+        f"✅ {key}: {Path(partial_prev[key]).name}"
+        for key in required_keys
+        if key in partial_prev
+    ]
+    unmatched_names = [
+        Path(item).name
+        for item in new_subs
+        if all(Path(item) != Path(value) for value in persisted_map.values())
+    ]
 
     kb = InlineKeyboardBuilder()
     if partial_prev:
@@ -503,13 +682,27 @@ async def handle_sauto_fa_sub_upload(message: Message, state: FSMContext):
         )
     kb.row(InlineKeyboardButton(text="🔙 انصراف", callback_data="menu:home"))
 
+    status = "\n".join(matched_lines) if matched_lines else "هنوز زیرنویسی با شماره قسمت قابل‌تطبیق پیدا نشد."
+    unmatched_note = ""
+    if unmatched_names:
+        unmatched_note = "\n\nفایل‌های بدون تطبیق:\n" + "\n".join(f"• {name}" for name in unmatched_names[:8])
+
     await message.answer(
-        f"✅ تعداد `{len(partial_prev)}` از `{len(required_keys)}` قسمت زیرنویس فارسی دریافت کردند.\n"
-        f"⏳ قسمت‌های باقی‌مانده: `{', '.join(missing_keys)}`\n\n"
-        "می‌توانید زیرنویس قسمت‌های باقی‌مانده را هم بفرستید و یا دکمه ادامه را بزنید:",
+        f"📥 تعداد {len(new_subs)} فایل زیرنویس دریافت شد و بر اساس شماره قسمت (Eyy) مرتب شد.\n"
+        f"✅ تطبیق‌یافته: {len(partial_prev)} از {len(required_keys)} قسمت\n\n"
+        f"{status}\n\n"
+        f"⏳ قسمت‌های باقی‌مانده: {', '.join(missing_keys) if missing_keys else '—'}"
+        f"{unmatched_note}\n\n"
+        "می‌توانید زیرنویس‌های باقی‌مانده را در یک آلبوم دیگر بفرستید یا ادامه را انتخاب کنید:",
         reply_markup=kb.as_markup(),
-        parse_mode="Markdown"
     )
+
+
+@router.message(SubtitleStates.sauto_waiting_fa_sub, F.document)
+async def handle_sauto_fa_sub_upload(message: Message, state: FSMContext):
+    if await _queue_sauto_subtitle_album(message, state, "FA"):
+        return
+    await _process_sauto_fa_sub_messages([message], state)
 
 
 async def _place_and_ask_fa_sub_names(
@@ -804,8 +997,8 @@ async def cb_sauto_upload_en_ask(call: CallbackQuery, state: FSMContext):
     )
 
 
-@router.message(SubtitleStates.sauto_waiting_en_upload, F.document)
-async def handle_sauto_en_upload(message: Message, state: FSMContext):
+async def _process_sauto_en_sub_messages(messages: list[Message], state: FSMContext):
+    message = messages[0]
     data = await state.get_data()
     target_dir = Path(data["sauto_target_dir"])
     ep_tags = data.get("sauto_ep_tags", [])
@@ -813,25 +1006,26 @@ async def handle_sauto_en_upload(message: Message, state: FSMContext):
     en_map: dict[str, str] = data.get("sauto_final_en_map", {})
 
     plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
+    if not plans:
+        return await message.answer("❌ برای این مسیر، پلن اتوماسیون معتبری پیدا نشد.")
+
     en_dir = plans[0].en_sub_dest_dir
-    en_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        en_candidates, batch_root = await _collect_subtitle_documents(messages, en_dir)
+    except Exception as exc:
+        return await message.answer(f"❌ دریافت زیرنویس‌های انگلیسی ناموفق بود: {html.escape(str(exc))}")
 
-    temp_dest = en_dir / (message.document.file_name or "subtitle.EN.srt")
-    await message.bot.download(message.document, destination=temp_dest)
+    fallback_season = AutomationService.extract_season_num_from_dir(plans[0].base_dir)
+    en_candidates.sort(key=lambda item: _subtitle_episode_sort_key(item, fallback_season))
+    matched_en = AutomationService.match_subtitles_to_episodes(plans, en_candidates)
 
-    if temp_dest.suffix.lower() in SubtitleService.ARCHIVE_EXTENSIONS:
-        extracted = SubtitleService.extract_archive(temp_dest, en_dir, remove_archive=True)
-        en_cands = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
-    else:
-        en_cands = [temp_dest]
-
-    matched_en = AutomationService.match_subtitles_to_episodes(plans, en_cands)
-    if len(plans) == 1 and len(en_cands) == 1 and not matched_en:
+    if len(plans) == 1 and len(en_candidates) == 1 and not matched_en:
         only_key = plans[0].season_ep_tag if (plans[0].is_series and plans[0].season_ep_tag) else "MOVIE"
-        matched_en[only_key] = en_cands[0]
+        matched_en[only_key] = en_candidates[0]
 
-    for key, chosen_en in matched_en.items():
-        fa_sub_p = Path(fa_map[key]) if key in fa_map else None
+    persisted_en = _persist_matched_subtitles(matched_en, en_dir, batch_root)
+    for key, chosen_en in persisted_en.items():
+        fa_sub_p = Path(fa_map[key]) if key in fa_map and Path(fa_map[key]).exists() else None
         if fa_sub_p:
             en_filename = re.sub(r"\.FA(\.[^.]+)$", r".EN\1", fa_sub_p.name, flags=re.IGNORECASE)
             if en_filename == fa_sub_p.name:
@@ -851,10 +1045,28 @@ async def handle_sauto_en_upload(message: Message, state: FSMContext):
         en_map[key] = str(chosen_en.resolve())
 
     await state.update_data(sauto_final_en_map=en_map)
-    await _prompt_final_automation_choices_step(
-        message, state, plans,
-        en_note=f"✅ تعداد `{len(en_map)}` زیرنویس انگلیسی در پوشه ذخیره شد."
+    unmatched_count = len(en_candidates) - len(persisted_en)
+    unmatched_note = (
+        f" موارد بدون تطبیق با Eyy: {unmatched_count}."
+        if unmatched_count > 0
+        else ""
     )
+    await _prompt_final_automation_choices_step(
+        message,
+        state,
+        plans,
+        en_note=(
+            f"✅ تعداد {len(persisted_en)} زیرنویس انگلیسی از مجموع {len(en_candidates)} فایل "
+            f"بر اساس Eyy مرتب و به قسمت متناظر وصل شد.{unmatched_note}"
+        ),
+    )
+
+
+@router.message(SubtitleStates.sauto_waiting_en_upload, F.document)
+async def handle_sauto_en_upload(message: Message, state: FSMContext):
+    if await _queue_sauto_subtitle_album(message, state, "EN"):
+        return
+    await _process_sauto_en_sub_messages([message], state)
 
 
 @router.callback_query(F.data == "sauto_en:skip")
