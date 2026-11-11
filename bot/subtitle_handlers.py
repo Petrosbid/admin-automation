@@ -126,7 +126,7 @@ def _subtitle_episode_sort_key(subtitle_path: Path, fallback_season: int | None 
         fallback_season=fallback_season,
     )
     if episode_tag:
-        match = re.search(r"S(\\d{1,2})E(\\d{1,3})", episode_tag, flags=re.IGNORECASE)
+        match = re.search(r"S(\d{1,2})E(\d{1,3})", episode_tag, flags=re.IGNORECASE)
         if match:
             return (0, int(match.group(1)), int(match.group(2)), subtitle_path.name.casefold())
     episode_number = AutomationService.extract_episode_number_only(subtitle_path.name)
