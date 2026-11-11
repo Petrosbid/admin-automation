@@ -65,38 +65,42 @@ async def _collect_subtitle_documents(
     batch_root.mkdir(parents=True, exist_ok=True)
     candidates: list[Path] = []
 
-    for index, message in enumerate(sorted(messages, key=lambda item: item.message_id), start=1):
-        document = message.document
-        if not document:
-            continue
-
-        raw_name = document.file_name or f"subtitle_{index}.srt"
-        safe_name = re.sub(r'[<>:"/\\\\|?*]', "_", raw_name.replace("\\", "/").split("/")[-1]).strip()
-        if not safe_name:
-            safe_name = f"subtitle_{index}.srt"
-
-        file_path = batch_root / f"file_{index:02d}" / safe_name
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        suffix = file_path.suffix.lower()
-
-        if suffix not in SubtitleService.SUB_EXTENSIONS and suffix not in SubtitleService.ARCHIVE_EXTENSIONS:
-            continue
-
-        await message.bot.download(document, destination=file_path)
-
-        if suffix in SubtitleService.ARCHIVE_EXTENSIONS:
-            extracted = SubtitleService.extract_archive(
-                file_path,
-                file_path.parent,
-                remove_archive=True,
-            )
-            candidates.extend(
-                Path(item).resolve()
-                for item in extracted
-                if Path(item).suffix.lower() in SubtitleService.SUB_EXTENSIONS
-            )
-        else:
-            candidates.append(file_path.resolve())
+    try:
+        for index, message in enumerate(sorted(messages, key=lambda item: item.message_id), start=1):
+            document = message.document
+            if not document:
+                continue
+    
+            raw_name = document.file_name or f"subtitle_{index}.srt"
+            safe_name = re.sub(r'[<>:"/\\\\|?*]', "_", raw_name.replace("\\", "/").split("/")[-1]).strip()
+            if not safe_name:
+                safe_name = f"subtitle_{index}.srt"
+    
+            file_path = batch_root / f"file_{index:02d}" / safe_name
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            suffix = file_path.suffix.lower()
+    
+            if suffix not in SubtitleService.SUB_EXTENSIONS and suffix not in SubtitleService.ARCHIVE_EXTENSIONS:
+                continue
+    
+            await message.bot.download(document, destination=file_path)
+    
+            if suffix in SubtitleService.ARCHIVE_EXTENSIONS:
+                extracted = SubtitleService.extract_archive(
+                    file_path,
+                    file_path.parent,
+                    remove_archive=True,
+                )
+                candidates.extend(
+                    Path(item).resolve()
+                    for item in extracted
+                    if Path(item).suffix.lower() in SubtitleService.SUB_EXTENSIONS
+                )
+            else:
+                candidates.append(file_path.resolve())
+    except Exception:
+        shutil.rmtree(batch_root, ignore_errors=True)
+        raise
 
     valid: list[Path] = []
     for subtitle_path in candidates:
@@ -192,7 +196,7 @@ async def _queue_sauto_subtitle_album(
     async def flush_album():
         try:
             # Telegram delivers each document in an album as a separate update with the same media_group_id.
-            await asyncio.sleep(1.35)
+            await asyncio.sleep(1.8)
             active = _PENDING_SUBTITLE_ALBUMS.get(key)
             if active is not entry:
                 return
@@ -583,7 +587,7 @@ async def _init_smart_auto_batch(
         f"📦 مجموع فایل‌های خام برای سافت‌ساب: **`{total_soft}` فایل**\n"
         f"🔥 سورس‌های آماده هاردساب (`FullHD`): **`{total_fhd}` فایل**\n\n"
         f"📋 **وضعیت زیرنویس فارسی در پوشه:**\n{ep_status_block}\n\n"
-        "📤 **لطفاً فایل زیرنویس فارسی (`.srt` / `.ass` / `.zip` / `.rar`) مربوط به این قسمت را در چت ارسال کنید:**"
+        "📤 **می‌توانید زیرنویس‌های فارسی همه قسمت‌ها را یک‌جا به‌صورت آلبوم فایل ارسال کنید.** نام هر فایل باید شماره قسمت مثل E01 یا S02E01 را داشته باشد تا خودکار مرتب و به همان قسمت وصل شود. فرمت‌ها: `.srt` / `.ass` / `.ssa` / `.zip` / `.rar`."
     )
 
     if isinstance(call_or_msg, CallbackQuery):
@@ -992,7 +996,7 @@ async def cb_sauto_auto_extract_en(call: CallbackQuery, state: FSMContext):
 async def cb_sauto_upload_en_ask(call: CallbackQuery, state: FSMContext):
     await state.set_state(SubtitleStates.sauto_waiting_en_upload)
     await call.message.edit_text(
-        "📤 لطفاً **فایل زیرنویس انگلیسی (`.srt` / `.ass` / `.zip` / `.rar`)** را ارسال کنید:",
+        "📤 می‌توانید زیرنویس‌های انگلیسی همه قسمت‌ها را یک‌جا به‌صورت آلبوم فایل ارسال کنید. نام هر فایل باید تگ قسمت مثل E01 یا S02E01 را داشته باشد تا خودکار مرتب شود:",
         reply_markup=skip_or_cancel_kb("sauto_en:skip"),
         parse_mode="Markdown"
     )
