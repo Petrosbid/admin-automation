@@ -71,7 +71,7 @@ async def _collect_subtitle_documents(
             continue
 
         raw_name = document.file_name or f"subtitle_{index}.srt"
-        safe_name = re.sub(r'[<>:"/\\\\|?*]', "_", raw_name.replace("\\\\", "/").split("/")[-1]).strip()
+        safe_name = re.sub(r'[<>:"/\\\\|?*]', "_", raw_name.replace("\\", "/").split("/")[-1]).strip()
         if not safe_name:
             safe_name = f"subtitle_{index}.srt"
 
@@ -644,6 +644,7 @@ async def _process_sauto_fa_sub_messages(messages: list[Message], state: FSMCont
         only_key = plans[0].season_ep_tag if (plans[0].is_series and plans[0].season_ep_tag) else "MOVIE"
         matched_map[only_key] = new_subs[0]
 
+    matched_source_paths = {Path(value).resolve() for value in matched_map.values()}
     persisted_map = _persist_matched_subtitles(matched_map, fa_dir, batch_root)
     partial_prev = {
         key: Path(value)
@@ -669,7 +670,7 @@ async def _process_sauto_fa_sub_messages(messages: list[Message], state: FSMCont
     unmatched_names = [
         Path(item).name
         for item in new_subs
-        if all(Path(item) != Path(value) for value in persisted_map.values())
+        if Path(item).resolve() not in matched_source_paths
     ]
 
     kb = InlineKeyboardBuilder()
