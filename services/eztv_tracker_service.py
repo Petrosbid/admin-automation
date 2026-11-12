@@ -147,14 +147,19 @@ class EZTVTrackerService:
 
     @staticmethod
     def _release_episode(title: str) -> tuple[int, int] | None:
+        raw_title = title or ""
+        if re.search(r"(?i)\bS\d{1,2}E\d{1,3}[-._ ]+E?\d{1,3}\b", raw_title):
+            return None
         patterns = (
             re.compile(r"(?<![A-Z0-9])S(?P<s>\d{1,2})[\s._-]*E(?P<e>\d{1,3})(?!\d)", re.I),
             re.compile(r"(?<!\d)(?P<s>\d{1,2})[xX](?P<e>\d{1,3})(?!\d)"),
         )
+        matches = []
         for pattern in patterns:
-            match = pattern.search(title or "")
-            if match:
-                return int(match.group("s")), int(match.group("e"))
+            matches.extend(pattern.finditer(raw_title))
+        if len(matches) != 1:
+            return None
+        return int(matches[0].group("s")), int(matches[0].group("e"))
         # No bare Eyy fallback: without a season marker we cannot safely exclude a wrong season.
         return None
 
@@ -235,6 +240,10 @@ class EZTVTrackerService:
                 item_link if item_link.lower().startswith("magnet:")
                 else enclosure_link or item_link
             )
+            if not magnet_link and guid.lower().startswith("magnet:"):
+                magnet_link = guid
+            if magnet_link:
+                link = magnet_link
             item_id = guid or magnet_link or item_link or f"{title}|{pubdate_raw}"
             if not link:
                 # Some RSS pages expose the magnet URI only in an attribute.
@@ -294,7 +303,7 @@ class EZTVTrackerService:
         title = str(release_title or "").casefold()
         if quality == "fullhd_h264":
             has_fullhd = bool(re.search(r"(?<!\d)(?:1080p|full[ ._-]?hd)(?![a-z0-9])", title))
-            has_h264 = bool(re.search(r"(?:h[ ._-]?264|avc)", title))
+            has_h264 = bool(re.search(r"(?:h[ ._-]?264|x264|avc)", title))
             return has_fullhd and has_h264
         if quality == "480p":
             return bool(re.search(r"(?<!\d)480p(?!\d)", title))
@@ -708,10 +717,23 @@ class EZTVTrackerService:
         for show in shows:
             episode = self._episode_progress(show, state)
             tag = self._episode_tag(show["season"], episode)
-            season_dir = self._show_folder(show, episode)
+            season_dir = await self._prepare_season(show, episode)
             status = await self._episode_status(show, episode, season_dir)
 
-            if not status["any_raw"]:
+            scheduled_keys = [
+                self._scheduled_key(show, episode, quality)
+                for quality in show["qualities"]
+            ]
+            scheduled_active = any(
+                self._task_is_active(
+                    str(state.get("scheduled_tasks", {}).get(key, {}).get("task_id", ""))
+                )
+                for key in scheduled_keys
+                if isinstance(state.get("scheduled_tasks", {}).get(key, {}), dict)
+            )
+            if not status["any_raw"] and scheduled_active:
+                headline = "📥 منتشر شده و دانلود در صف/در حال اجرا"
+            elif not status["any_raw"]:
                 headline = "⏳ هنوز منتشر نشده"
             elif status["complete"]:
                 headline = "✅ کامل شده"
