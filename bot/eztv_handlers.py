@@ -16,7 +16,7 @@ def _split_html_lines(text: str, limit: int = 3800) -> list[str]:
     chunks: list[str] = []
     current = ""
     for line in text.splitlines():
-        candidate = current + ("\\n" if current else "") + line
+        candidate = current + ("\n" if current else "") + line
         if len(candidate) > limit and current:
             chunks.append(current)
             current = line
