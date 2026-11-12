@@ -276,9 +276,13 @@ class EZTVTrackerService:
             "User-Agent": "Mozilla/5.0 (compatible; AdminAutomationEZTV/1.0)",
             "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
         }
-        proxy = ProxyManager.get_proxy_url()
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(feed_url, proxy=proxy) as response:
+        connector = ProxyManager.get_aiohttp_connector()
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            headers=headers,
+            connector=connector,
+        ) as session:
+            async with session.get(feed_url) as response:
                 response.raise_for_status()
                 body = await response.text(errors="replace")
         if not body.strip():
@@ -731,8 +735,14 @@ class EZTVTrackerService:
                 for key in scheduled_keys
                 if isinstance(state.get("scheduled_tasks", {}).get(key, {}), dict)
             )
+            release_history = state.get("release_history", {}).get(
+                self._release_history_key(show, episode), []
+            )
+            published_in_feed = bool(release_history)
             if not status["any_raw"] and scheduled_active:
                 headline = "📥 منتشر شده و دانلود در صف/در حال اجرا"
+            elif not status["any_raw"] and published_in_feed:
+                headline = "⚠️ در RSS منتشر شده، اما فایل محلی هنوز موجود نیست"
             elif not status["any_raw"]:
                 headline = "⏳ هنوز منتشر نشده"
             elif status["complete"]:
@@ -757,7 +767,7 @@ class EZTVTrackerService:
                 lines.append("هاردساب: " + ("✅ موجود" if status["hardsub"] else "❌ خالی"))
 
             expected_time = self._expected_release_time(state, show, episode)
-            if not status["any_raw"] and expected_time:
+            if not status["any_raw"] and not published_in_feed and expected_time:
                 lines.append(f"⏰ زمان معمول انتشار بر اساس سابقه: حدود <code>{expected_time}</code>")
             elif not status["any_raw"]:
                 lines.append("⏰ سابقه کافی برای تخمین ساعت انتشار ثبت نشده است.")
