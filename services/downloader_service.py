@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import time
@@ -244,10 +245,6 @@ class DownloaderService:
             if progress_callback:
                 progress_callback("تورنت در qBittorrent شناسایی شد؛ دریافت فایل‌ها آغاز شد...")
 
-            completed_states = {
-                "uploading", "stalledup", "pausedup", "queuedup",
-                "checkingup", "forcedup", "pauseddl", "stopped",
-            }
             while True:
                 await asyncio.sleep(3)
                 info_resp = await session.get(f"{base_url}/api/v2/torrents/info")
@@ -277,12 +274,11 @@ class DownloaderService:
                 if progress_callback:
                     progress_callback(f"{progress:.1f}% | سرعت: {speed_mb:.2f} MB/s ({name[:25]})")
 
-                if progress >= 100.0 or state in completed_states:
-                    if progress >= 100.0:
-                        await session.post(
-                            f"{base_url}/api/v2/torrents/delete",
-                            data={"hashes": matched_hash, "deleteFiles": "false"}
-                        )
+                if progress >= 100.0:
+                    await session.post(
+                        f"{base_url}/api/v2/torrents/delete",
+                        data={"hashes": matched_hash, "deleteFiles": "false"}
+                    )
                     break
 
         return dest_dir
