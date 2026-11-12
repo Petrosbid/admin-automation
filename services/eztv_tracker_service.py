@@ -62,6 +62,7 @@ class EZTVTrackerService:
             "seen_item_ids": [],
             "progress": {},
             "release_history": {},
+            "rss_matches": {},
             "scheduled_tasks": {},
             "last_daily_report_date": "",
             "last_feed_check": "",
@@ -485,6 +486,15 @@ class EZTVTrackerService:
         previous_id = str(previous.get("task_id", "")) if isinstance(previous, dict) else str(previous)
         if previous_id and self._task_is_active(previous_id):
             return None
+        if isinstance(previous, dict) and previous.get("queued_at"):
+            try:
+                previous_queued_at = self._parse_datetime(str(previous["queued_at"]))
+                if previous_queued_at and (
+                    datetime.now(timezone.utc) - previous_queued_at
+                ).total_seconds() < 900:
+                    return None
+            except Exception:
+                pass
 
         existing = self._find_episode_files(destination, show["season"], episode)
         if existing:
@@ -545,6 +555,13 @@ class EZTVTrackerService:
                     self._record_release_time(
                         state, show, episode, release.get("published_at")
                     )
+                    rss_matches = state.setdefault("rss_matches", {})
+                    episode_history_key = self._release_history_key(show, episode)
+                    rss_matches.setdefault(episode_history_key, {
+                        "first_seen_at": current_time.isoformat(),
+                        "release_id": release_id,
+                        "release_title": release["title"],
+                    })
                     for quality in show["qualities"]:
                         if not self._quality_matches(release["title"], quality):
                             continue
@@ -741,7 +758,10 @@ class EZTVTrackerService:
             release_history = state.get("release_history", {}).get(
                 self._release_history_key(show, episode), []
             )
-            published_in_feed = bool(release_history)
+            rss_match = state.get("rss_matches", {}).get(
+                self._release_history_key(show, episode), {}
+            )
+            published_in_feed = bool(release_history or rss_match)
             if not status["any_raw"] and scheduled_active:
                 headline = "📥 منتشر شده و دانلود در صف/در حال اجرا"
             elif not status["any_raw"] and published_in_feed:
