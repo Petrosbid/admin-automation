@@ -148,9 +148,14 @@ class EZTVTrackerService:
         return f"S{int(season):02d}E{int(episode):02d}"
 
     @staticmethod
+    @staticmethod
     def _release_episode(title: str) -> tuple[int, int] | None:
         raw_title = title or ""
-        if re.search(r"(?i)\bS\d{1,2}E\d{1,3}[-._ ]+E?\d{1,3}\b", raw_title):
+        # Reject common multi-episode packs such as S02E04-E05, S02E04E05 and S02E04+05.
+        if re.search(
+            r"(?i)\bS\d{1,2}E\d{1,3}(?:[-+._ &]+E?\d{1,3}|E\d{1,3})\b",
+            raw_title,
+        ):
             return None
         patterns = (
             re.compile(r"(?<![A-Z0-9])S(?P<s>\d{1,2})[\s._-]*E(?P<e>\d{1,3})(?!\d)", re.I),
