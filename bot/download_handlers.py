@@ -396,7 +396,8 @@ async def _smart_download_pipeline_job(
                         vid.rename(final_path)
                         vid = final_path
                     await _schedule_fullhd_destination_automation(
-                        bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag
+                        bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag,
+                        automated_background=automated_background,
                     )
                     if remote_folder_exists and auto_upload_cfg:
                         await queue_engine.add_task(
