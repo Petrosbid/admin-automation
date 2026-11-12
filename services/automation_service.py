@@ -1124,7 +1124,10 @@ class AutomationService:
                         if (
                             lang in ("", "und", "unknown")
                             and lang_ietf in ("", "und", "unknown")
-                            and not any(x in track_name for x in ("persian", "farsi", "فارسی", "per", "fa"))
+                            and not re.search(
+                                r"(?<![a-z0-9])(?:persian|farsi|فارسی|fa|per|fas)(?![a-z0-9])",
+                                track_name,
+                            )
                         ):
                             eng_tracks = [only_track]
 
