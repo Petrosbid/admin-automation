@@ -267,7 +267,7 @@ async def _smart_download_pipeline_job(
             ]
             is_ambiguous = len(staged_videos) != 1
             has_wrong_episode = any(
-                tag and tag.upper() != expected_episode_tag.upper()
+                not tag or tag.upper() != expected_episode_tag.upper()
                 for tag in found_tags
             )
             if is_ambiguous or has_wrong_episode:
