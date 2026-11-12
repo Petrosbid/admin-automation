@@ -195,7 +195,8 @@ async def _smart_download_pipeline_job(
     chat_id: int,
     target_link: str,
     dest_dir: Path,
-    progress_callback=None
+    progress_callback=None,
+    automated_background: bool = False,
 ) -> Path:
     """دانلود ایزوله، اکسترکت و اجرای پس‌پردازش فقط روی خروجی همین تسک."""
     dest_dir = Path(dest_dir).resolve()
@@ -336,7 +337,7 @@ async def _smart_download_pipeline_job(
                             vid,
                             remote_folder_path,
                         )
-                else:
+                elif not automated_background:
                     await _send_missing_remote_folder_upload_prompt(
                         bot, chat_id, vid, remote_folder_path
                     )
@@ -348,16 +349,38 @@ async def _smart_download_pipeline_job(
                     season_ep_tag=ep_tag,
                     is_series=is_series,
                 )
-                await _send_standard_name_confirmation_prompt(
-                    bot=bot,
-                    chat_id=chat_id,
-                    vid_path=vid,
-                    suggested_name=suggested_std_name,
-                    remote_folder_path=remote_folder_path,
-                    should_auto_upload=(auto_upload_cfg and remote_folder_exists),
-                    ask_fullhd_e01_question=(not remote_folder_exists),
-                    fullhd_auto_encode=True,
-                )
+                if automated_background:
+                    final_path = vid.with_name(suggested_std_name)
+                    if final_path.exists() and final_path.resolve() != vid.resolve():
+                        final_path = vid.with_name(
+                            f"{Path(suggested_std_name).stem}__{uuid.uuid4().hex[:6]}{Path(suggested_std_name).suffix}"
+                        )
+                    if final_path.resolve() != vid.resolve():
+                        vid.rename(final_path)
+                        vid = final_path
+                    await _schedule_fullhd_destination_automation(
+                        bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag
+                    )
+                    if remote_folder_exists and auto_upload_cfg:
+                        await queue_engine.add_task(
+                            "upload",
+                            f"AutoUpload [{remote_folder_path}]: {vid.name}",
+                            CuteFTPService.upload_path,
+                            vid,
+                            remote_folder_path,
+                            notify_completion=False,
+                        )
+                else:
+                    await _send_standard_name_confirmation_prompt(
+                        bot=bot,
+                        chat_id=chat_id,
+                        vid_path=vid,
+                        suggested_name=suggested_std_name,
+                        remote_folder_path=remote_folder_path,
+                        should_auto_upload=(auto_upload_cfg and remote_folder_exists),
+                        ask_fullhd_e01_question=(not remote_folder_exists),
+                        fullhd_auto_encode=True,
+                    )
             continue
 
         ask_missing_folder_question = not remote_folder_exists
@@ -377,7 +400,7 @@ async def _smart_download_pipeline_job(
                 vid.rename(final_path)
                 vid = final_path
 
-            if ask_missing_folder_question:
+            if ask_missing_folder_question and not automated_background:
                 await _send_missing_remote_folder_upload_prompt(
                     bot, chat_id, vid, remote_folder_path
                 )
@@ -397,6 +420,7 @@ async def _smart_download_pipeline_job(
                 is_series=is_series,
                 season_or_movie_dir=season_or_movie_dir,
                 ep_tag=ep_tag,
+                automated_background=automated_background,
             )
         else:
             suggested_std_name = await AutomationService.build_standard_raw_filename_for_folder(
@@ -406,15 +430,43 @@ async def _smart_download_pipeline_job(
                 season_ep_tag=ep_tag,
                 is_series=is_series,
             )
-            await _send_standard_name_confirmation_prompt(
-                bot=bot,
-                chat_id=chat_id,
-                vid_path=vid,
-                suggested_name=suggested_std_name,
-                remote_folder_path=remote_folder_path,
-                should_auto_upload=should_auto_upload,
-                ask_fullhd_e01_question=ask_missing_folder_question,
-            )
+            if automated_background:
+                final_path = vid.with_name(suggested_std_name)
+                if final_path.exists() and final_path.resolve() != vid.resolve():
+                    final_path = vid.with_name(
+                        f"{Path(suggested_std_name).stem}__{uuid.uuid4().hex[:6]}{Path(suggested_std_name).suffix}"
+                    )
+                if final_path.resolve() != vid.resolve():
+                    vid.rename(final_path)
+                    vid = final_path
+                if should_auto_upload:
+                    await queue_engine.add_task(
+                        "upload",
+                        f"AutoUpload [{remote_folder_path}]: {vid.name}",
+                        CuteFTPService.upload_path,
+                        vid,
+                        remote_folder_path,
+                        notify_completion=False,
+                    )
+                await _check_and_prompt_auto_softsub_for_new_quality(
+                    bot=bot,
+                    chat_id=chat_id,
+                    vid_path=vid,
+                    is_series=is_series,
+                    season_or_movie_dir=season_or_movie_dir,
+                    ep_tag=ep_tag,
+                    automated_background=True,
+                )
+            else:
+                await _send_standard_name_confirmation_prompt(
+                    bot=bot,
+                    chat_id=chat_id,
+                    vid_path=vid,
+                    suggested_name=suggested_std_name,
+                    remote_folder_path=remote_folder_path,
+                    should_auto_upload=should_auto_upload,
+                    ask_fullhd_e01_question=ask_missing_folder_question,
+                )
 
     return new_videos[0]
 
@@ -802,7 +854,8 @@ async def _check_and_prompt_auto_softsub_for_new_quality(
     vid_path: Path,
     is_series: bool,
     season_or_movie_dir: Path,
-    ep_tag: str
+    ep_tag: str,
+    automated_background: bool = False
 ):
     """
     بررسی وجود زیرنویس فارسی در پوشه زیرنویس پس از دانلود یک کیفیت جدید:
@@ -840,6 +893,36 @@ async def _check_and_prompt_auto_softsub_for_new_quality(
 
     soft_out_file = soft_out_dir / AutomationService.build_softsub_filename(vid_path)
     remote_soft_dir = AutomationService.compute_server_remote_dir_for_local_path(soft_out_file)
+
+    if automated_background:
+        brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
+        auto_upload = False
+        if bool(cfg.get("cuteftp", "auto_upload_after_download", True)):
+            try:
+                remote_info = await CuteFTPService.inspect_remote_dir(remote_soft_dir)
+                auto_upload = bool(remote_info.get("exists", False))
+            except Exception:
+                logging.exception("Could not inspect automatic SoftSub destination %s", remote_soft_dir)
+
+        task = await queue_engine.add_task(
+            "mkvtoolnix",
+            f"AutoSoftSub [{vid_path.parent.name}]: {soft_out_file.name}",
+            AutomationService.run_softsub_and_optional_upload,
+            vid_path,
+            soft_out_file,
+            fa_sub,
+            en_sub,
+            brand,
+            auto_upload,
+            notify_completion=False,
+        )
+        logging.info(
+            "Automatic SoftSub queued for %s (task=%s, upload=%s)",
+            vid_path.name,
+            task.task_id,
+            auto_upload,
+        )
+        return
 
     token = uuid.uuid4().hex[:6]
     PENDING_POST_DL_ITEMS[token] = {
