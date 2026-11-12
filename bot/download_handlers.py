@@ -197,6 +197,7 @@ async def _smart_download_pipeline_job(
     dest_dir: Path,
     progress_callback=None,
     automated_background: bool = False,
+    expected_episode_tag: str | None = None,
 ) -> Path:
     """دانلود ایزوله، اکسترکت و اجرای پس‌پردازش فقط روی خروجی همین تسک."""
     dest_dir = Path(dest_dir).resolve()
@@ -255,6 +256,38 @@ async def _smart_download_pipeline_job(
                 "این تسک هیچ فایل ویدئویی دانلود نکرد؛ خروجی تسک‌های دیگر به‌عنوان نتیجه استفاده نشد."
             )
 
+        if automated_background and expected_episode_tag:
+            fallback_season = AutomationService.extract_season_num_from_dir(dest_dir)
+            found_tags = [
+                AutomationService.extract_episode_tag(
+                    item.name,
+                    fallback_season=fallback_season,
+                )
+                for item in staged_videos
+            ]
+            is_ambiguous = len(staged_videos) != 1
+            has_wrong_episode = any(
+                tag and tag.upper() != expected_episode_tag.upper()
+                for tag in found_tags
+            )
+            if is_ambiguous or has_wrong_episode:
+                quarantine_dir = (
+                    dest_dir / "_rejected_downloads" / uuid.uuid4().hex[:10]
+                )
+                quarantine_dir.mkdir(parents=True, exist_ok=True)
+                for item in staged_videos:
+                    if item.exists():
+                        shutil.move(str(item), str(quarantine_dir / item.name))
+                reason = (
+                    "تورنت بیش از یک فایل ویدئویی تحویل داد"
+                    if is_ambiguous
+                    else f"نام فایل با قسمت مورد انتظار {expected_episode_tag} مغایرت داشت"
+                )
+                raise RuntimeError(
+                    f"دانلود خودکار امن متوقف شد: {reason}. "
+                    f"فایل‌ها برای بررسی در {quarantine_dir} نگه داشته شدند."
+                )
+
         for source_video in staged_videos:
             target_video = dest_dir / source_video.name
             if target_video.exists():
@@ -309,6 +342,8 @@ async def _smart_download_pipeline_job(
             vid.name,
             fallback_season=AutomationService.extract_season_num_from_dir(season_or_movie_dir),
         ) or ""
+        if automated_background and expected_episode_tag:
+            ep_tag = expected_episode_tag
 
         # FullHD فقط سورس انکود است؛ کیفیت‌های خروجی از پوشه فصل تشخیص داده می‌شوند.
         if dest_dir.name.casefold() == "fullhd":
