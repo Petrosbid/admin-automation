@@ -94,7 +94,10 @@ class EZTVTrackerService:
     ) -> None:
         """Keep recorded episodes and scheduled-task metadata when a show's identity changes."""
         state = self._load_state()
-        old_state_key = self._show_state_key(old_show)
+        old_normalized = dict(old_show)
+        old_normalized["category"] = str(old_normalized.get("category", "Series")).title()
+        old_normalized["title"] = str(old_normalized.get("title", "")).strip()
+        old_state_key = self._show_state_key(old_normalized)
         new_state_key = self._show_state_key(new_show)
         progress = state.setdefault("progress", {})
         if old_state_key != new_state_key and old_state_key in progress:
@@ -109,7 +112,7 @@ class EZTVTrackerService:
                     values[new_state_key + suffix] = values.pop(key)
 
         old_task_prefix = (
-            f"{old_show.get('category', 'Series')}|{self._slug(old_show.get('title', ''))}|"
+            f"{str(old_show.get('category', 'Series')).title()}|{self._slug(old_show.get('title', ''))}|"
             f"S{int(old_show.get('season', 1)):02d}E"
         )
         new_task_prefix = (
