@@ -193,93 +193,100 @@ class DownloaderService:
             if add_resp.status != 200:
                 raise RuntimeError(f"qBittorrent add failed: {await add_resp.text()}")
 
-            # از این نقطه تورنت به qBittorrent تحویل داده شده؛ fallback به aria2
-            # خطر دانلود موازی/تکراری دارد و نباید اجرا شود.
-            start_ts = time.time()
-            matched_hash: str | None = None
-            target_torrent: dict | None = None
-            registration_deadline = start_ts + 90
-
-            while time.time() < registration_deadline and not matched_hash:
-                await asyncio.sleep(2)
-                info_resp = await session.get(f"{base_url}/api/v2/torrents/info")
-                if info_resp.status != 200:
-                    continue
-                torrents = await info_resp.json()
-                if not isinstance(torrents, list):
-                    continue
-
-                candidates = []
-                for item in torrents:
-                    raw_save = str(item.get("save_path", "") or "")
-                    save_key = os.path.normcase(os.path.normpath(raw_save)).casefold()
-                    torrent_hash = str(item.get("hash", "")).casefold()
-                    if save_key == dest_key and torrent_hash and torrent_hash not in before_hashes:
-                        candidates.append(item)
-
-                if len(candidates) == 1:
-                    target_torrent = candidates[0]
-                    matched_hash = str(target_torrent.get("hash"))
-                elif len(candidates) > 1:
-                    # اگر چند فایل تورنت با همین مسیر به طور همزمان اضافه شده‌اند،
-                    # نام/لینک همین درخواست را تطبیق می‌دهیم؛ وگرنه fail closed.
-                    target_names = {
-                        Path(target).name.casefold(),
-                        Path(target).stem.casefold(),
-                    }
-                    named = [
-                        item for item in candidates
-                        if str(item.get("name", "")).casefold() in target_names
-                        or Path(str(item.get("name", ""))).stem.casefold() in target_names
-                    ]
-                    if len(named) == 1:
-                        target_torrent = named[0]
+            try:
+                # از این نقطه تورنت به qBittorrent تحویل داده شده؛ fallback به aria2
+                # خطر دانلود موازی/تکراری دارد و نباید اجرا شود.
+                start_ts = time.time()
+                matched_hash: str | None = None
+                target_torrent: dict | None = None
+                registration_deadline = start_ts + 90
+    
+                while time.time() < registration_deadline and not matched_hash:
+                    await asyncio.sleep(2)
+                    info_resp = await session.get(f"{base_url}/api/v2/torrents/info")
+                    if info_resp.status != 200:
+                        continue
+                    torrents = await info_resp.json()
+                    if not isinstance(torrents, list):
+                        continue
+    
+                    candidates = []
+                    for item in torrents:
+                        raw_save = str(item.get("save_path", "") or "")
+                        save_key = os.path.normcase(os.path.normpath(raw_save)).casefold()
+                        torrent_hash = str(item.get("hash", "")).casefold()
+                        if save_key == dest_key and torrent_hash and torrent_hash not in before_hashes:
+                            candidates.append(item)
+    
+                    if len(candidates) == 1:
+                        target_torrent = candidates[0]
                         matched_hash = str(target_torrent.get("hash"))
-
-            if not matched_hash:
-                raise _TorrentAlreadySubmittedError(
-                    "تورنت به qBittorrent تحویل شد اما تا ۹۰ ثانیه شناسهٔ یکتای آن در مسیر اختصاصی این دانلود پیدا نشد؛ "
-                    "برای جلوگیری از دانلود تکراری، fallback انجام نشد."
-                )
-
-            if progress_callback:
-                progress_callback("تورنت در qBittorrent شناسایی شد؛ دریافت فایل‌ها آغاز شد...")
-
-            while True:
-                await asyncio.sleep(3)
-                info_resp = await session.get(f"{base_url}/api/v2/torrents/info")
-                if info_resp.status != 200:
-                    continue
-                torrents = await info_resp.json()
-                if not isinstance(torrents, list):
-                    continue
-
-                target_torrent = next(
-                    (
-                        item for item in torrents
-                        if str(item.get("hash", "")).casefold() == matched_hash.casefold()
-                    ),
-                    None,
-                )
-                if target_torrent is None:
-                    # حذف از qBittorrent پس از تکمیل، یا حذف دستی؛ وضعیت واقعی روی دیسک
-                    # را caller بررسی خواهد کرد.
-                    break
-
-                progress = float(target_torrent.get("progress", 0.0)) * 100.0
-                state = str(target_torrent.get("state", "")).lower()
-                speed_mb = float(target_torrent.get("dlspeed", 0)) / (1024 * 1024)
-                name = str(target_torrent.get("name", "Torrent"))
-
-                if progress_callback:
-                    progress_callback(f"{progress:.1f}% | سرعت: {speed_mb:.2f} MB/s ({name[:25]})")
-
-                if progress >= 100.0:
-                    await session.post(
-                        f"{base_url}/api/v2/torrents/delete",
-                        data={"hashes": matched_hash, "deleteFiles": "false"}
+                    elif len(candidates) > 1:
+                        # اگر چند فایل تورنت با همین مسیر به طور همزمان اضافه شده‌اند،
+                        # نام/لینک همین درخواست را تطبیق می‌دهیم؛ وگرنه fail closed.
+                        target_names = {
+                            Path(target).name.casefold(),
+                            Path(target).stem.casefold(),
+                        }
+                        named = [
+                            item for item in candidates
+                            if str(item.get("name", "")).casefold() in target_names
+                            or Path(str(item.get("name", ""))).stem.casefold() in target_names
+                        ]
+                        if len(named) == 1:
+                            target_torrent = named[0]
+                            matched_hash = str(target_torrent.get("hash"))
+    
+                if not matched_hash:
+                    raise _TorrentAlreadySubmittedError(
+                        "تورنت به qBittorrent تحویل شد اما تا ۹۰ ثانیه شناسهٔ یکتای آن در مسیر اختصاصی این دانلود پیدا نشد؛ "
+                        "برای جلوگیری از دانلود تکراری، fallback انجام نشد."
                     )
-                    break
+    
+                if progress_callback:
+                    progress_callback("تورنت در qBittorrent شناسایی شد؛ دریافت فایل‌ها آغاز شد...")
+    
+                while True:
+                    await asyncio.sleep(3)
+                    info_resp = await session.get(f"{base_url}/api/v2/torrents/info")
+                    if info_resp.status != 200:
+                        continue
+                    torrents = await info_resp.json()
+                    if not isinstance(torrents, list):
+                        continue
+    
+                    target_torrent = next(
+                        (
+                            item for item in torrents
+                            if str(item.get("hash", "")).casefold() == matched_hash.casefold()
+                        ),
+                        None,
+                    )
+                    if target_torrent is None:
+                        # حذف از qBittorrent پس از تکمیل، یا حذف دستی؛ وضعیت واقعی روی دیسک
+                        # را caller بررسی خواهد کرد.
+                        break
+    
+                    progress = float(target_torrent.get("progress", 0.0)) * 100.0
+                    state = str(target_torrent.get("state", "")).lower()
+                    speed_mb = float(target_torrent.get("dlspeed", 0)) / (1024 * 1024)
+                    name = str(target_torrent.get("name", "Torrent"))
+    
+                    if progress_callback:
+                        progress_callback(f"{progress:.1f}% | سرعت: {speed_mb:.2f} MB/s ({name[:25]})")
+    
+                    if progress >= 100.0:
+                        await session.post(
+                            f"{base_url}/api/v2/torrents/delete",
+                            data={"hashes": matched_hash, "deleteFiles": "false"}
+                        )
+                        break
+            except _TorrentAlreadySubmittedError:
+                raise
+            except Exception as exc:
+                raise _TorrentAlreadySubmittedError(
+                    f"تورنت به qBittorrent تحویل شده اما در زمان ردیابی همان دانلود خطا رخ داد: {exc}"
+                ) from exc
 
         return dest_dir
 
