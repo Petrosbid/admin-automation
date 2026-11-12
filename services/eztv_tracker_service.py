@@ -539,6 +539,50 @@ class EZTVTrackerService:
         }
         return queue_task.task_id
 
+    def _collect_finished_task_updates(self, state: dict[str, Any]) -> list[dict[str, str]]:
+        """Collect terminal download statuses once; one poll produces at most one admin summary."""
+        updates: list[dict[str, str]] = []
+        scheduled = state.setdefault("scheduled_tasks", {})
+        now = datetime.now(timezone.utc).isoformat()
+
+        for key, item in list(scheduled.items()):
+            if not isinstance(item, dict):
+                continue
+            if item.get("reported"):
+                continue
+            task_id = str(item.get("task_id", "")).strip()
+            if not task_id:
+                continue
+            task = queue_engine.tasks.get(task_id)
+            if not task or not task.is_finished:
+                continue
+
+            status = str(task.status or "")
+            is_success = "تکمیل" in status or status.startswith("✅")
+            show = key.split("|")[1] if "|" in key else "سریال"
+            episode_match = re.search(r"(S\d{2}E\d{2})", key, flags=re.IGNORECASE)
+            episode_tag = episode_match.group(1).upper() if episode_match else "قسمت"
+            quality = key.rsplit("|", 1)[-1]
+
+            item["reported"] = True
+            item["finished_at"] = now
+            item["result"] = "success" if is_success else "failed"
+            item["final_status"] = status
+            if not is_success:
+                # بعد از خطا، ۱۵ دقیقه cooldown از زمان پایان محاسبه شود تا retry storm ایجاد نشود.
+                item["queued_at"] = now
+
+            updates.append({
+                "show": show,
+                "episode": episode_tag,
+                "quality": quality,
+                "task_id": task_id,
+                "result": "success" if is_success else "failed",
+                "detail": str(task.error or task.progress or status)[:180],
+            })
+
+        return updates
+
     async def poll_once(self, bot, send_summary: bool = True) -> dict[str, Any]:
         async with self._poll_lock:
             shows = self.get_shows()
@@ -549,6 +593,7 @@ class EZTVTrackerService:
             state = self._load_state()
             seen_ids = set(str(x) for x in state.get("seen_item_ids", []))
             added_ids: list[str] = []
+            completed_updates = self._collect_finished_task_updates(state)
             queued: list[dict[str, str]] = []
             already_local: list[str] = []
             current_time = datetime.now(timezone.utc)
@@ -631,8 +676,8 @@ class EZTVTrackerService:
             state["last_feed_check"] = current_time.isoformat()
             self._save_state(state)
 
-            if send_summary and (queued or (already_local and added_ids)):
-                lines = ["📡 <b>بررسی خودکار EZTV</b>"]
+            if send_summary and (queued or completed_updates or (already_local and added_ids)):
+                lines = ["📡 <b>گزارش خودکار EZTV</b>"]
                 if queued:
                     lines.append(f"✅ {len(queued)} دانلود جدید به صف اضافه شد:")
                     for item in queued[:self.MAX_STATUS_ITEMS]:
@@ -641,14 +686,33 @@ class EZTVTrackerService:
                             f"<code>{item['episode']}</code> — {html.escape(item['quality'])} "
                             f"(<code>{html.escape(item['task_id'])}</code>)"
                         )
-                elif already_local:
+                elif already_local and added_ids:
                     lines.append("✅ انتشارهای پیدا شده از قبل در پوشه محلی موجود بودند.")
-                else:
+
+                if completed_updates:
+                    success_items = [item for item in completed_updates if item["result"] == "success"]
+                    failed_items = [item for item in completed_updates if item["result"] != "success"]
+                    if success_items:
+                        lines.append(f"\n✅ دانلودهای تکمیل‌شده: {len(success_items)}")
+                        for item in success_items[:self.MAX_STATUS_ITEMS]:
+                            lines.append(
+                                f"• <code>{html.escape(item['episode'])}</code> — "
+                                f"{html.escape(item['quality'])}: دریافت فایل به پایان رسید"
+                            )
+                    if failed_items:
+                        lines.append(f"\n❌ دانلودهای ناموفق: {len(failed_items)}")
+                        for item in failed_items[:self.MAX_STATUS_ITEMS]:
+                            lines.append(
+                                f"• <code>{html.escape(item['episode'])}</code> — "
+                                f"{html.escape(item['quality'])}: {html.escape(item['detail'])}"
+                            )
+                if not queued and not completed_updates and not already_local:
                     lines.append("در این نوبت انتشار منطبق با قسمت‌های مورد انتظار پیدا نشد.")
                 await self._send_admin_message(bot, "\n".join(lines))
             return {
                 "shows": len(shows),
                 "queued": queued,
+                "completed_updates": completed_updates,
                 "already_local": already_local,
                 "release_count": len(releases),
             }
