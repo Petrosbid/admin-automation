@@ -38,6 +38,7 @@ class EZTVTrackerService:
         self._poll_lock = asyncio.Lock()
         self._last_error_notice = 0.0
         self._last_cycle_message = 0.0
+        self._remote_quality_cache: dict[str, tuple[float, set[str]]] = {}
 
     @staticmethod
     def _workspace() -> Path:
@@ -362,15 +363,25 @@ class EZTVTrackerService:
 
     async def _remote_quality_directories(self, season_dir: Path) -> set[str]:
         remote_path = AutomationService.compute_server_remote_dir_for_local_path(season_dir)
+        cache_key = remote_path.casefold()
+        cached = self._remote_quality_cache.get(cache_key)
+        now = time.monotonic()
+        if cached and now - cached[0] < 60:
+            return set(cached[1])
+
         try:
             info = await CuteFTPService.inspect_remote_dir(remote_path)
-            return {
+            directories = {
                 str(value).casefold()
                 for value in (info.get("dirs", []) or [])
                 if str(value).strip()
             }
+            self._remote_quality_cache[cache_key] = (now, directories)
+            return set(directories)
         except Exception:
             logging.exception("Could not inspect remote EZTV season folder %s", remote_path)
+            if cached:
+                return set(cached[1])
             return set()
 
     def _quality_folder_candidates(self, show: dict[str, Any], quality: str) -> list[str]:
@@ -535,7 +546,11 @@ class EZTVTrackerService:
         scheduled[key] = {
             "task_id": queue_task.task_id,
             "release_id": release["id"],
+            "show_title": show["title"],
+            "episode_tag": self._episode_tag(show["season"], episode),
+            "quality": quality,
             "queued_at": datetime.now(timezone.utc).isoformat(),
+            "reported": False,
         }
         return queue_task.task_id
 
@@ -559,10 +574,12 @@ class EZTVTrackerService:
 
             status = str(task.status or "")
             is_success = "تکمیل" in status or status.startswith("✅")
-            show = key.split("|")[1] if "|" in key else "سریال"
+            show = str(item.get("show_title") or (key.split("|")[1] if "|" in key else "سریال"))
             episode_match = re.search(r"(S\d{2}E\d{2})", key, flags=re.IGNORECASE)
-            episode_tag = episode_match.group(1).upper() if episode_match else "قسمت"
-            quality = key.rsplit("|", 1)[-1]
+            episode_tag = str(item.get("episode_tag") or (
+                episode_match.group(1).upper() if episode_match else "قسمت"
+            ))
+            quality = str(item.get("quality") or key.rsplit("|", 1)[-1])
 
             item["reported"] = True
             item["finished_at"] = now
@@ -862,6 +879,16 @@ class EZTVTrackerService:
             )
             lines.append(f"وضعیت: {headline}")
 
+            quality_status = [
+                (
+                    f"✅ {html.escape(quality)}"
+                    if present
+                    else f"❌ {html.escape(quality)} خالی"
+                )
+                for quality, present in status["raw_present"].items()
+            ]
+            if quality_status:
+                lines.append("کیفیت‌ها: " + " | ".join(quality_status))
             if status["missing_qualities"]:
                 lines.append(
                     "کیفیت‌های خالی: "
