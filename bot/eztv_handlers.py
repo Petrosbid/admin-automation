@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 from aiogram import F, Router
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
@@ -84,7 +84,9 @@ def _show_title(show: dict[str, Any]) -> str:
     return str(show.get("title", "بدون عنوان")).strip() or "بدون عنوان"
 
 
-def _quality_text(qualities: list[str]) -> str:
+def _quality_text(qualities: list[str] | None) -> str:
+    if not isinstance(qualities, list):
+        return "بدون کیفیت"
     return "، ".join(QUALITY_LABELS.get(q, q) for q in qualities) or "بدون کیفیت"
 
 
@@ -222,6 +224,9 @@ async def _render_detail(target: Message, index: int, edit: bool = True):
     observed = eztv_tracker_service.observed_release_weekdays(show, state)
     observed_text = "، ".join(_day_text(day) for day in observed) if observed else "هنوز داده‌ای ثبت نشده"
 
+    folders = show.get("quality_folders", {})
+    if not isinstance(folders, dict):
+        folders = {}
     body = (
         f"🎬 <b>{html.escape(_show_title(show))}</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -231,7 +236,7 @@ async def _render_detail(target: Message, index: int, edit: bool = True):
         f"کیفیت‌ها: <b>{html.escape(_quality_text(show.get('qualities', [])))}</b>\n"
         f"روز انتشار تنظیم‌شده: <b>{html.escape(_day_text(show.get('release_day')))}</b>\n"
         f"روزهای ثبت‌شده از RSS: <b>{html.escape(observed_text)}</b>\n"
-        f"پوشه‌های مقصد:\n<code>{html.escape(_folder_text(show.get('quality_folders', {})))}</code>"
+        f"پوشه‌های مقصد:\n<code>{html.escape(_folder_text(folders))}</code>"
     )
 
     builder = InlineKeyboardBuilder()
@@ -246,6 +251,15 @@ async def _render_detail(target: Message, index: int, edit: bool = True):
         await target.edit_text(body, reply_markup=builder.as_markup(), parse_mode="HTML")
     else:
         await target.answer(body, reply_markup=builder.as_markup(), parse_mode="HTML")
+
+
+async def _cancel_input(message: Message, state: FSMContext) -> bool:
+    if (message.text or "").strip().casefold() != "/cancel":
+        return False
+    await state.clear()
+    await message.answer("عملیات مدیریت EZTV لغو شد.")
+    await _render_list(message, page=0, edit=False)
+    return True
 
 
 async def _prompt_title(target: Message, state: FSMContext, edit: bool):
@@ -646,6 +660,8 @@ async def cb_eztv_manager(call: CallbackQuery, state: FSMContext):
 async def handle_eztv_title(message: Message, state: FSMContext):
     if not _is_admin(message):
         return
+    if await _cancel_input(message, state):
+        return
     raw = (message.text or "").strip()
     data = await state.get_data()
     draft = dict(data.get("draft", {}))
@@ -666,6 +682,8 @@ async def handle_eztv_title(message: Message, state: FSMContext):
 async def handle_eztv_aliases(message: Message, state: FSMContext):
     if not _is_admin(message):
         return
+    if await _cancel_input(message, state):
+        return
     raw = (message.text or "").strip()
     data = await state.get_data()
     draft = dict(data.get("draft", {}))
@@ -680,6 +698,8 @@ async def handle_eztv_aliases(message: Message, state: FSMContext):
 @router.message(EztvEditStates.season)
 async def handle_eztv_season(message: Message, state: FSMContext):
     if not _is_admin(message):
+        return
+    if await _cancel_input(message, state):
         return
     raw = (message.text or "").strip()
     data = await state.get_data()
@@ -700,6 +720,8 @@ async def handle_eztv_season(message: Message, state: FSMContext):
 async def handle_eztv_next_episode(message: Message, state: FSMContext):
     if not _is_admin(message):
         return
+    if await _cancel_input(message, state):
+        return
     raw = (message.text or "").strip()
     data = await state.get_data()
     draft = dict(data.get("draft", {}))
@@ -719,6 +741,8 @@ async def handle_eztv_next_episode(message: Message, state: FSMContext):
 async def handle_eztv_folders(message: Message, state: FSMContext):
     if not _is_admin(message):
         return
+    if await _cancel_input(message, state):
+        return
     raw = (message.text or "").strip()
     data = await state.get_data()
     draft = dict(data.get("draft", {}))
@@ -734,15 +758,6 @@ async def handle_eztv_folders(message: Message, state: FSMContext):
         "📅 روز معمول انتشار سریال را انتخاب کنید:",
         reply_markup=_release_day_keyboard(str(draft.get("release_day", "") or "")),
     )
-
-
-@router.message(Command("cancel"), StateFilter(EztvEditStates))
-async def cmd_eztv_cancel(message: Message, state: FSMContext):
-    if not _is_admin(message):
-        return
-    await state.clear()
-    await message.answer("عملیات مدیریت EZTV لغو شد.")
-    await _render_list(message, page=0, edit=False)
 
 
 @router.message(Command("eztv_status"))
