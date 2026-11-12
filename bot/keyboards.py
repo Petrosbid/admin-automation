@@ -239,7 +239,7 @@ def smart_auto_missing_en_kb(has_embedded_en: bool) -> InlineKeyboardMarkup:
         builder.row(
             InlineKeyboardButton(
                 text="✅ بله، خودکار از فیلم استخراج و در پوشه srt قرار بده",
-                callback_data="sauto_en:auto_extract"
+                callback_data="sauto_en:extract"
             )
         )
     builder.row(

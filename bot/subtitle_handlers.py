@@ -948,6 +948,7 @@ async def _check_english_sub_batch_step(call_or_msg: CallbackQuery | Message, st
         await call_or_msg.answer(text, reply_markup=kb, parse_mode="Markdown")
 
 
+@router.callback_query(SubtitleStates.sauto_waiting_en_decision, F.data == "sauto_en:auto_extract")
 @router.callback_query(SubtitleStates.sauto_waiting_en_decision, F.data == "sauto_en:extract")
 async def cb_sauto_extract_en(call: CallbackQuery, state: FSMContext):
     # نمایش اعلان بالای صفحه بدون مصرف سهمیه EditMessageText
