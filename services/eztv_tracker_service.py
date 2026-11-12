@@ -92,43 +92,71 @@ class EZTVTrackerService:
         old_show: dict[str, Any],
         new_show: dict[str, Any],
     ) -> None:
-        """Keep recorded episodes and scheduled-task metadata when a show's identity changes."""
+        """Keep release history when a title is renamed without resetting automatic progress."""
         state = self._load_state()
         old_normalized = dict(old_show)
         old_normalized["category"] = str(old_normalized.get("category", "Series")).title()
         old_normalized["title"] = str(old_normalized.get("title", "")).strip()
+        new_normalized = dict(new_show)
+        new_normalized["category"] = str(new_normalized.get("category", "Series")).title()
+        new_normalized["title"] = str(new_normalized.get("title", "")).strip()
+
         old_state_key = self._show_state_key(old_normalized)
-        new_state_key = self._show_state_key(new_show)
+        new_state_key = self._show_state_key(new_normalized)
+        old_season = int(old_normalized.get("season", 1))
+        new_season = int(new_normalized.get("season", 1))
+        old_category = old_normalized["category"]
+        new_category = new_normalized["category"]
+        old_episode_setting = int(old_normalized.get("next_episode", 1))
+        new_episode_setting = int(new_normalized.get("next_episode", 1))
+
         progress = state.setdefault("progress", {})
         if old_state_key != new_state_key and old_state_key in progress:
             old_progress = progress.pop(old_state_key)
             progress[new_state_key] = old_progress
 
-        for section in ("release_history", "rss_matches"):
-            values = state.setdefault(section, {})
-            for key in list(values):
-                if str(key).startswith(old_state_key + "|"):
-                    suffix = str(key)[len(old_state_key):]
-                    values[new_state_key + suffix] = values.pop(key)
+        # Renaming a show can safely migrate history within the same season.
+        # Changing season/category starts a different tracking scope, so do not
+        # re-label old season release dates or queued episode tasks as new ones.
+        same_tracking_scope = old_season == new_season and old_category == new_category
+        if old_state_key != new_state_key and same_tracking_scope:
+            for section in ("release_history", "rss_matches"):
+                values = state.setdefault(section, {})
+                for key in list(values):
+                    if str(key).startswith(old_state_key + "|"):
+                        suffix = str(key)[len(old_state_key):]
+                        values[new_state_key + suffix] = values.pop(key)
 
-        old_task_prefix = (
-            f"{str(old_show.get('category', 'Series')).title()}|{self._slug(old_show.get('title', ''))}|"
-            f"S{int(old_show.get('season', 1)):02d}E"
-        )
-        new_task_prefix = (
-            f"{new_show.get('category', 'Series')}|{self._slug(new_show.get('title', ''))}|"
-            f"S{int(new_show.get('season', 1)):02d}E"
-        )
-        scheduled = state.setdefault("scheduled_tasks", {})
-        if old_task_prefix != new_task_prefix:
+            old_task_prefix = (
+                f"{old_category}|{self._slug(old_normalized['title'])}|S{old_season:02d}E"
+            )
+            new_task_prefix = (
+                f"{new_category}|{self._slug(new_normalized['title'])}|S{new_season:02d}E"
+            )
+            scheduled = state.setdefault("scheduled_tasks", {})
             for key in list(scheduled):
                 if str(key).startswith(old_task_prefix):
                     suffix = str(key)[len(old_task_prefix):]
-                    scheduled[new_task_prefix + suffix] = scheduled.pop(key)
+                    migrated = scheduled.pop(key)
+                    if isinstance(migrated, dict):
+                        migrated["show_title"] = new_normalized["title"]
+                    new_key = new_task_prefix + suffix
+                    scheduled[new_key] = migrated
 
         progress_item = progress.setdefault(new_state_key, {})
-        progress_item["next_episode"] = int(new_show.get("next_episode", 1))
-        progress_item["config_next_episode"] = int(new_show.get("next_episode", 1))
+        episode_setting_changed = (
+            old_episode_setting != new_episode_setting
+            or old_season != new_season
+            or old_category != new_category
+        )
+        if episode_setting_changed or "next_episode" not in progress_item:
+            progress_item["next_episode"] = new_episode_setting
+            progress_item["config_next_episode"] = new_episode_setting
+        else:
+            # Preserve the auto-advanced next_episode when only weekday, aliases,
+            # quality folders or other descriptive metadata were edited.
+            progress_item.setdefault("config_next_episode", new_episode_setting)
+
         self._save_state(state)
 
     @classmethod
