@@ -34,6 +34,33 @@ monitor:
       enabled: true
       url: "https://avasaraw.top/"
 
+
+eztv_tracker:
+  enabled: true
+  feed_url: "https://myrss.org/eztv"
+  poll_interval_seconds: 300       # بررسی RSS هر ۵ دقیقه
+  daily_report_time: "09:00"       # ساعت گزارش روزانه بر اساس timezone
+  timezone: "Asia/Tehran"
+  required_outputs:
+    - softsub
+    - hardsub
+  shows: []
+  # نمونه افزودن سریال؛ برای هر سریال یک عضو به shows اضافه کنید:
+  # shows:
+  #   - title: "Example Show"
+  #     aliases: ["Example.Show"]
+  #     category: "Series"          # Series یا Anime
+  #     season: 2
+  #     next_episode: 4             # فقط S02E04 و کیفیت‌های مربوط به آن دانلود می‌شود
+  #     qualities:
+  #       - fullhd_h264             # 1080p/FullHD + H.264/H264/AVC
+  #       - 480p
+  #       - 2160p
+  #     quality_folders:
+  #       fullhd_h264: "FullHD"
+  #       480p: ["480p-RMTeam", "480p-EBTV"]
+  #       2160p: "2160p-HDR-x265"
+
 paths:
   workspace_dir: "C:\\MediaBot\\workspace"
   presets_dir: "C:\\MediaBot\\presets"
