@@ -221,7 +221,12 @@ async def _render_detail(target: Message, index: int, edit: bool = True):
     category = str(show.get("category", "Series"))
     category_text = "انیمه" if category.casefold() == "anime" else "سریال"
     state = eztv_tracker_service._load_state()
-    observed = eztv_tracker_service.observed_release_weekdays(show, state)
+    normalized_show = dict(show)
+    normalized_show["title"] = _show_title(show)
+    normalized_show["category"] = str(show.get("category", "Series")).strip().title()
+    if normalized_show["category"] not in ("Series", "Anime"):
+        normalized_show["category"] = "Series"
+    observed = eztv_tracker_service.observed_release_weekdays(normalized_show, state)
     observed_text = "، ".join(_day_text(day) for day in observed) if observed else "هنوز داده‌ای ثبت نشده"
 
     folders = show.get("quality_folders", {})
