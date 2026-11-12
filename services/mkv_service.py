@@ -78,20 +78,32 @@ class MKVService:
 
     @staticmethod
     def _is_english_track(track_info: dict) -> bool:
-        """تشخیص زبان با اولویت تگ استاندارد و زبان IETF؛ und به‌تنهایی انگلیسی فرض نمی‌شود."""
-        lang = str(track_info.get("language", "") or "").strip().lower()
-        lang_ietf = str(track_info.get("language_ietf", "") or "").strip().lower()
-        name = str(track_info.get("track_name", "") or "").strip().lower()
-        language_values = {lang, lang_ietf}
-        if any(
+        """تشخیص EN با تگ زبان؛ نام‌هایی مثل Default نباید به‌اشتباه رد شوند."""
+        lang = str(track_info.get("language", "") or "").strip().casefold()
+        lang_ietf = str(track_info.get("language_ietf", "") or "").strip().casefold()
+        name = str(track_info.get("track_name", "") or "").strip().casefold()
+
+        explicit_persian = bool(
+            re.search(
+                r"(?<![a-z0-9])(?:fa|per|fas|persian|farsi)(?![a-z0-9])",
+                name,
+            )
+        )
+        explicit_english_name = bool(
+            re.search(
+                r"(?<![a-z0-9])(?:en|eng|english)(?![a-z0-9])",
+                name,
+            )
+        )
+        explicit_english_language = any(
             value in {"eng", "en", "english"}
             or value.startswith("en-")
-            for value in language_values
-        ):
-            return not any(marker in name for marker in ("persian", "farsi", "فارسی", "per", "fa"))
-        if any(marker in name for marker in ("english", "eng", ".en", "_en", " en ")):
-            return not any(marker in name for marker in ("persian", "farsi", "فارسی"))
-        return False
+            for value in (lang, lang_ietf)
+        )
+
+        if explicit_persian:
+            return False
+        return explicit_english_language or explicit_english_name
 
     @staticmethod
     def subtitle_extension_for_codec(codec: str) -> str:
