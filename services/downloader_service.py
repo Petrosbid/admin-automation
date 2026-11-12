@@ -120,6 +120,8 @@ class DownloaderService:
             if Path(qbt_bin).is_file():
                 try:
                     return await cls._download_qbt_cli(qbt_bin, target, dest_dir, progress_callback)
+                except _TorrentAlreadySubmittedError:
+                    raise
                 except Exception as qbt_err:
                     logging.warning(f"qbt.exe failed ({qbt_err}), falling back to aria2c...")
 
