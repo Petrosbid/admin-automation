@@ -97,3 +97,15 @@ ftp:
       timeout: 120
       remote_base_dir: "/English/Movies"
       public_base_url: "https://dl16.cdnzed.sbs/"
+
+
+eztv_tracker:
+  enabled: true
+  feed_url: "https://myrss.org/eztv"
+  poll_interval_seconds: 300       # بررسی RSS هر ۵ دقیقه
+  daily_report_time: "09:00"       # ساعت گزارش روزانه بر اساس timezone
+  timezone: "Asia/Tehran"
+  required_outputs:
+    - softsub
+    - hardsub
+  shows: []

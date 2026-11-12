@@ -78,14 +78,43 @@ class MKVService:
 
     @staticmethod
     def _is_english_track(track_info: dict) -> bool:
-        lang = str(track_info.get("language", "")).lower()
-        name = str(track_info.get("track_name", "")).lower()
-        if lang in ("eng", "en", "english", "und"):
-            if "fa" not in name and "per" not in name and "persian" not in name:
-                return True
-        if "english" in name or "eng" in name:
-            return True
-        return False
+        """تشخیص EN با تگ زبان؛ نام‌هایی مثل Default نباید به‌اشتباه رد شوند."""
+        lang = str(track_info.get("language", "") or "").strip().casefold()
+        lang_ietf = str(track_info.get("language_ietf", "") or "").strip().casefold()
+        name = str(track_info.get("track_name", "") or "").strip().casefold()
+
+        explicit_persian = bool(
+            re.search(
+                r"(?<![a-z0-9])(?:fa|per|fas|persian|farsi)(?![a-z0-9])",
+                name,
+            )
+        )
+        explicit_english_name = bool(
+            re.search(
+                r"(?<![a-z0-9])(?:en|eng|english)(?![a-z0-9])",
+                name,
+            )
+        )
+        explicit_english_language = any(
+            value in {"eng", "en", "english"}
+            or value.startswith("en-")
+            for value in (lang, lang_ietf)
+        )
+
+        if explicit_persian:
+            return False
+        return explicit_english_language or explicit_english_name
+
+    @staticmethod
+    def subtitle_extension_for_codec(codec: str) -> str:
+        value = str(codec or "").casefold()
+        if "ssa" in value:
+            return ".ssa"
+        if "ass" in value:
+            return ".ass"
+        if any(x in value for x in ("pgs", "hdmv", "vobsub", "dvd_subtitle")):
+            return ".sup" if "pgs" in value or "hdmv" in value else ".idx"
+        return ".srt"
 
     @classmethod
     async def inspect_tracks(cls, video_path: Path) -> dict:
@@ -112,6 +141,7 @@ class MKVService:
                     "id": t.get("id"),
                     "codec": t.get("codec", "SubRip/SRT"),
                     "language": props.get("language", "und"),
+                    "language_ietf": props.get("language_ietf", ""),
                     "track_name": props.get("track_name", ""),
                     "default_track": props.get("default_track", False),
                     "forced_track": props.get("forced_track", False),
@@ -125,68 +155,73 @@ class MKVService:
         track_id: int,
         output_sub_path: Path
     ) -> Path:
+        """Extract one MKVToolNix subtitle track and fail clearly when output is empty."""
+        video_path = Path(video_path).resolve()
+        output_sub_path = Path(output_sub_path).resolve()
         output_sub_path.parent.mkdir(parents=True, exist_ok=True)
-        ffmpeg_bin = cls._get_ffmpeg_bin()
+        if track_id is None:
+            raise ValueError("شناسه ترک زیرنویس نامعتبر است.")
+
         mkvextract_bin = cls._get_mkvextract_bin()
+        if not Path(mkvextract_bin).is_file() and not shutil.which(mkvextract_bin):
+            raise FileNotFoundError(f"mkvextract پیدا نشد: {mkvextract_bin}")
 
-        if video_path.suffix.lower() == ".mp4" and ffmpeg_bin:
-            cmd = [
-                ffmpeg_bin, "-y",
-                "-i", str(video_path),
-                "-map", f"0:{track_id}",
-                str(output_sub_path)
-            ]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT
-            )
-            await proc.communicate()
-            if output_sub_path.exists() and output_sub_path.stat().st_size > 0:
-                if output_sub_path.suffix.lower() in (".srt", ".ass", ".ssa"):
-                    SubtitleService.normalize_subtitle_file(output_sub_path)
-                return output_sub_path
-
-        target_for_mkvextract = video_path
-        temp_remux_mkv = None
+        target_for_extract = video_path
+        selected_track_id = int(track_id)
+        temp_remux_mkv: Path | None = None
         try:
+            # شناسه ترک mkvmerge با شماره stream در ffmpeg یکی نیست؛ برای MP4 ابتدا
+            # ترک انتخابی را با mkvmerge به یک MKV تک‌ترکی remux می‌کنیم.
             if video_path.suffix.lower() == ".mp4":
-                temp_remux_mkv = output_sub_path.with_name(f"_tmp_sub_remux_{uuid.uuid4().hex[:5]}.mkv")
                 mkvmerge_bin = cls._get_mkvmerge_bin()
+                if not Path(mkvmerge_bin).is_file() and not shutil.which(mkvmerge_bin):
+                    raise FileNotFoundError(f"mkvmerge پیدا نشد: {mkvmerge_bin}")
+
+                temp_remux_mkv = output_sub_path.with_name(
+                    f"_tmp_sub_remux_{uuid.uuid4().hex[:8]}.mkv"
+                )
                 remux_cmd = [
                     mkvmerge_bin,
                     "--output", str(temp_remux_mkv),
                     "--no-video", "--no-audio",
-                    "--subtitle-tracks", str(track_id),
-                    str(video_path)
+                    "--subtitle-tracks", str(selected_track_id),
+                    str(video_path),
                 ]
-                r_proc = await asyncio.create_subprocess_exec(
+                remux_proc = await asyncio.create_subprocess_exec(
                     *remux_cmd,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT
+                    stderr=asyncio.subprocess.STDOUT,
                 )
-                await r_proc.communicate()
-                if temp_remux_mkv.exists():
-                    target_for_mkvextract = temp_remux_mkv
-                    track_id = 0
+                remux_out, _ = await remux_proc.communicate()
+                if remux_proc.returncode != 0 or not temp_remux_mkv.exists() or temp_remux_mkv.stat().st_size <= 0:
+                    raise RuntimeError(
+                        "Remux زیرنویس MP4 ناموفق بود: "
+                        + remux_out.decode("utf-8", errors="replace")[-1200:]
+                    )
+                target_for_extract = temp_remux_mkv
+                selected_track_id = 0
 
+            output_sub_path.unlink(missing_ok=True)
             cmd = [
                 mkvextract_bin,
                 "tracks",
-                str(target_for_mkvextract),
-                f"{track_id}:{output_sub_path}"
+                str(target_for_extract),
+                f"{selected_track_id}:{output_sub_path}",
             ]
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT
+                stderr=asyncio.subprocess.STDOUT,
             )
             stdout, _ = await proc.communicate()
-            if proc.returncode != 0 or not output_sub_path.exists():
-                raise RuntimeError(f"خطا در استخراج زیرنویس: {stdout.decode('utf-8', errors='replace')}")
+            if proc.returncode != 0 or not output_sub_path.exists() or output_sub_path.stat().st_size <= 0:
+                raise RuntimeError(
+                    "خطا در استخراج زیرنویس: "
+                    + stdout.decode("utf-8", errors="replace")[-1600:]
+                )
 
-            if output_sub_path.suffix.lower() == ".srt":
-                SubtitleService.normalize_srt_utf8(output_sub_path)
+            if output_sub_path.suffix.lower() in (".srt", ".ass", ".ssa"):
+                SubtitleService.normalize_subtitle_file(output_sub_path)
             return output_sub_path
         finally:
             if temp_remux_mkv and temp_remux_mkv.exists():

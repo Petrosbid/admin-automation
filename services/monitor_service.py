@@ -723,28 +723,90 @@ class SiteMonitorService:
 
     async def _loop(self, bot: Bot):
         self._running = True
-        logging.info("⏱ حلقه مانیتورینگ ۵ دقیقه‌ای فعال شد.")
-        while self._running:
-            try:
-                if cfg.get("monitor", "enabled", True):
-                    await self.check_all_sites_once(bot, notify_on_first_seed=False)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logging.error(f"Unexpected error in monitor loop: {e}")
+        logging.info("⏱ حلقه مانیتورینگ خودکار فعال شد.")
 
-            interval = max(60, int(cfg.get("monitor", "interval_seconds", 300)))
-            await asyncio.sleep(interval)
+        while self._running:
+            cycle_started = time.monotonic()
+            try:
+                if bool(cfg.get("monitor", "enabled", True)):
+                    counts = await self.check_all_sites_once(
+                        bot,
+                        notify_on_first_seed=False,
+                    )
+                    total_new = sum(int(value or 0) for value in counts.values())
+                    logging.info(
+                        "✅ [MONITOR] چرخه بررسی تمام شد؛ محتوای جدید: %d",
+                        total_new,
+                    )
+                else:
+                    logging.info("⏸ [MONITOR] مانیتورینگ در config.yaml غیرفعال است.")
+            except asyncio.CancelledError:
+                logging.info("Monitor loop cancellation received.")
+                raise
+            except Exception:
+                logging.exception("Unexpected error in automatic monitor cycle; loop will continue.")
+
+            try:
+                interval = int(cfg.get("monitor", "interval_seconds", 300) or 300)
+            except (TypeError, ValueError):
+                interval = 300
+            interval = max(60, min(interval, 24 * 60 * 60))
+
+            # زمان‌بندی بر اساس انتهای چرخه نیست: مدت اجرای بررسی از فاصله هدف کم می‌شود.
+            elapsed = max(0.0, time.monotonic() - cycle_started)
+            sleep_for = max(1.0, interval - elapsed)
+            logging.info(
+                "⏱ [MONITOR] چرخه بعدی حدود %.0f ثانیه دیگر اجرا می‌شود.",
+                sleep_for,
+            )
+            try:
+                await asyncio.sleep(sleep_for)
+            except asyncio.CancelledError:
+                logging.info("Monitor loop stopped during interval wait.")
+                raise
+
+        logging.info("Site monitor loop stopped.")
 
     def start(self, bot: Bot):
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._loop(bot))
-            logging.info("Site Monitor started.")
+        self._running = True
+        if self._task is not None and not self._task.done():
+            logging.info("Site Monitor is already running; duplicate start ignored.")
+            return
+
+        self._task = asyncio.create_task(
+            self._loop(bot),
+            name="site-monitor-loop",
+        )
+
+        def _done(task: asyncio.Task):
+            if task.cancelled():
+                logging.info("Site Monitor background task was cancelled.")
+                return
+            try:
+                error = task.exception()
+            except asyncio.CancelledError:
+                return
+            if error:
+                logging.error(
+                    "Site Monitor background task exited unexpectedly: %s",
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        self._task.add_done_callback(_done)
+        logging.info(
+            "Site Monitor started (enabled=%s, interval=%s seconds).",
+            bool(cfg.get("monitor", "enabled", True)),
+            cfg.get("monitor", "interval_seconds", 300),
+        )
 
     def stop(self):
         self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+        self._task = None
+        logging.info("Site Monitor stop requested.")
 
 
 monitor_service = SiteMonitorService()
