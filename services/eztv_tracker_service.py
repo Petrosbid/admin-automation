@@ -552,6 +552,13 @@ class EZTVTrackerService:
                     if not self._matches_show(release["title"], show):
                         continue
 
+                    matching_qualities = [
+                        quality for quality in show["qualities"]
+                        if self._quality_matches(release["title"], quality)
+                    ]
+                    if not matching_qualities:
+                        continue
+
                     self._record_release_time(
                         state, show, episode, release.get("published_at")
                     )
@@ -562,9 +569,7 @@ class EZTVTrackerService:
                         "release_id": release_id,
                         "release_title": release["title"],
                     })
-                    for quality in show["qualities"]:
-                        if not self._quality_matches(release["title"], quality):
-                            continue
+                    for quality in matching_qualities:
                         destination = await self._resolve_quality_folder(
                             show, season_dir, quality
                         )
