@@ -266,11 +266,18 @@ async def _smart_download_pipeline_job(
                 for item in staged_videos
             ]
             is_ambiguous = len(staged_videos) != 1
+            has_multi_episode_name = any(
+                re.search(
+                    r"(?i)\\bS\\d{1,2}E\\d{1,3}(?:[-+._ &]+E?\\d{1,3}|E\\d{1,3})\\b",
+                    item.name,
+                )
+                for item in staged_videos
+            )
             has_wrong_episode = any(
                 not tag or tag.upper() != expected_episode_tag.upper()
                 for tag in found_tags
             )
-            if is_ambiguous or has_wrong_episode:
+            if is_ambiguous or has_multi_episode_name or has_wrong_episode:
                 quarantine_dir = (
                     dest_dir / "_rejected_downloads" / uuid.uuid4().hex[:10]
                 )
@@ -281,6 +288,8 @@ async def _smart_download_pipeline_job(
                 reason = (
                     "تورنت بیش از یک فایل ویدئویی تحویل داد"
                     if is_ambiguous
+                    else "نام فایل نشان‌دهنده بسته چندقسمتی است"
+                    if has_multi_episode_name
                     else f"نام فایل با قسمت مورد انتظار {expected_episode_tag} مغایرت داشت"
                 )
                 raise RuntimeError(
