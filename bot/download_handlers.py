@@ -286,11 +286,12 @@ async def _smart_download_pipeline_job(
 
     is_series, season_or_movie_dir, series_or_movie_title = _resolve_series_or_movie_context(dest_dir)
 
-    # همگام‌سازی ساختار فصل با سرور؛ خطای FTP نباید پس‌پردازش دانلود را متوقف کند.
-    try:
-        await _check_and_notify_missing_local_folders(bot, chat_id, season_or_movie_dir)
-    except Exception:
-        logging.exception("Could not compare remote and local season folders")
+    # همگام‌سازی ساختار فصل با سرور؛ در دانلود برنامه‌ریزی‌شده پیام جداگانه صادر نمی‌کنیم.
+    if not automated_background:
+        try:
+            await _check_and_notify_missing_local_folders(bot, chat_id, season_or_movie_dir)
+        except Exception:
+            logging.exception("Could not compare remote and local season folders")
 
     remote_folder_path = AutomationService.compute_server_remote_dir_for_local_path(dest_dir)
     try:
@@ -326,7 +327,8 @@ async def _smart_download_pipeline_job(
                     vid = final_path
 
                 await _schedule_fullhd_destination_automation(
-                    bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag
+                    bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag,
+                    automated_background=automated_background,
                 )
                 if remote_folder_exists:
                     if auto_upload_cfg:
@@ -671,6 +673,7 @@ async def _schedule_fullhd_destination_automation(
     season_or_movie_dir: Path,
     is_series: bool,
     ep_tag: str,
+    automated_background: bool = False,
 ):
     """
     کیفیت‌های تعریف‌شده در مقصد را می‌خواند و فقط همان رزولوشن‌ها را از FullHD انکود می‌کند.
@@ -684,6 +687,9 @@ async def _schedule_fullhd_destination_automation(
     try:
         remote_info = await CuteFTPService.inspect_remote_dir(remote_root)
     except Exception as exc:
+        if automated_background:
+            logging.warning("FullHD quality inspection failed for %s: %s", remote_root, exc)
+            return
         await bot.send_message(
             chat_id,
             f"⚠️ بررسی پوشه‌های کیفیت مقصد ناموفق بود؛ انکود خودکار انجام نشد.\n"
@@ -694,6 +700,9 @@ async def _schedule_fullhd_destination_automation(
         return
 
     if not remote_info.get("exists"):
+        if automated_background:
+            logging.info("FullHD destination is not present remotely: %s", remote_root)
+            return
         await bot.send_message(
             chat_id,
             f"⚠️ پوشه مقصد قابل بررسی نیست یا دسترسی FTP تنظیم نشده است؛ "
@@ -723,6 +732,9 @@ async def _schedule_fullhd_destination_automation(
             bucket["base"] = name
 
     if not quality_map:
+        if automated_background:
+            logging.info("No remote EBTV quality folders found for FullHD source %s", vid_path)
+            return
         await bot.send_message(
             chat_id,
             f"ℹ️ در مسیر <code>{html.escape(remote_root)}</code> هیچ پوشه‌ای با پسوند "
@@ -733,6 +745,9 @@ async def _schedule_fullhd_destination_automation(
         return
 
     if not AutomationService.get_movie_ass_logo_path().exists():
+        if automated_background:
+            logging.warning("movie.ass is missing; skipping FullHD encode for %s", vid_path)
+            return
         await bot.send_message(
             chat_id,
             "❌ فایل <code>movie.ass</code> برای انکود/واترمارک در مسیر presets یا کنار برنامه پیدا نشد؛ "
@@ -822,11 +837,23 @@ async def _schedule_fullhd_destination_automation(
         tasks.append(task)
 
     if not tasks:
+        if automated_background:
+            logging.warning("No FullHD encode tasks could be scheduled for %s: %s", vid_path, notes)
+            return
         return await bot.send_message(
             chat_id,
             "⚠️ کیفیت مناسب برای انکود در صف قرار نگرفت.",
             parse_mode="HTML",
         )
+
+    if automated_background:
+        logging.info(
+            "Scheduled %d FullHD encode tasks for %s: %s",
+            len(tasks),
+            vid_path.name,
+            [task.task_id for task in tasks],
+        )
+        return
 
     status_title = (
         season_or_movie_dir.parent.name
