@@ -301,77 +301,134 @@ class DownloaderService:
             auth_args.extend(["--password", qbt_cfg["password"]])
 
         dest_resolved = str(dest_dir.resolve())
+        dest_key = os.path.normcase(os.path.normpath(dest_resolved)).casefold()
+
+        list_cmd = [qbt_bin, "torrent", "list", "--format", "json"] + auth_args
+        before_proc = await asyncio.create_subprocess_exec(
+            *list_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        before_out, _ = await before_proc.communicate()
+        try:
+            before_items = json.loads(before_out.decode("utf-8", errors="replace"))
+        except Exception:
+            before_items = []
+        before_hashes = {
+            str(item.get("hash", "")).casefold()
+            for item in (before_items if isinstance(before_items, list) else [])
+            if item.get("hash")
+        }
+
         try:
             is_local_file = Path(target).is_file()
         except OSError:
             is_local_file = False
 
         if is_local_file:
-            add_cmd = [qbt_bin, "torrent", "add", "file", str(Path(target).resolve()), "--folder", dest_resolved] + auth_args
+            add_cmd = [
+                qbt_bin, "torrent", "add", "file",
+                str(Path(target).resolve()), "--folder", dest_resolved,
+            ] + auth_args
         else:
-            add_cmd = [qbt_bin, "torrent", "add", "url", target, "--folder", dest_resolved] + auth_args
+            add_cmd = [
+                qbt_bin, "torrent", "add", "url",
+                target, "--folder", dest_resolved,
+            ] + auth_args
 
         proc = await asyncio.create_subprocess_exec(
             *add_cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT
+            stderr=asyncio.subprocess.STDOUT,
         )
         stdout, _ = await proc.communicate()
         if proc.returncode != 0:
             raise RuntimeError(f"qbt error: {stdout.decode('utf-8', errors='replace')}")
 
-        completed_states = {"uploading", "stalledup", "pausedup", "queuedup", "checkingup", "forcedup"}
-        matched_hash = None
+        # Torrent has been accepted; never switch to aria2 or another torrent because
+        # that would duplicate the just-submitted download.
         start_ts = time.time()
+        matched_hash: str | None = None
+        target_torrent: dict | None = None
+        try:
+            while True:
+                await asyncio.sleep(3)
+                l_proc = await asyncio.create_subprocess_exec(
+                    *list_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                l_out, _ = await l_proc.communicate()
+                try:
+                    torrents = json.loads(l_out.decode("utf-8", errors="replace"))
+                except Exception:
+                    torrents = []
+                if not isinstance(torrents, list):
+                    continue
 
-        while True:
-            await asyncio.sleep(3)
-            list_cmd = [qbt_bin, "torrent", "list", "--format", "json"] + auth_args
-            l_proc = await asyncio.create_subprocess_exec(
-                *list_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            l_out, _ = await l_proc.communicate()
-            try:
-                torrents = json.loads(l_out.decode("utf-8", errors="replace"))
-            except Exception:
-                continue
-
-            if not isinstance(torrents, list):
-                continue
-
-            target_torrent = None
-            for t in torrents:
-                save_p = str(t.get("save_path", "")).rstrip("\\/")
-                if matched_hash and t.get("hash") == matched_hash:
-                    target_torrent = t
-                    break
-                elif save_p.lower() == dest_resolved.rstrip("\\/").lower():
-                    target_torrent = t
-                    matched_hash = t.get("hash")
-                    break
-
-            if not target_torrent and torrents and (time.time() - start_ts < 30):
-                newest = max(torrents, key=lambda x: x.get("added_on", 0))
-                target_torrent = newest
-                matched_hash = newest.get("hash")
-
-            if not target_torrent:
-                continue
-
-            prog = float(target_torrent.get("progress", 0.0)) * 100.0
-            state = str(target_torrent.get("state", "")).lower()
-            dlspeed_mb = float(target_torrent.get("dlspeed", 0)) / (1024 * 1024)
-            if progress_callback:
-                progress_callback(f"{prog:.1f}% | {dlspeed_mb:.2f} MB/s")
-
-            if prog >= 100.0 or state in completed_states:
                 if matched_hash:
+                    target_torrent = next(
+                        (
+                            item for item in torrents
+                            if str(item.get("hash", "")).casefold() == matched_hash.casefold()
+                        ),
+                        None,
+                    )
+                else:
+                    candidates = []
+                    for item in torrents:
+                        save_p = str(item.get("save_path", "") or "")
+                        save_key = os.path.normcase(os.path.normpath(save_p)).casefold()
+                        torrent_hash = str(item.get("hash", "")).casefold()
+                        if save_key == dest_key and torrent_hash and torrent_hash not in before_hashes:
+                            candidates.append(item)
+                    if len(candidates) == 1:
+                        target_torrent = candidates[0]
+                        matched_hash = str(target_torrent.get("hash"))
+                    elif len(candidates) > 1:
+                        target_names = {Path(target).name.casefold(), Path(target).stem.casefold()}
+                        named = [
+                            item for item in candidates
+                            if str(item.get("name", "")).casefold() in target_names
+                            or Path(str(item.get("name", ""))).stem.casefold() in target_names
+                        ]
+                        if len(named) == 1:
+                            target_torrent = named[0]
+                            matched_hash = str(target_torrent.get("hash"))
+
+                if not matched_hash:
+                    if time.time() - start_ts > 90:
+                        raise _TorrentAlreadySubmittedError(
+                            "qbt.exe تورنت را ثبت کرد اما شناسه یکتای آن در مسیر اختصاصی این دانلود پیدا نشد؛ "
+                            "برای جلوگیری از دانلود تکراری fallback انجام نشد."
+                        )
+                    continue
+
+                if target_torrent is None:
+                    # Torrent disappeared from the client; caller will validate the staged files.
+                    break
+
+                progress = float(target_torrent.get("progress", 0.0)) * 100.0
+                speed_mb = float(target_torrent.get("dlspeed", 0)) / (1024 * 1024)
+                if progress_callback:
+                    progress_callback(f"{progress:.1f}% | {speed_mb:.2f} MB/s")
+
+                if progress >= 100.0:
                     del_cmd = [qbt_bin, "torrent", "delete", matched_hash] + auth_args
-                    d_proc = await asyncio.create_subprocess_exec(*del_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                    d_proc = await asyncio.create_subprocess_exec(
+                        *del_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
                     await d_proc.communicate()
-                break
+                    break
+
+        except _TorrentAlreadySubmittedError:
+            raise
+        except Exception as exc:
+            raise _TorrentAlreadySubmittedError(
+                f"qbt.exe تورنت را ثبت کرده اما هنگام ردیابی همان دانلود خطا رخ داد: {exc}"
+            ) from exc
 
         return dest_dir
 
