@@ -454,6 +454,7 @@ class EZTVTrackerService:
         chat_id: int,
         release_link: str,
         destination: Path,
+        expected_episode_tag: str,
         progress_callback=None,
     ):
         # Import lazily to avoid creating a router/service import cycle.
@@ -465,6 +466,7 @@ class EZTVTrackerService:
             destination,
             progress_callback=progress_callback,
             automated_background=True,
+            expected_episode_tag=expected_episode_tag,
         )
 
     async def _queue_release(
@@ -503,6 +505,7 @@ class EZTVTrackerService:
             chat_id,
             release["link"],
             destination,
+            self._episode_tag(show["season"], episode),
             notify_completion=False,
         )
         scheduled[key] = {
