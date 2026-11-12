@@ -579,7 +579,7 @@ class EZTVTrackerService:
             state["last_feed_check"] = current_time.isoformat()
             self._save_state(state)
 
-            if send_summary and (queued or releases and not state.get("last_error_notice")):
+            if send_summary and (queued or (already_local and added_ids)):
                 lines = ["📡 <b>بررسی خودکار EZTV</b>"]
                 if queued:
                     lines.append(f"✅ {len(queued)} دانلود جدید به صف اضافه شد:")
