@@ -475,6 +475,8 @@ class QueueManager:
                     logging.error(f"Failed to send notification to {admin_id}: {e2}")
 
     async def _send_completion_notification(self, task: QueueTask, res: Any):
+        if getattr(task, "batch_id", None):
+            return
         section_label = html.escape(self.QUEUE_LABELS.get(task.queue_type, task.queue_type.upper()))
         safe_title = html.escape(str(task.title))
         safe_id = html.escape(str(task.task_id))
