@@ -32,7 +32,9 @@ import core.queue_manager as queue_mod
 from core.queue_manager import queue_engine
 
 import services.monitor_service as monitor_mod
+import services.eztv_tracker_service as eztv_mod
 
+import bot.eztv_handlers as eztv_handlers_mod
 import bot.queue_handlers as queue_handlers_mod
 import bot.download_handlers as download_handlers_mod
 import bot.subtitle_handlers as subtitle_handlers_mod
@@ -59,10 +61,12 @@ RELOADABLE_MODULES_ORDER = [
     "services.downloader_service",
     "services.automation_service",
     "services.monitor_service",
+    "services.eztv_tracker_service",
     "bot.keyboards",
     "bot.queue_handlers",
     "bot.download_handlers",
     "bot.subtitle_handlers",
+    "bot.eztv_handlers",
     "bot.handlers",
 ]
 
@@ -94,6 +98,7 @@ def _attach_all_routers(dp: Dispatcher):
         queue_handlers_mod.router,
         download_handlers_mod.router,
         subtitle_handlers_mod.router,
+        eztv_handlers_mod.router,
         main_handlers_mod.router,
     ):
         r._parent_router = None
@@ -102,6 +107,7 @@ def _attach_all_routers(dp: Dispatcher):
     dp.include_router(queue_handlers_mod.router)
     dp.include_router(download_handlers_mod.router)
     dp.include_router(subtitle_handlers_mod.router)
+    dp.include_router(eztv_handlers_mod.router)
     dp.include_router(main_handlers_mod.router)
 
 
@@ -113,6 +119,8 @@ async def hot_reload_code(dp: Dispatcher, bot: Bot) -> tuple[bool, str]:
 
         if hasattr(monitor_mod, "monitor_service"):
             monitor_mod.monitor_service.stop()
+        if hasattr(eztv_mod, "eztv_tracker_service"):
+            eztv_mod.eztv_tracker_service.stop()
 
         active_engine = queue_mod.queue_engine
 
@@ -134,6 +142,8 @@ async def hot_reload_code(dp: Dispatcher, bot: Bot) -> tuple[bool, str]:
 
         if hasattr(monitor_mod, "monitor_service"):
             monitor_mod.monitor_service.start(bot)
+        if hasattr(eztv_mod, "eztv_tracker_service"):
+            eztv_mod.eztv_tracker_service.start(bot)
 
         msg = f"✅ [HOT-RELOAD] تعداد {reloaded_count} ماژول و ورکرهای نوتیفیکیشن با موفقیت آپدیت شدند!"
         logging.info(msg)
@@ -200,6 +210,8 @@ async def main():
 
         monitor_mod.monitor_service.start(bot)
         logging.info("Monitor service started.")
+        eztv_mod.eztv_tracker_service.start(bot)
+        logging.info("EZTV RSS tracker started.")
 
         console_task = asyncio.create_task(console_key_listener(dp, bot))
 
@@ -213,6 +225,7 @@ async def main():
         if console_task and not console_task.done():
             console_task.cancel()
         monitor_mod.monitor_service.stop()
+        eztv_mod.eztv_tracker_service.stop()
         await asyncio.sleep(0.2)
         await bot.session.close()
         logging.info("Telegram session closed cleanly.")
