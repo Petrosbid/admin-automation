@@ -268,7 +268,7 @@ async def _smart_download_pipeline_job(
             is_ambiguous = len(staged_videos) != 1
             has_multi_episode_name = any(
                 re.search(
-                    r"(?i)\\bS\\d{1,2}E\\d{1,3}(?:[-+._ &]+E?\\d{1,3}|E\\d{1,3})\\b",
+                    r"(?i)\bS\d{1,2}E\d{1,3}(?:[-+._ &]+E?\d{1,3}|E\d{1,3})\b",
                     item.name,
                 )
                 for item in staged_videos
