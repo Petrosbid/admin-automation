@@ -197,23 +197,11 @@ async def _smart_download_pipeline_job(
     dest_dir: Path,
     progress_callback=None
 ) -> Path:
-    """
-    موتور هوشمند دانلود + اکسترکت خودکار + تغییر نام از روی سرور یا استاندارد + آپلود خودکار:
-    ۱. ابتدا فایل را در پوشه dest_dir دانلود می‌کند.
-    ۲. اگر فایل دانلودشده فشرده (.zip / .rar / .7z) باشد، ابتدا آن را اکسترکت کرده و فایل فشرده را حذف می‌کند.
-    ۳. پوشه‌های فصل/فیلم در سرور مقصد را بررسی می‌کند و اگر پوشه‌ای در سرور هست که در لوکال نیست، خبر می‌دهد.
-    ۴. برای تغییر نام فایل ویدئو:
-       - اولویت اول: بررسی همان پوشه در همان فصل در سرور اصلی و کپی کردن نام قسمت‌های قبلی با تغییر فقط Eyy!
-       - اولویت دوم: اگر در سرور قسمت قبلی نبود، تولید نام استاندارد و پرسیدن از کاربر در ربات قبل از آپلود.
-    ۵. منطق ویژه پوشه FullHD:
-       - اگر پوشه FullHD در سرور وجود نداشته باشد و قسمت اول فصل (E01) نباشد -> آپلود نمی‌شود.
-       - اگر قسمت اول فصل (E01) باشد و در سرور FullHD نباشد -> از کاربر سوال می‌پرسد که آیا FullHD هم آپلود شود یا خیر.
-    """
+    """دانلود ایزوله، اکسترکت و اجرای پس‌پردازش فقط روی خروجی همین تسک."""
     dest_dir = Path(dest_dir).resolve()
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    # هر دانلود باید در مسیر خصوصی خودش انجام شود؛ اسکن before/after روی پوشه مشترک
-    # در دانلودهای همزمان باعث می‌شد هر تسک فایل‌های تسک‌های دیگر را هم پردازش کند.
+    # هر لینک پوشه staging مستقل دارد؛ بنابراین تسک‌ها فایل‌های یکدیگر را نمی‌بینند.
     staging_dir = dest_dir / "_incoming_downloads" / uuid.uuid4().hex[:12]
     staging_dir.mkdir(parents=True, exist_ok=True)
     new_videos: list[Path] = []
@@ -230,22 +218,22 @@ async def _smart_download_pipeline_job(
             for p in staging_dir.rglob("*")
             if p.is_file() and not p.name.endswith(".aria2")
         ]
-
         extracted_files: list[Path] = []
+
         for archive_path in list(staged_files):
-            if not archive_path.exists() or archive_path.suffix.lower() not in SubtitleService.ARCHIVE_EXTENSIONS:
+            if archive_path.suffix.lower() not in SubtitleService.ARCHIVE_EXTENSIONS:
                 continue
             if progress_callback:
                 progress_callback(f"در حال اکسترکت خودکار {archive_path.name}...")
             try:
-                output_items = await asyncio.to_thread(
+                extracted = await asyncio.to_thread(
                     SubtitleService.extract_archive,
                     archive_path,
                     archive_path.parent,
                     True,
                     False,
                 )
-                extracted_files.extend(Path(item).resolve() for item in output_items)
+                extracted_files.extend(Path(item).resolve() for item in extracted)
             except Exception as exc:
                 logging.exception("Archive extraction failed for %s", archive_path.name)
                 raise RuntimeError(f"اکسترکت آرشیو {archive_path.name} ناموفق بود: {exc}") from exc
@@ -255,39 +243,32 @@ async def _smart_download_pipeline_job(
             {
                 p.resolve()
                 for p in staged_candidates
-                if p.exists() and p.is_file()
+                if p.exists()
+                and p.is_file()
                 and p.suffix.lower() in DownloaderService.VIDEO_EXTENSIONS
             },
             key=lambda p: p.as_posix().casefold(),
         )
-
         if not staged_videos:
             raise FileNotFoundError(
-                "این لینک به اتمام رسید اما هیچ فایل ویدئویی جدیدی در پوشه موقت همین دانلود پیدا نشد؛ "
-                "فایل‌های دانلودهای دیگر به‌عنوان نتیجه این تسک استفاده نمی‌شوند."
+                "این تسک هیچ فایل ویدئویی دانلود نکرد؛ خروجی تسک‌های دیگر به‌عنوان نتیجه استفاده نشد."
             )
 
-        # فقط فایل‌های همین staging را به مقصد واقعی منتقل می‌کنیم. فایل‌های قبلی و
-        # خروجی تسک‌های دیگر هرگز وارد فهرست پردازش این تسک نمی‌شوند.
         for source_video in staged_videos:
             target_video = dest_dir / source_video.name
             if target_video.exists():
                 try:
                     if target_video.stat().st_size == source_video.stat().st_size:
-                        logging.info("Skipping duplicate download file already present: %s", target_video)
+                        logging.info("Duplicate download skipped: %s", target_video)
                         continue
                 except OSError:
                     pass
-
-                collision_token = uuid.uuid4().hex[:6]
-                target_video = dest_dir / f"{source_video.stem}__{collision_token}{source_video.suffix}"
+                target_video = dest_dir / (
+                    f"{source_video.stem}__{uuid.uuid4().hex[:6]}{source_video.suffix}"
+                )
 
             shutil.move(str(source_video), str(target_video))
             new_videos.append(target_video.resolve())
-
-        if not new_videos:
-            logging.info("Download produced only files that already existed in %s", dest_dir)
-            return dest_dir
 
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
@@ -297,9 +278,90 @@ async def _smart_download_pipeline_job(
                 staging_parent.rmdir()
         except OSError:
             pass
-انلود روشن است ولی پوشه روی سرور وجود ندارد -> از کاربر بپرس!
+
+    if not new_videos:
+        logging.info("Download contained no new video files in %s", dest_dir)
+        return dest_dir
+
+    is_series, season_or_movie_dir, series_or_movie_title = _resolve_series_or_movie_context(dest_dir)
+
+    # همگام‌سازی ساختار فصل با سرور؛ خطای FTP نباید پس‌پردازش دانلود را متوقف کند.
+    try:
+        await _check_and_notify_missing_local_folders(bot, chat_id, season_or_movie_dir)
+    except Exception:
+        logging.exception("Could not compare remote and local season folders")
+
+    remote_folder_path = AutomationService.compute_server_remote_dir_for_local_path(dest_dir)
+    try:
+        remote_folder_info = await CuteFTPService.inspect_remote_dir(remote_folder_path)
+    except Exception as exc:
+        logging.warning("Could not inspect remote download folder %s: %s", remote_folder_path, exc)
+        remote_folder_info = {"files": [], "exists": False}
+
+    server_files_in_folder = remote_folder_info.get("files", [])
+    remote_folder_exists = bool(remote_folder_info.get("exists", False))
+    auto_upload_cfg = bool(cfg.get("cuteftp", "auto_upload_after_download", True))
+
+    for vid in new_videos:
+        ep_tag = AutomationService.extract_episode_tag(
+            vid.name,
+            fallback_season=AutomationService.extract_season_num_from_dir(season_or_movie_dir),
+        ) or ""
+
+        # FullHD فقط سورس انکود است؛ کیفیت‌های خروجی از پوشه فصل تشخیص داده می‌شوند.
+        if dest_dir.name.casefold() == "fullhd":
+            copied_fullhd_name = None
+            if is_series and ep_tag and server_files_in_folder:
+                copied_fullhd_name = AutomationService.match_filename_from_server_siblings(
+                    server_files_in_folder, ep_tag
+                )
+
+            if copied_fullhd_name:
+                final_path = vid.with_name(copied_fullhd_name)
+                if vid.resolve() != final_path.resolve():
+                    if final_path.exists():
+                        final_path.unlink(missing_ok=True)
+                    vid.rename(final_path)
+                    vid = final_path
+
+                await _schedule_fullhd_destination_automation(
+                    bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag
+                )
+                if remote_folder_exists:
+                    if auto_upload_cfg:
+                        await queue_engine.add_task(
+                            "upload",
+                            f"AutoUpload [{remote_folder_path}]: {vid.name}",
+                            CuteFTPService.upload_path,
+                            vid,
+                            remote_folder_path,
+                        )
+                else:
+                    await _send_missing_remote_folder_upload_prompt(
+                        bot, chat_id, vid, remote_folder_path
+                    )
+            else:
+                suggested_std_name = await AutomationService.build_standard_raw_filename_for_folder(
+                    video_path=vid,
+                    folder_name=dest_dir.name,
+                    series_or_movie_title=series_or_movie_title,
+                    season_ep_tag=ep_tag,
+                    is_series=is_series,
+                )
+                await _send_standard_name_confirmation_prompt(
+                    bot=bot,
+                    chat_id=chat_id,
+                    vid_path=vid,
+                    suggested_name=suggested_std_name,
+                    remote_folder_path=remote_folder_path,
+                    should_auto_upload=(auto_upload_cfg and remote_folder_exists),
+                    ask_fullhd_e01_question=(not remote_folder_exists),
+                    fullhd_auto_encode=True,
+                )
+            continue
+
         ask_missing_folder_question = not remote_folder_exists
-        should_auto_upload = (auto_upload_cfg and remote_folder_exists)
+        should_auto_upload = auto_upload_cfg and remote_folder_exists
 
         copied_server_name = None
         if is_series and ep_tag and server_files_in_folder:
@@ -316,14 +378,16 @@ async def _smart_download_pipeline_job(
                 vid = final_path
 
             if ask_missing_folder_question:
-                await _send_missing_remote_folder_upload_prompt(bot, chat_id, vid, remote_folder_path)
+                await _send_missing_remote_folder_upload_prompt(
+                    bot, chat_id, vid, remote_folder_path
+                )
             elif should_auto_upload:
                 await queue_engine.add_task(
                     "upload",
                     f"AutoUpload [{remote_folder_path}]: {vid.name}",
                     CuteFTPService.upload_path,
                     vid,
-                    remote_folder_path
+                    remote_folder_path,
                 )
 
             await _check_and_prompt_auto_softsub_for_new_quality(
@@ -332,7 +396,7 @@ async def _smart_download_pipeline_job(
                 vid_path=vid,
                 is_series=is_series,
                 season_or_movie_dir=season_or_movie_dir,
-                ep_tag=ep_tag
+                ep_tag=ep_tag,
             )
         else:
             suggested_std_name = await AutomationService.build_standard_raw_filename_for_folder(
@@ -340,7 +404,7 @@ async def _smart_download_pipeline_job(
                 folder_name=dest_dir.name,
                 series_or_movie_title=series_or_movie_title,
                 season_ep_tag=ep_tag,
-                is_series=is_series
+                is_series=is_series,
             )
             await _send_standard_name_confirmation_prompt(
                 bot=bot,
@@ -349,7 +413,7 @@ async def _smart_download_pipeline_job(
                 suggested_name=suggested_std_name,
                 remote_folder_path=remote_folder_path,
                 should_auto_upload=should_auto_upload,
-                ask_fullhd_e01_question=ask_missing_folder_question
+                ask_fullhd_e01_question=ask_missing_folder_question,
             )
 
     return new_videos[0]
