@@ -713,14 +713,16 @@ class EZTVTrackerService:
                         lines.append(f"\n✅ دانلودهای تکمیل‌شده: {len(success_items)}")
                         for item in success_items[:self.MAX_STATUS_ITEMS]:
                             lines.append(
-                                f"• <code>{html.escape(item['episode'])}</code> — "
+                                f"• {html.escape(item['show'])} "
+                                f"<code>{html.escape(item['episode'])}</code> — "
                                 f"{html.escape(item['quality'])}: دریافت فایل به پایان رسید"
                             )
                     if failed_items:
                         lines.append(f"\n❌ دانلودهای ناموفق: {len(failed_items)}")
                         for item in failed_items[:self.MAX_STATUS_ITEMS]:
                             lines.append(
-                                f"• <code>{html.escape(item['episode'])}</code> — "
+                                f"• {html.escape(item['show'])} "
+                                f"<code>{html.escape(item['episode'])}</code> — "
                                 f"{html.escape(item['quality'])}: {html.escape(item['detail'])}"
                             )
                 if not queued and not completed_updates and not already_local:
