@@ -954,41 +954,77 @@ async def cb_sauto_auto_extract_en(call: CallbackQuery, state: FSMContext):
     en_map: dict[str, str] = data.get("sauto_final_en_map", {})
 
     plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
+    if not plans:
+        return await call.answer("❌ هیچ پلن معتبری برای استخراج زیرنویس انگلیسی پیدا نشد.", show_alert=True)
 
-    await call.message.edit_text("⏳ در حال استخراج خودکار زیرنویس انگلیسی و قرار دادن در پوشه `srt`...", parse_mode="Markdown")
+    await call.message.edit_text(
+        "⏳ در حال بررسی ترک‌های انگلیسی و استخراج آن‌ها از فایل‌های هر قسمت...",
+        parse_mode="Markdown",
+    )
 
     extracted_count = 0
+    failures: list[str] = []
     for p in plans:
         key = p.season_ep_tag if (p.is_series and p.season_ep_tag) else "MOVIE"
-        if key in en_map:
+        if key in en_map and Path(en_map[key]).exists():
             continue
-        if p.embedded_en_source_video and p.embedded_en_track_id is not None:
-            fa_sub_p = Path(fa_map[key]) if key in fa_map else None
-            if fa_sub_p:
-                en_filename = re.sub(r"\.FA(\.[^.]+)$", r".EN\1", fa_sub_p.name, flags=re.IGNORECASE)
-                if en_filename == fa_sub_p.name:
-                    en_filename = f"{fa_sub_p.stem}.EN.srt"
-            else:
-                en_filename = AutomationService.build_standard_subtitle_filename(
-                    p.series_title, p.season_ep_tag, p.source_type, "EN", ".srt"
-                )
 
-            out_en_path = p.en_sub_dest_dir / en_filename
-            try:
+        if not p.embedded_en_source_video or p.embedded_en_track_id is None:
+            failures.append(f"{key}: ترک انگلیسی قابل استخراج در فایل‌های این قسمت پیدا نشد")
+            continue
+
+        ext = MKVService.subtitle_extension_for_codec(p.embedded_en_codec)
+        if ext not in (".srt", ".ass", ".ssa"):
+            failures.append(f"{key}: فرمت ترک ({p.embedded_en_codec}) متنی نیست و نیاز به OCR دارد")
+            continue
+
+        fa_sub_p = Path(fa_map[key]) if key in fa_map and Path(fa_map[key]).exists() else None
+        if fa_sub_p:
+            stem = re.sub(r"\.FA$", "", fa_sub_p.stem, flags=re.IGNORECASE)
+            en_filename = f"{stem}.EN{ext}"
+        else:
+            en_filename = AutomationService.build_standard_subtitle_filename(
+                p.series_title, p.season_ep_tag, p.source_type, "EN", ext
+            )
+
+        out_en_path = p.en_sub_dest_dir / en_filename
+        try:
+            if out_en_path.exists() and out_en_path.stat().st_size > 0:
+                SubtitleService.normalize_subtitle_file(out_en_path)
+            else:
                 await MKVService.extract_subtitle_track(
-                    p.embedded_en_source_video, p.embedded_en_track_id, out_en_path
+                    p.embedded_en_source_video,
+                    p.embedded_en_track_id,
+                    out_en_path,
                 )
-                if out_en_path.suffix.lower() == ".srt":
-                    SubtitleService.normalize_srt_utf8(out_en_path)
-                en_map[key] = str(out_en_path.resolve())
-                extracted_count += 1
-            except Exception as e:
-                logging.warning(f"Auto EN extract failed for {key}: {e}")
+            if not out_en_path.exists() or out_en_path.stat().st_size <= 0:
+                raise RuntimeError("فایل خروجی ایجاد نشد یا خالی است")
+            en_map[key] = str(out_en_path.resolve())
+            extracted_count += 1
+            logging.info(
+                "English subtitle extracted: episode=%s source=%s track=%s codec=%s output=%s",
+                key,
+                p.embedded_en_source_video,
+                p.embedded_en_track_id,
+                p.embedded_en_codec,
+                out_en_path,
+            )
+        except Exception as exc:
+            logging.exception("Auto EN extraction failed for %s", key)
+            failures.append(f"{key}: {str(exc)[:180]}")
 
     await state.update_data(sauto_final_en_map=en_map)
+    note_lines = [f"✅ تعداد {extracted_count} زیرنویس انگلیسی استخراج شد."]
+    if failures:
+        note_lines.append("❌ موارد ناموفق:")
+        note_lines.extend(f"• {item}" for item in failures[:10])
+    en_note = "\n".join(note_lines)
+
     await _prompt_final_automation_choices_step(
-        call, state, plans,
-        en_note=f"✅ تعداد `{extracted_count}` زیرنویس انگلیسی به طور خودکار استخراج و در پوشه قرار گرفت."
+        call,
+        state,
+        plans,
+        en_note=en_note,
     )
 
 
