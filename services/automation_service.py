@@ -1102,11 +1102,32 @@ class AutomationService:
                 seen_v.add(str(candidate_vid))
                 try:
                     tracks = await MKVService.list_subtitle_tracks(candidate_vid)
-                    eng_tracks = [
+                    text_tracks = [
                         t for t in tracks
-                        if MKVService._is_english_track(t)
-                        and any(k in t["codec"].lower() for k in ("subrip", "srt", "ass", "ssa", "utf8", "text"))
+                        if any(
+                            k in str(t.get("codec", "")).lower()
+                            for k in ("subrip", "srt", "ass", "ssa", "utf8", "text")
+                        )
                     ]
+                    eng_tracks = [
+                        t for t in text_tracks
+                        if MKVService._is_english_track(t)
+                    ]
+
+                    # اگر زبان ترک und است، فقط وقتی دقیقاً یک ترک متنیِ نامشخص وجود دارد
+                    # و هیچ ترک انگلیسی/فارسی صریحی پیدا نشده، آن را به‌عنوان نامزد احتمالی می‌پذیریم.
+                    if not eng_tracks and len(text_tracks) == 1:
+                        only_track = text_tracks[0]
+                        lang = str(only_track.get("language", "und")).lower()
+                        lang_ietf = str(only_track.get("language_ietf", "")).lower()
+                        track_name = str(only_track.get("track_name", "")).lower()
+                        if (
+                            lang in ("", "und", "unknown")
+                            and lang_ietf in ("", "und", "unknown")
+                            and not any(x in track_name for x in ("persian", "farsi", "فارسی", "per", "fa"))
+                        ):
+                            eng_tracks = [only_track]
+
                     if eng_tracks:
                         plan.embedded_en_source_video = candidate_vid
                         plan.embedded_en_track_id = eng_tracks[0]["id"]
