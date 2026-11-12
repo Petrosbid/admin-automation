@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 
@@ -9,6 +10,21 @@ from core.config_loader import cfg
 from services.eztv_tracker_service import eztv_tracker_service
 
 router = Router()
+
+
+def _split_html_lines(text: str, limit: int = 3800) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines():
+        candidate = current + ("\\n" if current else "") + line
+        if len(candidate) > limit and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or ["گزارشی برای نمایش وجود ندارد."]
 
 
 def _is_admin(message: Message) -> bool:
@@ -83,11 +99,10 @@ async def cmd_eztv_report(message: Message):
     wait = await message.answer("📊 در حال تهیه گزارش روزانه...")
     try:
         report = await eztv_tracker_service.build_daily_report()
-        chunks = [report[i:i + 3800] for i in range(0, len(report), 3800)]
-        if not chunks:
-            chunks = ["گزارشی برای نمایش وجود ندارد."]
+        chunks = _split_html_lines(report)
         await wait.edit_text(chunks[0], parse_mode="HTML")
         for chunk in chunks[1:]:
+            await asyncio.sleep(1.1)
             await message.answer(chunk, parse_mode="HTML")
     except Exception as exc:
         logging.exception("Manual EZTV report failed")
