@@ -87,6 +87,47 @@ class EZTVTrackerService:
         )
         temp.replace(self.managed_shows_file)
 
+    def migrate_show_state(
+        self,
+        old_show: dict[str, Any],
+        new_show: dict[str, Any],
+    ) -> None:
+        """Keep recorded episodes and scheduled-task metadata when a show's identity changes."""
+        state = self._load_state()
+        old_state_key = self._show_state_key(old_show)
+        new_state_key = self._show_state_key(new_show)
+        progress = state.setdefault("progress", {})
+        if old_state_key != new_state_key and old_state_key in progress:
+            old_progress = progress.pop(old_state_key)
+            progress[new_state_key] = old_progress
+
+        for section in ("release_history", "rss_matches"):
+            values = state.setdefault(section, {})
+            for key in list(values):
+                if str(key).startswith(old_state_key + "|"):
+                    suffix = str(key)[len(old_state_key):]
+                    values[new_state_key + suffix] = values.pop(key)
+
+        old_task_prefix = (
+            f"{old_show.get('category', 'Series')}|{self._slug(old_show.get('title', ''))}|"
+            f"S{int(old_show.get('season', 1)):02d}E"
+        )
+        new_task_prefix = (
+            f"{new_show.get('category', 'Series')}|{self._slug(new_show.get('title', ''))}|"
+            f"S{int(new_show.get('season', 1)):02d}E"
+        )
+        scheduled = state.setdefault("scheduled_tasks", {})
+        if old_task_prefix != new_task_prefix:
+            for key in list(scheduled):
+                if str(key).startswith(old_task_prefix):
+                    suffix = str(key)[len(old_task_prefix):]
+                    scheduled[new_task_prefix + suffix] = scheduled.pop(key)
+
+        progress_item = progress.setdefault(new_state_key, {})
+        progress_item["next_episode"] = int(new_show.get("next_episode", 1))
+        progress_item["config_next_episode"] = int(new_show.get("next_episode", 1))
+        self._save_state(state)
+
     @classmethod
     def weekday_label(cls, value: str | None) -> str:
         key = str(value or "").strip().title()
