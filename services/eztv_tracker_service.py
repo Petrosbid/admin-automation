@@ -161,8 +161,6 @@ class EZTVTrackerService:
         if len(matches) != 1:
             return None
         return int(matches[0].group("s")), int(matches[0].group("e"))
-        # No bare Eyy fallback: without a season marker we cannot safely exclude a wrong season.
-        return None
 
     @staticmethod
     def _parse_datetime(raw: str) -> datetime | None:
@@ -307,7 +305,7 @@ class EZTVTrackerService:
     def _quality_matches(release_title: str, quality: str) -> bool:
         title = str(release_title or "").casefold()
         if quality == "fullhd_h264":
-            has_fullhd = bool(re.search(r"(?<!\d)(?:1080p|full[ ._-]?hd)(?![a-z0-9])", title))
+            has_fullhd = bool(re.search(r"(?<!\d)(?:1080p|full[ ._-]?hd|fhd)(?![a-z0-9])", title))
             has_h264 = bool(re.search(r"(?:h[ ._-]?264|x264|avc)", title))
             return has_fullhd and has_h264
         if quality == "480p":
@@ -321,9 +319,25 @@ class EZTVTrackerService:
         progress = state.setdefault("progress", {})
         item = progress.setdefault(key, {})
         try:
-            current = int(item.get("next_episode", show["next_episode"]))
+            configured_episode = int(show["next_episode"])
         except (TypeError, ValueError):
-            current = int(show["next_episode"])
+            configured_episode = 1
+
+        # اگر ادمین next_episode را در config تغییر دهد، مقدار ذخیره‌شدهٔ قبلی
+        # را با مقدار جدید پیکربندی همگام کن؛ پیشرفت خودکار بعدی حفظ می‌شود.
+        try:
+            config_anchor = int(item.get("config_next_episode", configured_episode))
+        except (TypeError, ValueError):
+            config_anchor = configured_episode
+        if config_anchor != configured_episode:
+            item["next_episode"] = configured_episode
+            item["config_next_episode"] = configured_episode
+
+        try:
+            current = int(item.get("next_episode", configured_episode))
+        except (TypeError, ValueError):
+            current = configured_episode
+        item.setdefault("config_next_episode", configured_episode)
         return max(1, current)
 
     def _show_folder(self, show: dict[str, Any], episode: int) -> Path:
