@@ -31,6 +31,15 @@ class EZTVTrackerService:
     MAX_SEEN_IDS = 2500
     MAX_HISTORY_PER_EPISODE = 20
     MAX_STATUS_ITEMS = 20
+    WEEKDAY_LABELS = {
+        "Monday": "دوشنبه",
+        "Tuesday": "سه‌شنبه",
+        "Wednesday": "چهارشنبه",
+        "Thursday": "پنج‌شنبه",
+        "Friday": "جمعه",
+        "Saturday": "شنبه",
+        "Sunday": "یکشنبه",
+    }
 
     def __init__(self):
         self._task: asyncio.Task | None = None
@@ -49,6 +58,67 @@ class EZTVTrackerService:
         path = self._workspace() / "_state" / "eztv_tracker_state.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
+
+    @property
+    def managed_shows_file(self) -> Path:
+        """Managed show list is stored separately so Telegram edits never rewrite config.yaml."""
+        path = self._workspace() / "_state" / "eztv_tracker_shows.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_show_entries(self) -> list[dict[str, Any]]:
+        if self.managed_shows_file.exists():
+            try:
+                payload = json.loads(self.managed_shows_file.read_text(encoding="utf-8"))
+                if isinstance(payload, list):
+                    return [dict(item) for item in payload if isinstance(item, dict)]
+            except Exception:
+                logging.exception("Could not read managed EZTV show list")
+        raw = self.get_config().get("shows", [])
+        return [dict(item) for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+    def save_show_entries(self, entries: list[dict[str, Any]]) -> None:
+        if not isinstance(entries, list):
+            raise TypeError("فهرست سریال‌ها باید یک لیست باشد.")
+        temp = self.managed_shows_file.with_suffix(".tmp")
+        temp.write_text(
+            json.dumps(entries, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp.replace(self.managed_shows_file)
+
+    @classmethod
+    def weekday_label(cls, value: str | None) -> str:
+        key = str(value or "").strip().title()
+        return cls.WEEKDAY_LABELS.get(key, "نامشخص")
+
+    def observed_release_weekdays(
+        self,
+        show: dict[str, Any],
+        state: dict[str, Any] | None = None,
+    ) -> list[str]:
+        state = state or self._load_state()
+        identity_prefix = (
+            f"{show['category']}|{self._slug(show['title'])}|S"
+        )
+        counts: dict[str, int] = {}
+        for key, timestamps in state.get("release_history", {}).items():
+            if not str(key).startswith(identity_prefix) or not isinstance(timestamps, list):
+                continue
+            for raw in timestamps:
+                parsed = self._parse_datetime(str(raw))
+                if not parsed:
+                    continue
+                day = parsed.astimezone(self._timezone()).strftime("%A")
+                counts[day] = counts.get(day, 0) + 1
+        if not counts:
+            return []
+        maximum = max(counts.values())
+        ordered_days = [
+            day for day in self.WEEKDAY_LABELS
+            if counts.get(day) == maximum
+        ]
+        return ordered_days
 
     def _timezone(self) -> ZoneInfo:
         tz_name = str(cfg.get("eztv_tracker", "timezone", "Asia/Tehran") or "Asia/Tehran")
@@ -98,7 +168,7 @@ class EZTVTrackerService:
         return raw if isinstance(raw, dict) else {}
 
     def get_shows(self) -> list[dict[str, Any]]:
-        raw_shows = self.get_config().get("shows", [])
+        raw_shows = self.get_show_entries()
         if not isinstance(raw_shows, list):
             return []
         result: list[dict[str, Any]] = []
@@ -132,6 +202,9 @@ class EZTVTrackerService:
                 "qualities": list(dict.fromkeys(qualities)),
                 "aliases": [str(x).strip() for x in raw.get("aliases", []) if str(x).strip()]
                     if isinstance(raw.get("aliases", []), list) else [],
+                "release_day": str(raw.get("release_day", "") or "").strip().title(),
+                "quality_folders": dict(raw.get("quality_folders", {}))
+                    if isinstance(raw.get("quality_folders", {}), dict) else {},
             })
         return result
 
@@ -147,7 +220,6 @@ class EZTVTrackerService:
     def _episode_tag(season: int, episode: int) -> str:
         return f"S{int(season):02d}E{int(episode):02d}"
 
-    @staticmethod
     @staticmethod
     def _release_episode(title: str) -> tuple[int, int] | None:
         raw_title = title or ""
@@ -885,6 +957,15 @@ class EZTVTrackerService:
                 f"<code>{tag}</code>"
             )
             lines.append(f"وضعیت: {headline}")
+
+            configured_day = self.weekday_label(show.get("release_day"))
+            observed_days = self.observed_release_weekdays(show, state)
+            lines.append(f"📅 روز انتشار تنظیم‌شده: <b>{configured_day}</b>")
+            if observed_days:
+                observed_labels = "، ".join(self.weekday_label(day) for day in observed_days)
+                lines.append(f"📚 روز(های) ثبت‌شده از RSS: <b>{observed_labels}</b>")
+            else:
+                lines.append("📚 روز انتشار ثبت‌شده: هنوز داده کافی وجود ندارد.")
 
             quality_status = [
                 (
