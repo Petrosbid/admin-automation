@@ -31,6 +31,15 @@ class EZTVTrackerService:
     MAX_SEEN_IDS = 2500
     MAX_HISTORY_PER_EPISODE = 20
     MAX_STATUS_ITEMS = 20
+    WEEKDAY_LABELS = {
+        "Monday": "دوشنبه",
+        "Tuesday": "سه‌شنبه",
+        "Wednesday": "چهارشنبه",
+        "Thursday": "پنج‌شنبه",
+        "Friday": "جمعه",
+        "Saturday": "شنبه",
+        "Sunday": "یکشنبه",
+    }
 
     def __init__(self):
         self._task: asyncio.Task | None = None
@@ -39,7 +48,6 @@ class EZTVTrackerService:
         self._last_error_notice = 0.0
         self._last_cycle_message = 0.0
         self._remote_quality_cache: dict[str, tuple[float, set[str]]] = {}
-        self._remote_listing_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     @staticmethod
     def _workspace() -> Path:
@@ -50,6 +58,139 @@ class EZTVTrackerService:
         path = self._workspace() / "_state" / "eztv_tracker_state.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
+
+    @property
+    def managed_shows_file(self) -> Path:
+        """Managed show list is stored separately so Telegram edits never rewrite config.yaml."""
+        path = self._workspace() / "_state" / "eztv_tracker_shows.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_show_entries(self) -> list[dict[str, Any]]:
+        if self.managed_shows_file.exists():
+            try:
+                payload = json.loads(self.managed_shows_file.read_text(encoding="utf-8"))
+                if isinstance(payload, list):
+                    return [dict(item) for item in payload if isinstance(item, dict)]
+            except Exception:
+                logging.exception("Could not read managed EZTV show list")
+        raw = self.get_config().get("shows", [])
+        return [dict(item) for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+    def save_show_entries(self, entries: list[dict[str, Any]]) -> None:
+        if not isinstance(entries, list):
+            raise TypeError("فهرست سریال‌ها باید یک لیست باشد.")
+        temp = self.managed_shows_file.with_suffix(".tmp")
+        temp.write_text(
+            json.dumps(entries, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp.replace(self.managed_shows_file)
+
+    def migrate_show_state(
+        self,
+        old_show: dict[str, Any],
+        new_show: dict[str, Any],
+    ) -> None:
+        """Keep release history when a title is renamed without resetting automatic progress."""
+        state = self._load_state()
+        old_normalized = dict(old_show)
+        old_normalized["category"] = str(old_normalized.get("category", "Series")).title()
+        old_normalized["title"] = str(old_normalized.get("title", "")).strip()
+        new_normalized = dict(new_show)
+        new_normalized["category"] = str(new_normalized.get("category", "Series")).title()
+        new_normalized["title"] = str(new_normalized.get("title", "")).strip()
+
+        old_state_key = self._show_state_key(old_normalized)
+        new_state_key = self._show_state_key(new_normalized)
+        old_season = int(old_normalized.get("season", 1))
+        new_season = int(new_normalized.get("season", 1))
+        old_category = old_normalized["category"]
+        new_category = new_normalized["category"]
+        old_episode_setting = int(old_normalized.get("next_episode", 1))
+        new_episode_setting = int(new_normalized.get("next_episode", 1))
+
+        progress = state.setdefault("progress", {})
+        if old_state_key != new_state_key and old_state_key in progress:
+            old_progress = progress.pop(old_state_key)
+            progress[new_state_key] = old_progress
+
+        # Renaming a show can safely migrate history within the same season.
+        # Changing season/category starts a different tracking scope, so do not
+        # re-label old season release dates or queued episode tasks as new ones.
+        same_tracking_scope = old_season == new_season and old_category == new_category
+        if old_state_key != new_state_key and same_tracking_scope:
+            for section in ("release_history", "rss_matches"):
+                values = state.setdefault(section, {})
+                for key in list(values):
+                    if str(key).startswith(old_state_key + "|"):
+                        suffix = str(key)[len(old_state_key):]
+                        values[new_state_key + suffix] = values.pop(key)
+
+            old_task_prefix = (
+                f"{old_category}|{self._slug(old_normalized['title'])}|S{old_season:02d}E"
+            )
+            new_task_prefix = (
+                f"{new_category}|{self._slug(new_normalized['title'])}|S{new_season:02d}E"
+            )
+            scheduled = state.setdefault("scheduled_tasks", {})
+            for key in list(scheduled):
+                if str(key).startswith(old_task_prefix):
+                    suffix = str(key)[len(old_task_prefix):]
+                    migrated = scheduled.pop(key)
+                    if isinstance(migrated, dict):
+                        migrated["show_title"] = new_normalized["title"]
+                    new_key = new_task_prefix + suffix
+                    scheduled[new_key] = migrated
+
+        progress_item = progress.setdefault(new_state_key, {})
+        episode_setting_changed = (
+            old_episode_setting != new_episode_setting
+            or old_season != new_season
+            or old_category != new_category
+        )
+        if episode_setting_changed or "next_episode" not in progress_item:
+            progress_item["next_episode"] = new_episode_setting
+            progress_item["config_next_episode"] = new_episode_setting
+        else:
+            # Preserve the auto-advanced next_episode when only weekday, aliases,
+            # quality folders or other descriptive metadata were edited.
+            progress_item.setdefault("config_next_episode", new_episode_setting)
+
+        self._save_state(state)
+
+    @classmethod
+    def weekday_label(cls, value: str | None) -> str:
+        key = str(value or "").strip().title()
+        return cls.WEEKDAY_LABELS.get(key, "نامشخص")
+
+    def observed_release_weekdays(
+        self,
+        show: dict[str, Any],
+        state: dict[str, Any] | None = None,
+    ) -> list[str]:
+        state = state or self._load_state()
+        identity_prefix = (
+            f"{show['category']}|{self._slug(show['title'])}|S"
+        )
+        counts: dict[str, int] = {}
+        for key, timestamps in state.get("release_history", {}).items():
+            if not str(key).startswith(identity_prefix) or not isinstance(timestamps, list):
+                continue
+            for raw in timestamps:
+                parsed = self._parse_datetime(str(raw))
+                if not parsed:
+                    continue
+                day = parsed.astimezone(self._timezone()).strftime("%A")
+                counts[day] = counts.get(day, 0) + 1
+        if not counts:
+            return []
+        maximum = max(counts.values())
+        ordered_days = [
+            day for day in self.WEEKDAY_LABELS
+            if counts.get(day) == maximum
+        ]
+        return ordered_days
 
     def _timezone(self) -> ZoneInfo:
         tz_name = str(cfg.get("eztv_tracker", "timezone", "Asia/Tehran") or "Asia/Tehran")
@@ -99,7 +240,7 @@ class EZTVTrackerService:
         return raw if isinstance(raw, dict) else {}
 
     def get_shows(self) -> list[dict[str, Any]]:
-        raw_shows = self.get_config().get("shows", [])
+        raw_shows = self.get_show_entries()
         if not isinstance(raw_shows, list):
             return []
         result: list[dict[str, Any]] = []
@@ -133,6 +274,9 @@ class EZTVTrackerService:
                 "qualities": list(dict.fromkeys(qualities)),
                 "aliases": [str(x).strip() for x in raw.get("aliases", []) if str(x).strip()]
                     if isinstance(raw.get("aliases", []), list) else [],
+                "release_day": str(raw.get("release_day", "") or "").strip().title(),
+                "quality_folders": dict(raw.get("quality_folders", {}))
+                    if isinstance(raw.get("quality_folders", {}), dict) else {},
             })
         return result
 
@@ -148,7 +292,6 @@ class EZTVTrackerService:
     def _episode_tag(season: int, episode: int) -> str:
         return f"S{int(season):02d}E{int(episode):02d}"
 
-    @staticmethod
     @staticmethod
     def _release_episode(title: str) -> tuple[int, int] | None:
         raw_title = title or ""
@@ -472,7 +615,12 @@ class EZTVTrackerService:
     ) -> dict[str, Any]:
         cache_key = str(remote_dir or "").casefold()
         now = time.monotonic()
-        cached = self._remote_listing_cache.get(cache_key)
+        cache = getattr(self, "_remote_listing_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._remote_listing_cache = cache
+
+        cached = cache.get(cache_key)
         if not refresh and cached and now - cached[0] < 20:
             return dict(cached[1])
         try:
@@ -486,7 +634,7 @@ class EZTVTrackerService:
                 "dirs": [],
                 "error": str(exc),
             }
-        self._remote_listing_cache[cache_key] = (now, dict(info))
+        cache[cache_key] = (now, dict(info))
         return dict(info)
 
     async def _episode_folder_presence(
@@ -1186,6 +1334,34 @@ class EZTVTrackerService:
                         for item in status["remote_unavailable"]
                     )
                     lines.append(f"⚠️ دسترسی به برخی سرورها برقرار نشد: {unavailable}")
+            configured_day = self.weekday_label(show.get("release_day"))
+            observed_days = self.observed_release_weekdays(show, state)
+            lines.append(f"📅 روز انتشار تنظیم‌شده: <b>{configured_day}</b>")
+            if observed_days:
+                observed_labels = "، ".join(self.weekday_label(day) for day in observed_days)
+                lines.append(f"📚 روز(های) ثبت‌شده از RSS: <b>{observed_labels}</b>")
+            else:
+                lines.append("📚 روز انتشار ثبت‌شده: هنوز داده کافی وجود ندارد.")
+
+            quality_status = [
+                (
+                    f"✅ {html.escape(quality)}"
+                    if present
+                    else f"❌ {html.escape(quality)} خالی"
+                )
+                for quality, present in status["raw_present"].items()
+            ]
+            if quality_status:
+                lines.append("کیفیت‌ها: " + " | ".join(quality_status))
+            if status["missing_qualities"]:
+                lines.append(
+                    "کیفیت‌های خالی: "
+                    + ", ".join(html.escape(x) for x in status["missing_qualities"])
+                )
+            if "softsub" in [str(x).casefold() for x in status["required_outputs"]]:
+                lines.append("سافت‌ساب: " + ("✅ موجود" if status["softsub"] else "❌ خالی"))
+            if "hardsub" in [str(x).casefold() for x in status["required_outputs"]]:
+                lines.append("هاردساب: " + ("✅ موجود" if status["hardsub"] else "❌ خالی"))
 
                 expected_time = self._expected_release_time(state, show, episode)
                 if not published_in_feed and expected_time:

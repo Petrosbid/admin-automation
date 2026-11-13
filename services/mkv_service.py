@@ -153,7 +153,9 @@ class MKVService:
         cls,
         video_path: Path,
         track_id: int,
-        output_sub_path: Path
+        output_sub_path: Path,
+        track_codec=None,
+        **kwargs
     ) -> Path:
         """Extract one MKVToolNix subtitle track and fail clearly when output is empty."""
         video_path = Path(video_path).resolve()
