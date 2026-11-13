@@ -372,21 +372,35 @@ class AutomationService:
         return cls.EPISODE_REGEX.sub(_replacer, template_name, count=1)
 
     @classmethod
+    def extract_media_year(cls, *values: object) -> str | None:
+        """Extract a plausible release year from a title, folder, or source filename."""
+        for value in values:
+            if value is None:
+                continue
+            match = re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)", str(value))
+            if match:
+                return match.group(1)
+        return None
+
+    @classmethod
     def build_standard_subtitle_filename(
         cls,
         series_or_movie_title: str,
         season_ep_tag: str,
         source_type: str,
         lang: str,
-        ext: str = ".srt"
+        ext: str = ".srt",
+        year: str | None = None,
     ) -> str:
         clean_name = cls.format_clean_title(series_or_movie_title)
+        year_match = re.fullmatch(r"(?:19|20)\d{2}", str(year or "").strip())
+        year_part = f".{year_match.group(0)}" if year_match else ""
         lang_up = lang.upper()
         if not ext.startswith("."):
             ext = f".{ext}"
         if season_ep_tag:
-            return f"{clean_name}.{season_ep_tag}.{source_type}.{lang_up}{ext}"
-        return f"{clean_name}.{source_type}.{lang_up}{ext}"
+            return f"{clean_name}{year_part}.{season_ep_tag}.{source_type}.{lang_up}{ext}"
+        return f"{clean_name}{year_part}.{source_type}.{lang_up}{ext}"
 
     @classmethod
     def build_hardsub_srt_filename(

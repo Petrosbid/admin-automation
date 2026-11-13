@@ -71,7 +71,7 @@ async def cmd_eztv_status(message: Message):
 async def cmd_eztv_check(message: Message):
     if not _is_admin(message):
         return
-    wait = await message.answer("🔎 در حال بررسی فوری RSS سایت EZTV و قسمت‌های مورد انتظار...")
+    wait = await message.answer("🔎 در حال بررسی RSS، فایل‌های Workspace و سرورهای مقصد...")
     try:
         result = await eztv_tracker_service.poll_once(message.bot, send_summary=True)
         queued = result.get("queued", [])
@@ -79,7 +79,8 @@ async def cmd_eztv_check(message: Message):
             "✅ بررسی فوری تمام شد.\n"
             f"سریال‌های تنظیم‌شده: <code>{result.get('shows', 0)}</code>\n"
             f"دانلودهای جدید به صف: <code>{len(queued)}</code>\n"
-            f"مواردی که از قبل موجود بودند: <code>{len(result.get('already_local', []))}</code>",
+            f"موارد موجود در Workspace: <code>{len(result.get('already_local', []))}</code>\n"
+            f"موارد موجود روی سرور مقصد: <code>{len(result.get('already_remote', []))}</code>",
             parse_mode="HTML",
         )
     except Exception as exc:

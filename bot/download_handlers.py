@@ -2187,12 +2187,7 @@ async def cb_link_candidate_selected(call: CallbackQuery, state: FSMContext):
                 chosen_dir,
                 category=category,
             )
-            # در صورت وجود EBTV روی مقصد، همگام‌سازی FullHD را نیز ایجاد می‌کند.
-            preferred_download_dir = (
-                chosen_dir / "FullHD"
-                if (chosen_dir / "FullHD").is_dir()
-                else chosen_dir
-            )
+            # مرورگر در ریشه فصل باز می‌شود؛ کیفیت دانلود را کاربر انتخاب می‌کند.
             await state.update_data(
                 pending_direct_targets=list(info.get("targets", [])),
                 dl_smart_series_title=candidate.get("name", chosen_dir.parent.name),
@@ -2203,7 +2198,7 @@ async def cb_link_candidate_selected(call: CallbackQuery, state: FSMContext):
             await _render_download_folder_browser(
                 call,
                 state,
-                preferred_download_dir,
+                chosen_dir,
                 page=0,
             )
             return

@@ -27,6 +27,13 @@ class SettingsStates(StatesGroup):
     waiting_new_value = State()
 
 
+PRIVATE_SETTING_KEYS = {"bot_token", "password", "username", "admin_ids"}
+
+
+def _is_private_setting(key: str) -> bool:
+    return str(key).casefold() in PRIVATE_SETTING_KEYS
+
+
 def is_admin(user_id: int) -> bool:
     return user_id in cfg.get("telegram", "admin_ids", [])
 
@@ -45,7 +52,7 @@ def _section_keys_kb(section: str) -> InlineKeyboardMarkup:
     sec_data = cfg.get(section) or {}
     if isinstance(sec_data, dict):
         for k, v in sec_data.items():
-            if isinstance(v, (dict, list)):
+            if _is_private_setting(k) or isinstance(v, (dict, list)):
                 continue
             val_preview = "🟢 True" if v is True else ("🔴 False" if v is False else str(v)[:28])
             builder.row(
@@ -77,8 +84,9 @@ async def cmd_settings(message: Message, state: FSMContext):
     await state.clear()
     cfg.reload()
     await message.answer(
-        "⚙️ **پنل مدیریت مستقیم تنظیمات (`config.yaml`)**\n\n"
-        "هر تغییری که در این بخش بدهید، بلافاصله در فایل `config.yaml` ذخیره و بدون نیاز به ری‌استارت کردن ربات اعمال می‌شود.\n"
+        "⚙️ **پنل مدیریت تنظیمات ربات**\n\n"
+        "تنظیمات غیرمحرمانه در `config.yaml` ذخیره می‌شوند. اطلاعات محرمانه مانند توکن و رمزهای عبور فقط از طریق فایل محلی `.env` تنظیم می‌شوند و در این پنل نمایش داده نمی‌شوند.\n"
+        "پس از تغییر `.env` ربات را مجدداً اجرا کنید.\n"
         "بخش مورد نظر را انتخاب کنید:",
         reply_markup=_sections_kb(),
         parse_mode="Markdown"
@@ -90,7 +98,8 @@ async def cb_settings_home(call: CallbackQuery, state: FSMContext):
     await state.clear()
     cfg.reload()
     await call.message.edit_text(
-        "⚙️ **پنل مدیریت مستقیم تنظیمات (`config.yaml`)**\n\n"
+        "⚙️ **پنل مدیریت تنظیمات ربات**\n\n"
+        "اطلاعات محرمانه در `.env` نگهداری می‌شوند و در این پنل قابل مشاهده یا ویرایش نیستند.\n"
         "بخش مورد نظر برای مشاهده یا ویرایش را انتخاب کنید:",
         reply_markup=_sections_kb(),
         parse_mode="Markdown"
@@ -105,10 +114,19 @@ async def cb_open_config_section(call: CallbackQuery, state: FSMContext):
 
     lines = [f"⚙️ **بخش: {label}**\n"]
     if isinstance(sec_data, dict):
+        has_private_values = False
         for k, v in sec_data.items():
+            if _is_private_setting(k):
+                has_private_values = True
+                continue
             if isinstance(v, (dict, list)):
                 continue
             lines.append(f"• `{k}` = `{v}`")
+        if has_private_values:
+            lines.extend([
+                "",
+                "🔒 مقادیر محرمانهٔ این بخش از فایل محلی `.env` خوانده می‌شوند و برای امنیت نمایش داده نمی‌شوند.",
+            ])
 
     lines.append("\n👇 برای تغییر هر مورد، روی دکمه آن کلیک کنید (گزینه‌های بولین با یک کلیک تغییر می‌کنند):")
     await call.message.edit_text(
@@ -121,6 +139,11 @@ async def cb_open_config_section(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("cfgkey:"))
 async def cb_edit_config_key(call: CallbackQuery, state: FSMContext):
     _, section, key = call.data.split(":", 2)
+    if _is_private_setting(key):
+        return await call.answer(
+            "🔒 این مقدار محرمانه است؛ آن را فقط در فایل محلی .env تغییر دهید.",
+            show_alert=True,
+        )
     current_val = cfg.get(section, key)
 
     # اگر مقدار از نوع بولین (True/False) باشد، با همان یک کلیک آن را تغییر بده!
@@ -150,6 +173,9 @@ async def handle_new_config_value(message: Message, state: FSMContext):
     data = await state.get_data()
     section = data["cfg_section"]
     key = data["cfg_key"]
+    if _is_private_setting(key):
+        await state.clear()
+        return await message.answer("🔒 این مقدار فقط در فایل محلی .env قابل تغییر است.")
     old_val = cfg.get(section, key)
 
     try:
