@@ -39,6 +39,7 @@ class EZTVTrackerService:
         self._last_error_notice = 0.0
         self._last_cycle_message = 0.0
         self._remote_quality_cache: dict[str, tuple[float, set[str]]] = {}
+        self._remote_listing_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     @staticmethod
     def _workspace() -> Path:
@@ -451,6 +452,128 @@ class EZTVTrackerService:
                 found.append(path.resolve())
         return found
 
+    @classmethod
+    def _listed_episode_files(cls, names: list[str], season: int, episode: int) -> list[str]:
+        expected = f"S{season:02d}E{episode:02d}"
+        found: list[str] = []
+        for raw_name in names or []:
+            name = Path(str(raw_name)).name
+            if Path(name).suffix.casefold() not in cls.VIDEO_EXTENSIONS:
+                continue
+            tag = AutomationService.extract_episode_tag(name, fallback_season=season)
+            if tag and tag.upper() == expected:
+                found.append(name)
+        return found
+
+    async def _inspect_remote_directory(
+        self,
+        remote_dir: str,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        cache_key = str(remote_dir or "").casefold()
+        now = time.monotonic()
+        cached = self._remote_listing_cache.get(cache_key)
+        if not refresh and cached and now - cached[0] < 20:
+            return dict(cached[1])
+        try:
+            info = await CuteFTPService.inspect_remote_dir(remote_dir)
+        except Exception as exc:
+            logging.warning("Remote EZTV inspection failed for %s: %s", remote_dir, exc)
+            info = {
+                "exists": False,
+                "checked": False,
+                "files": [],
+                "dirs": [],
+                "error": str(exc),
+            }
+        self._remote_listing_cache[cache_key] = (now, dict(info))
+        return dict(info)
+
+    async def _episode_folder_presence(
+        self,
+        folder: Path,
+        season: int,
+        episode: int,
+        refresh_remote: bool = False,
+    ) -> tuple[list[Path], list[str], dict[str, Any]]:
+        local_files = self._find_episode_files(folder, season, episode)
+        remote_path = AutomationService.compute_server_remote_dir_for_local_path(folder)
+        remote_info = await self._inspect_remote_directory(remote_path, refresh=refresh_remote)
+        remote_files = self._listed_episode_files(
+            list(remote_info.get("files", []) or []),
+            season,
+            episode,
+        )
+        return local_files, remote_files, remote_info
+
+    @staticmethod
+    def _is_quality_folder_name(name: str) -> bool:
+        low = str(name or "").casefold()
+        if (
+            low in {
+                "srt", "sub", "softsub", "hardsub",
+                "_incoming_downloads", "_rejected_downloads",
+            }
+            or low.endswith(("-softsub", "-hardsub"))
+        ):
+            return False
+        return bool(
+            re.search(r"(?<!\d)(?:2160p|4k|uhd|1080p|fullhd|fhd|720p|480p|360p|240p)(?!\d)", low)
+        )
+
+    def _today_episodes_for_show(
+        self,
+        show: dict[str, Any],
+        state: dict[str, Any],
+        local_date,
+    ) -> list[int]:
+        prefix = self._show_state_key(show) + "|"
+        scheduled_prefix = f"{show['category']}|{self._slug(show['title'])}|"
+        episodes: set[int] = set()
+
+        def is_today(value: Any) -> bool:
+            parsed = self._parse_datetime(str(value or ""))
+            return bool(parsed and parsed.astimezone(self._timezone()).date() == local_date)
+
+        def collect(key: str, stamps: list[Any]):
+            if not str(key).startswith(prefix):
+                return
+            match = re.search(r"\|S(\d{2})E(\d{2})(?:\||$)", str(key), re.IGNORECASE)
+            if not match or int(match.group(1)) != int(show["season"]):
+                return
+            if any(is_today(stamp) for stamp in stamps):
+                episodes.add(int(match.group(2)))
+
+        for key, stamps in state.get("release_history", {}).items():
+            collect(key, stamps if isinstance(stamps, list) else [])
+        for key, item in state.get("rss_matches", {}).items():
+            if isinstance(item, dict):
+                collect(key, [
+                    item.get("first_seen_at"),
+                    item.get("published_at"),
+                    item.get("updated_at"),
+                ])
+        for key, item in state.get("scheduled_tasks", {}).items():
+            if not isinstance(item, dict) or not str(key).startswith(scheduled_prefix):
+                continue
+            match = re.search(r"\|S(\d{2})E(\d{2})(?:\||$)", str(key), re.IGNORECASE)
+            if not match or int(match.group(1)) != int(show["season"]):
+                continue
+
+            if any(is_today(stamp) for stamp in (item.get("queued_at"), item.get("finished_at"))):
+                episodes.add(int(match.group(2)))
+                continue
+
+            # A task started on an earlier day may finish today before the next RSS poll.
+            task = queue_engine.tasks.get(str(item.get("task_id") or ""))
+            finished_ts = float(getattr(task, "finished_ts", 0) or 0) if task else 0.0
+            if finished_ts > 0:
+                finished_at = datetime.fromtimestamp(finished_ts, tz=timezone.utc)
+                if finished_at.astimezone(self._timezone()).date() == local_date:
+                    episodes.add(int(match.group(2)))
+
+        return sorted(episodes)
+
     def _release_history_key(self, show: dict[str, Any], episode: int) -> str:
         return f"{self._show_state_key(show)}|{self._episode_tag(show['season'], episode)}"
 
@@ -526,8 +649,10 @@ class EZTVTrackerService:
             except Exception:
                 pass
 
-        existing = self._find_episode_files(destination, show["season"], episode)
-        if existing:
+        local_existing, remote_existing, _ = await self._episode_folder_presence(
+            destination, show["season"], episode
+        )
+        if local_existing or remote_existing:
             scheduled.pop(key, None)
             return None
 
@@ -618,6 +743,7 @@ class EZTVTrackerService:
             completed_updates = self._collect_finished_task_updates(state)
             queued: list[dict[str, str]] = []
             already_local: list[str] = []
+            already_remote: list[str] = []
             current_time = datetime.now(timezone.utc)
 
             for show in shows:
@@ -654,13 +780,22 @@ class EZTVTrackerService:
                         destination = await self._resolve_quality_folder(
                             show, season_dir, quality
                         )
-                        files = self._find_episode_files(
+                        local_files, remote_files, _ = await self._episode_folder_presence(
                             destination, show["season"], episode
                         )
-                        if files:
-                            already_local.append(
-                                f"{show['title']} {expected_tag} {quality}: موجود"
+                        if local_files or remote_files:
+                            location = (
+                                "Workspace و سرور مقصد"
+                                if local_files and remote_files
+                                else "Workspace"
+                                if local_files
+                                else "سرور مقصد"
                             )
+                            note = f"{show['title']} {expected_tag} {quality}: موجود ({location})"
+                            if local_files:
+                                already_local.append(note)
+                            if remote_files:
+                                already_remote.append(note)
                             continue
 
                         task_id = await self._queue_release(
@@ -698,7 +833,9 @@ class EZTVTrackerService:
             state["last_feed_check"] = current_time.isoformat()
             self._save_state(state)
 
-            if send_summary and (queued or completed_updates or (already_local and added_ids)):
+            if send_summary and (
+                queued or completed_updates or ((already_local or already_remote) and added_ids)
+            ):
                 lines = ["📡 <b>گزارش خودکار EZTV</b>"]
                 if queued:
                     lines.append(f"✅ {len(queued)} دانلود جدید به صف اضافه شد:")
@@ -708,8 +845,14 @@ class EZTVTrackerService:
                             f"<code>{item['episode']}</code> — {html.escape(item['quality'])} "
                             f"(<code>{html.escape(item['task_id'])}</code>)"
                         )
-                elif already_local and added_ids:
-                    lines.append("✅ انتشارهای پیدا شده از قبل در پوشه محلی موجود بودند.")
+                if already_local and added_ids:
+                    lines.append(
+                        f"✅ {len(already_local)} مورد از انتشارهای جدید از قبل در Workspace موجود بودند."
+                    )
+                if already_remote and added_ids:
+                    lines.append(
+                        f"☁️ {len(already_remote)} مورد از انتشارهای جدید از قبل روی سرور مقصد موجود بودند."
+                    )
 
                 if completed_updates:
                     success_items = [item for item in completed_updates if item["result"] == "success"]
@@ -730,7 +873,7 @@ class EZTVTrackerService:
                                 f"<code>{html.escape(item['episode'])}</code> — "
                                 f"{html.escape(item['quality'])}: {html.escape(item['detail'])}"
                             )
-                if not queued and not completed_updates and not already_local:
+                if not queued and not completed_updates and not already_local and not already_remote:
                     lines.append("در این نوبت انتشار منطبق با قسمت‌های مورد انتظار پیدا نشد.")
                 await self._send_admin_message(bot, "\n".join(lines))
             return {
@@ -738,6 +881,7 @@ class EZTVTrackerService:
                 "queued": queued,
                 "completed_updates": completed_updates,
                 "already_local": already_local,
+                "already_remote": already_remote,
                 "release_count": len(releases),
             }
 
@@ -777,59 +921,154 @@ class EZTVTrackerService:
         season_dir: Path | None = None,
     ) -> dict[str, Any]:
         season_dir = season_dir or self._show_folder(show, episode)
-        raw_present: dict[str, bool] = {}
-        for quality in show["qualities"]:
-            destination = await self._resolve_quality_folder(show, season_dir, quality)
-            raw_present[quality] = bool(
-                self._find_episode_files(destination, show["season"], episode)
-            )
+        season_dir.mkdir(parents=True, exist_ok=True)
 
+        remote_root = AutomationService.compute_server_remote_dir_for_local_path(season_dir)
+        remote_root_info = await self._inspect_remote_directory(remote_root)
+        remote_name_map = {
+            str(name).casefold(): str(name)
+            for name in (remote_root_info.get("dirs", []) or [])
+            if str(name).strip()
+        }
+        local_name_map = {
+            child.name.casefold(): child.name
+            for child in season_dir.iterdir()
+            if child.is_dir()
+        }
+
+        configured_candidates: dict[str, list[str]] = {}
+        candidate_names: dict[str, str] = {}
+        for quality in show["qualities"]:
+            names = self._quality_folder_candidates(show, quality)
+            configured_candidates[quality] = names
+            for name in names:
+                candidate_names.setdefault(name.casefold(), name)
+
+        for folded, name in {**local_name_map, **remote_name_map}.items():
+            if self._is_quality_folder_name(name):
+                candidate_names.setdefault(folded, name)
+
+        quality_folders: dict[str, dict[str, Any]] = {}
+        for folded, name in sorted(candidate_names.items(), key=lambda item: item[1].casefold()):
+            local_name = local_name_map.get(folded, name)
+            local_dir = season_dir / local_name
+            local_files = (
+                self._find_episode_files(local_dir, show["season"], episode)
+                if local_dir.is_dir()
+                else []
+            )
+            remote_actual_name = remote_name_map.get(folded)
+            remote_files: list[str] = []
+            if remote_actual_name:
+                remote_path = f"{remote_root.rstrip('/')}/{remote_actual_name}"
+                remote_info = await self._inspect_remote_directory(remote_path)
+                remote_files = self._listed_episode_files(
+                    list(remote_info.get("files", []) or []),
+                    show["season"],
+                    episode,
+                )
+
+            quality_folders[name] = {
+                "local": bool(local_files),
+                "remote": bool(remote_files),
+                "present": bool(local_files or remote_files),
+                "local_files": [item.name for item in local_files],
+                "remote_files": remote_files,
+            }
+
+        quality_by_folded = {
+            name.casefold(): detail
+            for name, detail in quality_folders.items()
+        }
+        configured_presence = {
+            quality: any(
+                quality_by_folded.get(name.casefold(), {}).get("present", False)
+                for name in names
+            )
+            for quality, names in configured_candidates.items()
+        }
+
+        output_names = {
+            name.casefold(): name
+            for name in list(local_name_map.values()) + list(remote_name_map.values())
+            if (
+                "softsub" in name.casefold()
+                or name.casefold() == "hardsub"
+                or name.casefold().endswith("-hardsub")
+            )
+        }
+        soft_local = False
+        soft_remote = False
+        hard_local = False
+        hard_remote = False
+
+        for folded, name in output_names.items():
+            local_name = local_name_map.get(folded, name)
+            local_dir = season_dir / local_name
+            local_files = (
+                self._find_episode_files(local_dir, show["season"], episode)
+                if local_dir.is_dir()
+                else []
+            )
+            remote_files: list[str] = []
+            remote_actual_name = remote_name_map.get(folded)
+            if remote_actual_name:
+                remote_path = f"{remote_root.rstrip('/')}/{remote_actual_name}"
+                remote_info = await self._inspect_remote_directory(remote_path)
+                remote_files = self._listed_episode_files(
+                    list(remote_info.get("files", []) or []),
+                    show["season"],
+                    episode,
+                )
+
+            is_soft = "softsub" in folded or folded == "softsub"
+            is_hard = folded == "hardsub" or folded.endswith("-hardsub")
+            if is_soft:
+                soft_local = soft_local or bool(local_files)
+                soft_remote = soft_remote or bool(remote_files)
+            if is_hard:
+                hard_local = hard_local or bool(local_files)
+                hard_remote = hard_remote or bool(remote_files)
+
+        soft_present = soft_local or soft_remote
+        hard_present = hard_local or hard_remote
         required_outputs = self.get_config().get("required_outputs", ["softsub", "hardsub"])
         if not isinstance(required_outputs, list):
             required_outputs = ["softsub", "hardsub"]
 
-        soft_dirs = [
-            path for path in season_dir.iterdir()
-            if path.is_dir() and path.name.casefold().endswith("-softsub")
-        ] if season_dir.exists() else []
-        hard_dirs = [
-            path for path in season_dir.iterdir()
-            if path.is_dir() and (
-                path.name.casefold().endswith("-hardsub")
-                or path.name.casefold() == "hardsub"
-            )
-        ] if season_dir.exists() else []
+        all_raw = bool(configured_presence) and all(configured_presence.values())
+        any_raw = any(detail["present"] for detail in quality_folders.values())
+        missing_qualities = [
+            quality for quality, present in configured_presence.items() if not present
+        ]
 
-        soft_present = any(
-            self._find_episode_files(folder, show["season"], episode)
-            for folder in soft_dirs
-        )
-        hard_present = any(
-            self._find_episode_files(folder, show["season"], episode)
-            for folder in hard_dirs
-        )
-        all_raw = bool(raw_present) and all(raw_present.values())
-        any_raw = any(raw_present.values())
         outputs_ok = all(
             (soft_present if str(item).casefold() == "softsub"
              else hard_present if str(item).casefold() == "hardsub"
              else True)
             for item in required_outputs
         )
-        complete = all_raw and outputs_ok
-        missing_qualities = [
-            quality for quality, present in raw_present.items() if not present
-        ]
 
         return {
-            "raw_present": raw_present,
+            "raw_present": {
+                name: bool(detail["present"])
+                for name, detail in quality_folders.items()
+            },
+            "quality_folders": quality_folders,
+            "configured_presence": configured_presence,
             "any_raw": any_raw,
             "all_raw": all_raw,
             "missing_qualities": missing_qualities,
             "softsub": soft_present,
+            "softsub_local": soft_local,
+            "softsub_remote": soft_remote,
             "hardsub": hard_present,
-            "complete": complete,
+            "hardsub_local": hard_local,
+            "hardsub_remote": hard_remote,
+            "remote_checked": bool(remote_root_info.get("checked", False)),
+            "remote_unavailable": list(remote_root_info.get("unavailable_servers", []) or []),
             "required_outputs": required_outputs,
+            "complete": all_raw and outputs_ok,
         }
 
     async def build_daily_report(self) -> str:
@@ -839,82 +1078,125 @@ class EZTVTrackerService:
 
         state = self._load_state()
         local_now = datetime.now(self._timezone())
+        today = local_now.date()
         lines = [
             f"📊 <b>گزارش روزانه EZTV — {local_now.strftime('%Y-%m-%d')}</b>",
             f"🕘 منطقه زمانی: <code>{html.escape(str(self.get_config().get('timezone', 'Asia/Tehran')))}</code>",
+            "📌 فقط سریال‌ها و قسمت‌هایی نمایش داده می‌شوند که امروز در RSS یا صف دانلود فعالیت داشته‌اند.",
             "",
         ]
 
+        activity_count = 0
         for show in shows:
-            episode = self._episode_progress(show, state)
-            tag = self._episode_tag(show["season"], episode)
-            season_dir = await self._prepare_season(show, episode)
-            status = await self._episode_status(show, episode, season_dir)
+            today_episodes = self._today_episodes_for_show(show, state, today)
+            if not today_episodes:
+                continue
 
-            scheduled_keys = [
-                self._scheduled_key(show, episode, quality)
-                for quality in show["qualities"]
-            ]
-            scheduled_active = any(
-                self._task_is_active(
-                    str(state.get("scheduled_tasks", {}).get(key, {}).get("task_id", ""))
+            for episode in today_episodes:
+                activity_count += 1
+                tag = self._episode_tag(show["season"], episode)
+                season_dir = await self._prepare_season(show, episode)
+                status = await self._episode_status(show, episode, season_dir)
+
+                scheduled_keys = [
+                    self._scheduled_key(show, episode, quality)
+                    for quality in show["qualities"]
+                ]
+                scheduled_active = any(
+                    self._task_is_active(
+                        str(state.get("scheduled_tasks", {}).get(key, {}).get("task_id", ""))
+                    )
+                    for key in scheduled_keys
+                    if isinstance(state.get("scheduled_tasks", {}).get(key, {}), dict)
                 )
-                for key in scheduled_keys
-                if isinstance(state.get("scheduled_tasks", {}).get(key, {}), dict)
-            )
-            release_history = state.get("release_history", {}).get(
-                self._release_history_key(show, episode), []
-            )
-            rss_match = state.get("rss_matches", {}).get(
-                self._release_history_key(show, episode), {}
-            )
-            published_in_feed = bool(release_history or rss_match)
-            if not status["any_raw"] and scheduled_active:
-                headline = "📥 منتشر شده و دانلود در صف/در حال اجرا"
-            elif not status["any_raw"] and published_in_feed:
-                headline = "⚠️ در RSS منتشر شده، اما فایل محلی هنوز موجود نیست"
-            elif not status["any_raw"]:
-                headline = "⏳ هنوز منتشر نشده"
-            elif status["complete"]:
-                headline = "✅ کامل شده"
-            else:
-                headline = "🟠 خام منتشر شده / پردازش ناقص"
+                release_key = self._release_history_key(show, episode)
+                release_history = state.get("release_history", {}).get(release_key, [])
+                rss_match = state.get("rss_matches", {}).get(release_key, {})
+                published_in_feed = bool(release_history or rss_match)
 
-            lines.append(
-                f"🎬 <b>{html.escape(show['title'])}</b> — "
-                f"<code>{tag}</code>"
-            )
-            lines.append(f"وضعیت: {headline}")
+                if not status["any_raw"] and scheduled_active:
+                    headline = "📥 منتشر شده و دانلود در صف/در حال اجرا"
+                elif not status["any_raw"] and published_in_feed:
+                    headline = "⚠️ در RSS دیده شده، اما هنوز فایل در دسترس نیست"
+                elif not status["any_raw"]:
+                    headline = "⏳ فعالیت امروز ثبت شده، اما فایل کیفیتی پیدا نشد"
+                elif status["complete"]:
+                    headline = "✅ همه کیفیت‌های تنظیم‌شده و خروجی‌های لازم موجودند"
+                else:
+                    headline = "🟠 بخشی از فایل‌ها یا پردازش‌ها موجود است"
 
-            quality_status = [
-                (
-                    f"✅ {html.escape(quality)}"
-                    if present
-                    else f"❌ {html.escape(quality)} خالی"
-                )
-                for quality, present in status["raw_present"].items()
-            ]
-            if quality_status:
-                lines.append("کیفیت‌ها: " + " | ".join(quality_status))
-            if status["missing_qualities"]:
                 lines.append(
-                    "کیفیت‌های خالی: "
-                    + ", ".join(html.escape(x) for x in status["missing_qualities"])
+                    f"🎬 <b>{html.escape(show['title'])}</b> — "
+                    f"<code>{tag}</code>"
                 )
-            if "softsub" in [str(x).casefold() for x in status["required_outputs"]]:
-                lines.append("سافت‌ساب: " + ("✅ موجود" if status["softsub"] else "❌ خالی"))
-            if "hardsub" in [str(x).casefold() for x in status["required_outputs"]]:
-                lines.append("هاردساب: " + ("✅ موجود" if status["hardsub"] else "❌ خالی"))
+                lines.append(f"وضعیت: {headline}")
 
-            expected_time = self._expected_release_time(state, show, episode)
-            if not status["any_raw"] and not published_in_feed and expected_time:
-                lines.append(f"⏰ زمان معمول انتشار بر اساس سابقه: حدود <code>{expected_time}</code>")
-            elif not status["any_raw"]:
-                lines.append("⏰ سابقه کافی برای تخمین ساعت انتشار ثبت نشده است.")
-            lines.append("")
+                quality_status = []
+                for folder_name, detail in status["quality_folders"].items():
+                    if detail["present"]:
+                        sources = []
+                        if detail["local"]:
+                            sources.append("محلی")
+                        if detail["remote"]:
+                            sources.append("سرور مقصد")
+                        quality_status.append(
+                            f"✅ {html.escape(folder_name)} ({' + '.join(sources)})"
+                        )
+                    else:
+                        quality_status.append(
+                            f"❌ {html.escape(folder_name)} (قسمت اضافه نشده)"
+                        )
+                if quality_status:
+                    lines.append("کیفیت‌ها: " + " | ".join(quality_status))
+                else:
+                    lines.append("کیفیت‌ها: هیچ پوشه کیفیتی در Workspace یا سرور مقصد شناسایی نشد.")
 
+                if status["missing_qualities"]:
+                    lines.append(
+                        "کیفیت‌های تنظیم‌شده و موجودنشده: "
+                        + ", ".join(html.escape(x) for x in status["missing_qualities"])
+                    )
+
+                if "softsub" in [str(x).casefold() for x in status["required_outputs"]]:
+                    sources = []
+                    if status["softsub_local"]:
+                        sources.append("محلی")
+                    if status["softsub_remote"]:
+                        sources.append("سرور مقصد")
+                    lines.append(
+                        "سافت‌ساب: "
+                        + ("✅ موجود (" + " + ".join(sources) + ")" if sources else "❌ موجود نیست")
+                    )
+                if "hardsub" in [str(x).casefold() for x in status["required_outputs"]]:
+                    sources = []
+                    if status["hardsub_local"]:
+                        sources.append("محلی")
+                    if status["hardsub_remote"]:
+                        sources.append("سرور مقصد")
+                    lines.append(
+                        "هاردساب: "
+                        + ("✅ موجود (" + " + ".join(sources) + ")" if sources else "❌ موجود نیست")
+                    )
+
+                if not status["remote_checked"]:
+                    lines.append("⚠️ بررسی سرور مقصد کامل نشد؛ وضعیت محلی جداگانه نمایش داده شده است.")
+                elif status["remote_unavailable"]:
+                    unavailable = "، ".join(
+                        html.escape(str(item.get("name") or item.get("id") or "سرور"))
+                        for item in status["remote_unavailable"]
+                    )
+                    lines.append(f"⚠️ دسترسی به برخی سرورها برقرار نشد: {unavailable}")
+
+                expected_time = self._expected_release_time(state, show, episode)
+                if not published_in_feed and expected_time:
+                    lines.append(f"⏰ زمان معمول انتشار بر اساس سابقه: حدود <code>{expected_time}</code>")
+                lines.append("")
+
+        if activity_count == 0:
+            lines.append("امروز هیچ انتشار، دانلود صف‌شده یا پایان دانلودی برای سریال‌های ردیابی‌شده ثبت نشده است.")
         lines.append(
-            "تعریف «کامل»: تمام کیفیت‌های تنظیم‌شده و خروجی‌های موردنیاز سافت‌ساب/هاردساب برای این قسمت محلی موجود باشند."
+            "تعریف «کامل»: تمام کیفیت‌های تعریف‌شده برای ردیاب و خروجی‌های موردنیاز سافت‌ساب/هاردساب "
+            "در Workspace یا سرور مقصد موجود باشند."
         )
         return "\n".join(lines)
 

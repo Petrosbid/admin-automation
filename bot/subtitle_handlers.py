@@ -538,6 +538,9 @@ async def _init_smart_auto_batch(
     ]
 
     matched_map = AutomationService.match_subtitles_to_episodes(plans, all_candidate_subs)
+    if len(plans) == 1 and len(all_candidate_subs) == 1 and not matched_map:
+        only_key = plans[0].season_ep_tag if (plans[0].is_series and plans[0].season_ep_tag) else "MOVIE"
+        matched_map[only_key] = all_candidate_subs[0]
 
     required_keys = ep_tags if ep_tags else ["MOVIE"]
     if all(k in matched_map for k in required_keys):
@@ -744,7 +747,13 @@ async def _place_and_ask_fa_sub_names(
             season_ep_tag=p.season_ep_tag,
             source_type=p.source_type,
             lang="FA",
-            ext=sub_p.suffix
+            ext=sub_p.suffix,
+            year=AutomationService.extract_media_year(
+                p.series_title,
+                p.base_dir.name,
+                p.base_dir.parent.name,
+                *(target.raw_video.name for target in p.softsub_targets),
+            ),
         )
 
         placed_map[key] = str(sub_p.resolve())
@@ -1324,8 +1333,9 @@ def _build_automation_batch_status_text(
         skipped_items: list[str],
         auto_upload: bool,
         final: bool = False,
+        destination_folder_urls: list[dict[str, str]] | None = None,
 ) -> str:
-    """ساخت یک گزارش HTML جمع‌وجور از وضعیت کل Batch."""
+    """Build a compact HTML summary for the initial and final batch messages."""
     done = [t for t in tasks if t.is_finished and "خطا" not in str(t.status) and "لغو" not in str(t.status)]
     failed = [t for t in tasks if "خطا" in str(t.status)]
     cancelled = [t for t in tasks if "لغو" in str(t.status)]
@@ -1346,10 +1356,10 @@ def _build_automation_batch_status_text(
     elif pending:
         stage = "⏳ مرحله جاری: انتظار در صف پردازش"
     else:
-        stage = "🧾 در حال آماده‌سازی گزارش نهایی"
+        stage = "🧾 مراحل در صف ثبت شده‌اند"
 
     lines = [
-        f"🎬 <b>گزارش زنده اتوماسیون: {html.escape(title)}</b>",
+        f"🎬 <b>{'نتیجه نهایی اتوماسیون' if final else 'اتوماسیون در صف قرار گرفت'}: {html.escape(title)}</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"📍 <b>{stage}</b>",
         f"☁️ آپلود خودکار: {'فعال' if auto_upload else 'غیرفعال'}",
@@ -1364,12 +1374,11 @@ def _build_automation_batch_status_text(
         "<b>وضعیت مراحل:</b>",
     ]
 
-    stage_labels = (
+    for queue_type, label in (
         ("mkvtoolnix", "📎 SoftSub"),
         ("handbrake", "🔥 HardSub"),
         ("upload", "☁️ Upload"),
-    )
-    for queue_type, label in stage_labels:
+    ):
         subset = [t for t in tasks if t.queue_type == queue_type]
         if not subset:
             continue
@@ -1385,6 +1394,21 @@ def _build_automation_batch_status_text(
             f"• {label}: <b>{subset_done}/{len(subset)}</b> تکمیل"
             + (f" | <b>{subset_failed}</b> ناموفق" if subset_failed else "")
         )
+
+    if final:
+        if destination_folder_urls:
+            lines.extend(["", "📂 <b>پوشه اصلی فایل‌ها روی سرور مقصد:</b>"])
+            for item in destination_folder_urls[:4]:
+                name = html.escape(str(item.get("name") or "سرور مقصد"))
+                url = html.escape(str(item.get("url") or ""), quote=True)
+                if url:
+                    lines.append(f'• <a href="{url}">{name} — باز کردن پوشه</a>')
+        if not tasks:
+            lines.extend(["", "ℹ️ <b>هیچ عملیات اجرایی در صف ثبت نشد.</b>"])
+        elif failed or cancelled:
+            lines.extend(["", "⚠️ <b>اتوماسیون با موارد ناموفق/لغوشده پایان یافت.</b>"])
+        else:
+            lines.extend(["", "🎉 <b>تمام عملیات ثبت‌شده با موفقیت تکمیل شدند.</b>"])
 
     if tasks:
         lines.extend(["", "<b>فایل‌ها و عملیات:</b>"])
@@ -1415,16 +1439,16 @@ def _build_automation_batch_status_text(
         if len(skipped_items) > 6:
             lines.append(f"<i>... و {len(skipped_items) - 6} مورد دیگر</i>")
 
-    if final:
-        if not tasks:
-            lines.extend(["", "ℹ️ <b>هیچ عملیات اجرایی در صف ثبت نشد.</b>"])
-        elif failed or cancelled:
-            lines.extend(["", "⚠️ <b>اتوماسیون با موارد ناموفق/لغوشده پایان یافت.</b>"])
-        else:
-            lines.extend(["", "🎉 <b>تمام عملیات ثبت‌شده با موفقیت تکمیل شدند.</b>"])
-
-    return "\n".join(lines)[:3900]
-
+    # Keep complete HTML lines and the mandatory destination links/status within Telegram's limit.
+    rendered_lines: list[str] = []
+    total_length = 0
+    for line in lines:
+        line_length = len(line) + (1 if rendered_lines else 0)
+        if total_length + line_length > 3900:
+            break
+        rendered_lines.append(line)
+        total_length += line_length
+    return "\n".join(rendered_lines)
 
 async def _watch_smart_automation_batch(
     status_message: Message,
@@ -1433,17 +1457,14 @@ async def _watch_smart_automation_batch(
     initial_tasks: list,
     skipped_items: list[str],
     auto_upload: bool,
+    remote_root_path: str | None = None,
 ):
     """
-    آپدیت وضعیت اتوماسیون با فاصله ایمن ۱۲ ثانیه:
-    هر ۱۰ بار ادیت، یک بار پیام جدید ارسال می‌کند تا سقف EditMessageText تلگرام هرگز پر نشود.
+    The caller sends the initial status. This watcher sends no periodic
+    progress messages and delivers one final summary once all batch tasks end.
     """
     known_tasks = {task.task_id: task for task in initial_tasks}
-    markup = _automation_batch_status_markup()
-    last_rendered = None
     stable_completed_cycles = 0
-    edit_counter = 0
-    current_msg = status_message
 
     while True:
         for task in list(queue_engine.tasks.values()):
@@ -1453,50 +1474,42 @@ async def _watch_smart_automation_batch(
         tasks = list(known_tasks.values())
         is_complete = bool(tasks) and all(task.is_finished for task in tasks)
         stable_completed_cycles = stable_completed_cycles + 1 if is_complete else 0
-        is_final = stable_completed_cycles >= 2
 
-        report = _build_automation_batch_status_text(
-            title=title,
-            tasks=tasks,
-            skipped_items=skipped_items,
-            auto_upload=auto_upload,
-            final=is_final,
-        )
+        if stable_completed_cycles >= 2:
+            destination_folder_urls: list[dict[str, str]] = []
+            if remote_root_path:
+                try:
+                    remote_results = await CuteFTPService.inspect_remote_dir_all(remote_root_path)
+                    for item in remote_results:
+                        public_url = str(item.get("public_url") or "").strip()
+                        if item.get("exists") and public_url:
+                            destination_folder_urls.append({
+                                "name": str(item.get("server_name") or item.get("server_id") or "سرور مقصد"),
+                                "url": public_url.rstrip("/") + "/",
+                            })
+                except Exception:
+                    logging.exception("Could not resolve automation folder URL for %s", remote_root_path)
 
-        if report != last_rendered:
+            final_report = _build_automation_batch_status_text(
+                title=title,
+                tasks=tasks,
+                skipped_items=skipped_items,
+                auto_upload=auto_upload,
+                final=True,
+                destination_folder_urls=destination_folder_urls,
+            )
             try:
-                # اگر کار تمام شده یا هر ۱۰ دور یک بار، یک پیام جدید بفرست تا ادیت روی یک پیام واحد اسپم نشود
-                if is_final or edit_counter >= 10:
-                    sent = await current_msg.answer(
-                        report,
-                        reply_markup=markup,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
-                    if isinstance(sent, Message) and sent.message_id > 1:
-                        current_msg = sent
-                    edit_counter = 0
-                else:
-                    await current_msg.edit_text(
-                        report,
-                        reply_markup=markup,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
-                    edit_counter += 1
-                last_rendered = report
-            except TelegramRetryAfter as exc:
-                wait_sec = float(getattr(exc, "retry_after", 20))
-                await asyncio.sleep(wait_sec + 2.0)
-            except Exception as exc:
-                if "message is not modified" not in str(exc).lower():
-                    logging.debug("Status update skipped: %s", exc)
-
-        if is_final:
+                await status_message.answer(
+                    final_report,
+                    reply_markup=_automation_batch_status_markup(),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                logging.exception("Could not send final automation report for batch %s", batch_id)
             return
 
-        # فاصله ۱۲ ثانیه‌ای بین هر بررسی (کاملاً ایمن در برابر محدودیت تلگرام)
-        await asyncio.sleep(12)
+        await asyncio.sleep(3)
 
 async def _execute_smart_automation_batch(
         call: CallbackQuery,
@@ -1648,13 +1661,14 @@ async def _execute_smart_automation_batch(
                 initial_tasks=batch_tasks,
                 skipped_items=skipped_items,
                 auto_upload=auto_upload,
+                remote_root_path=AutomationService.compute_server_remote_dir_for_local_path(target_dir),
             ),
             name=f"automation-status-{batch_id}",
         )
         _ACTIVE_AUTOMATION_MONITORS.add(monitor_task)
         monitor_task.add_done_callback(_release_automation_monitor)
 
-    await call.answer("اتوماسیون در صف قرار گرفت و گزارش آن به‌روزرسانی می‌شود.")
+    await call.answer("اتوماسیون در صف قرار گرفت؛ گزارش نهایی پس از پایان ارسال می‌شود.")
 
 
 def _incoming_subtitle_episode_tags(sub_files: list[Path], target_dir: Path) -> list[str]:
@@ -1671,12 +1685,36 @@ def _resolve_incoming_subtitle_target(target_dir: Path, sub_files: list[Path]) -
     target_dir = target_dir.resolve()
     ep_tags = _incoming_subtitle_episode_tags(sub_files, target_dir)
     category = AutomationService.detect_category_from_path(target_dir)
-    if ep_tags and category in ("Series", "Anime") and not AutomationService.SEASON_DIR_REGEX.match(target_dir.name):
-        if target_dir.name.casefold() not in ("series", "anime", "workspace"):
-            season_num = int(ep_tags[0][1:3])
-            target_dir = target_dir / f"S{season_num:02d}"
-    return target_dir, ep_tags
 
+    quality_folder = (
+        target_dir.name.casefold() == "fullhd"
+        or bool(re.search(r"(?i)(2160p|4k|uhd|1080p|fullhd|fhd|720p|480p|360p|240p)", target_dir.name))
+        or target_dir.name.casefold().endswith(("-softsub", "-hardsub"))
+    )
+    if quality_folder and (
+        category == "Movies"
+        or (
+            category in ("Series", "Anime")
+            and AutomationService.SEASON_DIR_REGEX.match(target_dir.parent.name)
+        )
+    ):
+        target_dir = target_dir.parent
+
+    if category in ("Series", "Anime"):
+        if ep_tags and not AutomationService.SEASON_DIR_REGEX.match(target_dir.name):
+            target_dir = target_dir / f"S{int(ep_tags[0][1:3]):02d}"
+        elif not AutomationService.SEASON_DIR_REGEX.match(target_dir.name):
+            try:
+                local_seasons = [
+                    child for child in target_dir.iterdir()
+                    if child.is_dir() and AutomationService.SEASON_DIR_REGEX.match(child.name)
+                ]
+            except OSError:
+                local_seasons = []
+            if len(local_seasons) == 1:
+                target_dir = local_seasons[0]
+
+    return target_dir.resolve(), ep_tags
 
 async def _show_incoming_subtitle_actions(
         call_or_msg: CallbackQuery | Message,
@@ -1821,6 +1859,7 @@ async def _start_incoming_subtitle_upload_batch(
             initial_tasks=tasks,
             skipped_items=skipped,
             auto_upload=True,
+            remote_root_path=AutomationService.compute_server_remote_dir_for_local_path(target_dir),
         ),
         name=f"subtitle-upload-status-{batch_id}",
     )

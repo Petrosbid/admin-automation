@@ -1,7 +1,6 @@
 telegram:
-  bot_token: "9194234248:AAGGkeiVf7E8v0BAL_Ft1R-VUvS6oh2ESME"
-  admin_ids:
-    - 815777731
+  bot_token: ""
+  admin_ids: []
   progress_update_interval: 3.0
 proxy:
   enabled: true
@@ -48,8 +47,8 @@ paths:
 
 qbittorrent:
   webui_url: "http://127.0.0.1:8080"
-  username: "admin"
-  password: "adminpassword"
+  username: ""
+  password: ""
 
 
 branding:
@@ -74,8 +73,8 @@ ftp:
   host: "185.130.50.130"
   port: 21
   protocol: "FTP"
-  username: "hamid@dl15.cdnzed.sbs"
-  password: "p7vBKuwz8dFW4pRNjYJp"
+  username: ""
+  password: ""
   passive_mode: true
   timeout: 120
   remote_base_dir: "/English/Movies"
@@ -91,8 +90,8 @@ ftp:
       host: "185.130.50.50"
       port: 21
       protocol: "FTP"
-      username: "ali@dl16.cdnzed.sbs"
-      password: "p7vBKuwz8dFW4pRNjYJp"
+      username: ""
+      password: ""
       passive_mode: true
       timeout: 120
       remote_base_dir: "/English/Movies"
