@@ -48,6 +48,7 @@ class EZTVTrackerService:
         self._last_error_notice = 0.0
         self._last_cycle_message = 0.0
         self._remote_quality_cache: dict[str, tuple[float, set[str]]] = {}
+        self._remote_listing_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     @staticmethod
     def _workspace() -> Path:
@@ -615,6 +616,15 @@ class EZTVTrackerService:
     ) -> dict[str, Any]:
         cache_key = str(remote_dir or "").casefold()
         now = time.monotonic()
+
+        # Be defensive against legacy instances created before this cache was added,
+        # test fixtures that bypass __init__, or hot-reload edge cases.
+        cache = getattr(self, "_remote_listing_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._remote_listing_cache = cache
+
+        cached = cache.get(cache_key)
         cache = getattr(self, "_remote_listing_cache", None)
         if not isinstance(cache, dict):
             cache = {}
