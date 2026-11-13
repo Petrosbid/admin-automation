@@ -472,7 +472,15 @@ class EZTVTrackerService:
     ) -> dict[str, Any]:
         cache_key = str(remote_dir or "").casefold()
         now = time.monotonic()
-        cached = self._remote_listing_cache.get(cache_key)
+
+        # Be defensive against legacy instances created before this cache was added,
+        # test fixtures that bypass __init__, or hot-reload edge cases.
+        cache = getattr(self, "_remote_listing_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._remote_listing_cache = cache
+
+        cached = cache.get(cache_key)
         if not refresh and cached and now - cached[0] < 20:
             return dict(cached[1])
         try:
@@ -486,7 +494,7 @@ class EZTVTrackerService:
                 "dirs": [],
                 "error": str(exc),
             }
-        self._remote_listing_cache[cache_key] = (now, dict(info))
+        cache[cache_key] = (now, dict(info))
         return dict(info)
 
     async def _episode_folder_presence(
