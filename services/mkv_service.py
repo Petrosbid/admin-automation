@@ -457,7 +457,8 @@ class MKVService:
             if fa_sub_path and Path(fa_sub_path).exists():
                 fa_sub_path = Path(fa_sub_path)
                 clean_fa_sub = output_path.with_name(f"_soft_clean_fa_{uid}{fa_sub_path.suffix}")
-                clean_fa_sub.write_text(SubtitleService.read_subtitle_safe(fa_sub_path), encoding="utf-8-sig")
+                clean_fa_sub.write_text(SubtitleService.read_subtitle_safe(fa_sub_path), encoding="utf-8", newline="\n")
+                SubtitleService.normalize_subtitle_file(clean_fa_sub)
 
                 if sync_mode == "auto":
                     await cls.sync_sub_against_video(
@@ -472,7 +473,8 @@ class MKVService:
             if en_sub_path and Path(en_sub_path).exists():
                 en_sub_path = Path(en_sub_path)
                 clean_en_sub = output_path.with_name(f"_soft_clean_en_{uid}{en_sub_path.suffix}")
-                clean_en_sub.write_text(SubtitleService.read_subtitle_safe(en_sub_path), encoding="utf-8-sig")
+                clean_en_sub.write_text(SubtitleService.read_subtitle_safe(en_sub_path), encoding="utf-8", newline="\n")
+                SubtitleService.normalize_subtitle_file(clean_en_sub)
 
             info = await cls.inspect_tracks(video_path)
             tracks = info.get("tracks", [])
@@ -557,22 +559,38 @@ class MKVService:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT
             )
-
+            output_chunks: list[str] = []
             buffer = ""
             while True:
-                chunk = await proc.stdout.read(128)
+                chunk = await proc.stdout.read(4096)
                 if not chunk:
                     break
-                buffer += chunk.decode("utf-8", errors="replace")
+                decoded = chunk.decode("utf-8", errors="replace")
+                output_chunks.append(decoded)
+                buffer += decoded
                 lines = re.split(r"[\r\n]+", buffer)
                 buffer = lines.pop()
                 for line in lines:
                     if "Progress:" in line and progress_callback:
                         progress_callback(line.replace("Progress:", "").strip())
-
+            if buffer.strip() and "Progress:" in buffer and progress_callback:
+                progress_callback(buffer.replace("Progress:", "").strip())
             await proc.wait()
+            mkvmerge_output = "".join(output_chunks).strip()
             if proc.returncode not in (0, 1):
-                raise RuntimeError(f"mkvmerge failed with code {proc.returncode}")
+                try:
+                    output_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                diagnostic = mkvmerge_output[-8000:] or "(mkvmerge produced no diagnostic output)"
+                raise RuntimeError(
+                    f"mkvmerge failed with code {proc.returncode}. "
+                    f"Input video: {video_path}\n"
+                    f"Persian subtitle: {clean_fa_sub or '(none)'}\n"
+                    f"English subtitle: {clean_en_sub or '(none)'}\n"
+                    f"Output: {output_path}\n"
+                    f"mkvmerge output:\n{diagnostic}"
+                )
 
             return output_path
 

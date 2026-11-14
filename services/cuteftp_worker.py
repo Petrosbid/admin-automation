@@ -16,8 +16,26 @@ _FTP_SERIAL_LOCK = threading.Lock()
 # سایز بلاک بهینه برای انتقال سریع فایل‌های ویدئویی حجیم روی شبکه (512 کیلوبایت)
 UPLOAD_BLOCK_SIZE = 512 * 1024
 MAX_UPLOAD_RETRIES = 4
+INSPECT_TIMEOUT_SECONDS = 10
 
 _EP_TAG_RE = re.compile(r"[Ss](\d{1,2})[\s._\-]*[Ee][Pp]?(\d{1,3})")
+
+
+class _NatSafeFTP(FTP):
+    """
+    جلوگیری از خطای WinError 10060 در حالت Passive (PASV) زمانی که سرور FTP پشت NAT/فایروال است
+    و در پاسخ 227 یک IP داخلی یا غیرقابل دسترس برمی‌گرداند.
+    """
+    def makepasv(self) -> tuple[str, int]:
+        _, port = super().makepasv()
+        return self.host, port
+
+
+class _NatSafeFTP_TLS(FTP_TLS):
+    """نسخه FTPS/TLS مقاوم در برابر بازگشت IP اشتباه در Passive Mode"""
+    def makepasv(self) -> tuple[str, int]:
+        _, port = super().makepasv()
+        return self.host, port
 
 
 def _format_speed_and_eta(uploaded_bytes: int, total_bytes: int, elapsed_sec: float) -> str:
@@ -54,7 +72,7 @@ def _create_ftp_connection(
 ) -> FTP:
     """ایجاد اتصال پایدار FTP یا FTPS با استفاده از مشخصات ثبت‌شده در config.yaml"""
     use_tls = str(protocol).strip().upper() in ("FTPS", "FTPES", "TLS", "SSL")
-    ftp = FTP_TLS() if use_tls else FTP()
+    ftp = _NatSafeFTP_TLS() if use_tls else _NatSafeFTP()
     ftp.encoding = "utf-8"
 
     ftp.connect(host=host, port=port, timeout=timeout)
@@ -276,7 +294,6 @@ def _upload_single_file_with_retry(
             if progress_callback:
                 progress_callback(f"{progress_prefix}100% ({total_mb:.1f} MB) - تکمیل شد")
 
-            # برگرداندن مسیر فایل (با نام جدید در صورت تغییر نام خودکار)
             return local_file
 
         except all_errors as e:
@@ -354,7 +371,7 @@ def _get_ftp_inspection_config() -> dict:
 
 
 def list_ftp_dir_entries(remote_dir: str, server_config: dict | None = None) -> dict[str, Any]:
-    """اتصال به یک سرور مشخص و دریافت فایل‌ها و زیرپوشه‌های مسیر remote_dir"""
+    """اتصال سریع به یک سرور مشخص و دریافت فایل‌ها و زیرپوشه‌های مسیر remote_dir"""
     result = {"files": [], "dirs": [], "exists": False, "checked": False}
     ftp_cfg = dict(server_config) if isinstance(server_config, dict) else _get_ftp_inspection_config()
     protocol = str(ftp_cfg.get("protocol", "FTP")).strip().upper()
@@ -362,6 +379,7 @@ def list_ftp_dir_entries(remote_dir: str, server_config: dict | None = None) -> 
     port = int(ftp_cfg.get("port", 21) or 21)
     username = str(ftp_cfg.get("username", "")).strip()
     password = str(ftp_cfg.get("password", "")).strip()
+    server_label = str(ftp_cfg.get("name") or ftp_cfg.get("id") or host)
 
     if (
         not host
@@ -379,6 +397,9 @@ def list_ftp_dir_entries(remote_dir: str, server_config: dict | None = None) -> 
         return result
 
     norm_dir = _normalize_remote_path(remote_dir)
+    # استفاده از تایم‌اوت کوتاه (حداکثر ۱۰ ثانیه) برای Inspect تا در صورت قطعی یک سرور، ربات ۲۱+ ثانیه قفل نشود
+    inspect_timeout = min(INSPECT_TIMEOUT_SECONDS, int(ftp_cfg.get("inspect_timeout", INSPECT_TIMEOUT_SECONDS) or INSPECT_TIMEOUT_SECONDS))
+
     ftp = None
     try:
         ftp = _create_ftp_connection(
@@ -387,22 +408,29 @@ def list_ftp_dir_entries(remote_dir: str, server_config: dict | None = None) -> 
             username=username,
             password=password,
             protocol=protocol,
-            timeout=int(ftp_cfg.get("timeout", 30) or 30),
+            timeout=inspect_timeout,
             passive_mode=bool(ftp_cfg.get("passive_mode", True)),
         )
         result["checked"] = True
         try:
             ftp.cwd(norm_dir)
             result["exists"] = True
-        except Exception:
+        except error_perm:
+            # پوشه هنوز روی این سرور وجود ندارد (خطای شبکه نیست)
+            return result
+        except Exception as cwd_exc:
+            result["checked"] = False
+            result["error"] = str(cwd_exc)
+            logging.warning(f"FTP cwd warning on [{server_label}] for {norm_dir}: {cwd_exc}")
             return result
 
+        # ۱. تلاش با دستور استاندارد MLSD
         try:
             for name, facts in ftp.mlsd():
                 if name in (".", ".."):
                     continue
                 ftype = str(facts.get("type", "")).lower()
-                if ftype == "dir":
+                if ftype in ("dir", "cdir", "pdir"):
                     result["dirs"].append(name)
                 elif ftype == "file":
                     result["files"].append(name)
@@ -410,6 +438,7 @@ def list_ftp_dir_entries(remote_dir: str, server_config: dict | None = None) -> 
         except Exception:
             pass
 
+        # ۲. تلاش جایگزین با LIST
         lines: list[str] = []
         ftp.retrlines("LIST", lines.append)
         for line in lines:
@@ -427,7 +456,7 @@ def list_ftp_dir_entries(remote_dir: str, server_config: dict | None = None) -> 
         return result
     except Exception as e:
         result["error"] = str(e)
-        logging.warning(f"FTP inspect warning for {norm_dir}: {e}")
+        logging.warning(f"FTP inspect warning on [{server_label} - {host}] for {norm_dir}: {e}")
         return result
     finally:
         _close_ftp_quietly(ftp)
@@ -505,7 +534,6 @@ def sync_upload_cuteftp(
         try:
             if local_target.is_file():
                 logging.info(f"☁️ [FTP UPLOAD START] File: {local_target.name} -> {target_remote_dir}")
-                # دریافت مسیر نهایی فایل (در صورتی که هنگام آپلود هم‌فرمول با سرور تغییر نام یافته باشد)
                 local_target = _upload_single_file_with_retry(
                     ftp_holder=ftp_holder,
                     conn_params=conn_params,
@@ -555,7 +583,6 @@ def sync_upload_cuteftp(
                     )
                     prefix_str = f"[{idx}/{total_files}] {file_p.name[:22]}: "
 
-                    # دریافت مسیر نهایی هر فایل پس از تطبیق نام با سرور
                     file_p = _upload_single_file_with_retry(
                         ftp_holder=ftp_holder,
                         conn_params=conn_params,

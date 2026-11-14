@@ -174,7 +174,6 @@ class CuteFTPService:
                 result.append(normalized)
             return result
 
-        # رفتار قبلی بدون نیاز به تغییر config کاربران حفظ می‌شود.
         legacy_server = cls._normalize_server(cls._merge_legacy_config(), 0)
         return [legacy_server] if legacy_server else []
 
@@ -236,15 +235,17 @@ class CuteFTPService:
 
     @classmethod
     async def inspect_remote_dir_all(cls, remote_dir: str) -> list[dict]:
-        """بررسی ترتیبی مسیر روی تمام سرورها؛ ترتیب خروجی مطابق ترتیب config.yaml است."""
+        """بررسی موازی مسیر روی تمام سرورها با حفظ دقیق ترتیب config.yaml در خروجی."""
         servers = cls.get_servers()
-        results: list[dict] = []
-        for server in servers:
+        if not servers:
+            return []
+
+        async def _inspect_one(server: dict) -> dict:
             target_dir = cls._remote_path_for_server(remote_dir, server)
             try:
                 info = await asyncio.to_thread(list_ftp_dir_entries, target_dir, server)
             except Exception as exc:
-                info = {"files": [], "dirs": [], "exists": False, "error": str(exc)}
+                info = {"files": [], "dirs": [], "exists": False, "checked": False, "error": str(exc)}
             item = dict(info)
             item.update({
                 "server_id": server["id"],
@@ -252,8 +253,9 @@ class CuteFTPService:
                 "remote_dir": target_dir,
                 "public_url": cls.build_public_url(server, target_dir),
             })
-            results.append(item)
-        return results
+            return item
+
+        return list(await asyncio.gather(*(_inspect_one(s) for s in servers)))
 
     @classmethod
     async def find_existing_servers(cls, remote_dir: str) -> list[dict]:
@@ -287,8 +289,6 @@ class CuteFTPService:
         selected = existing_results[0] if existing_results else results[0]
         response = dict(selected)
 
-        # فهرست فایل‌ها و پوشه‌ها را از تمام سرورهای قابل‌دسترسی ادغام می‌کنیم
-        # تا جست‌وجوی عنوان/فصل و همگام‌سازی ساختار، محتوای سرورهای پشتیبان را هم ببیند.
         def _unique_names(key: str) -> list[str]:
             found: dict[str, str] = {}
             for item in existing_results:
@@ -361,7 +361,6 @@ class CuteFTPService:
         if matches:
             return matches[0][0]
 
-        # وقتی هیچ پوشه‌ای پیدا نشده، فقط روی اولین سروری ایجاد می‌کنیم که واقعاً بررسی شده است.
         reachable = [
             server for server, result in pairs
             if result.get("checked", False)
@@ -369,7 +368,6 @@ class CuteFTPService:
         if reachable:
             return reachable[0]
 
-        # اگر هیچ سروری بررسی نشده باشد، مقصد را حدس نمی‌زنیم تا فایل در سرور اشتباه آپلود نشود.
         errors = "; ".join(
             f"{item['name']}: {item['error'][:120]}" for item in unavailable
         )
@@ -408,7 +406,6 @@ class CuteFTPService:
         else:
             targets_list = [Path(t) for t in targets]
 
-        # سرور یک بار برای کل عملیات انتخاب می‌شود تا فایل‌های یک batch در چند سرور پخش نشوند.
         selected_server = await cls._resolve_upload_server(remote_subpath, server_id)
         all_links: list[str] = []
         total = len(targets_list)

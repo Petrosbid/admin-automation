@@ -10,7 +10,6 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
@@ -116,9 +115,6 @@ class EZTVTrackerService:
             old_progress = progress.pop(old_state_key)
             progress[new_state_key] = old_progress
 
-        # Renaming a show can safely migrate history within the same season.
-        # Changing season/category starts a different tracking scope, so do not
-        # re-label old season release dates or queued episode tasks as new ones.
         same_tracking_scope = old_season == new_season and old_category == new_category
         if old_state_key != new_state_key and same_tracking_scope:
             for section in ("release_history", "rss_matches"):
@@ -154,8 +150,6 @@ class EZTVTrackerService:
             progress_item["next_episode"] = new_episode_setting
             progress_item["config_next_episode"] = new_episode_setting
         else:
-            # Preserve the auto-advanced next_episode when only weekday, aliases,
-            # quality folders or other descriptive metadata were edited.
             progress_item.setdefault("config_next_episode", new_episode_setting)
 
         self._save_state(state)
@@ -296,7 +290,6 @@ class EZTVTrackerService:
     @staticmethod
     def _release_episode(title: str) -> tuple[int, int] | None:
         raw_title = title or ""
-        # Reject common multi-episode packs such as S02E04-E05, S02E04E05 and S02E04+05.
         if re.search(
             r"(?i)\bS\d{1,2}E\d{1,3}(?:[-+._ &]+E?\d{1,3}|E\d{1,3})\b",
             raw_title,
@@ -396,7 +389,6 @@ class EZTVTrackerService:
                 link = magnet_link
             item_id = guid or magnet_link or item_link or f"{title}|{pubdate_raw}"
             if not link:
-                # Some RSS pages expose the magnet URI only in an attribute.
                 for child in item.iter():
                     for attr_name, attr_value in child.attrib.items():
                         if attr_name.casefold().endswith("magneturi") and attr_value.strip():
@@ -474,8 +466,6 @@ class EZTVTrackerService:
         except (TypeError, ValueError):
             configured_episode = 1
 
-        # اگر ادمین next_episode را در config تغییر دهد، مقدار ذخیره‌شدهٔ قبلی
-        # را با مقدار جدید پیکربندی همگام کن؛ پیشرفت خودکار بعدی حفظ می‌شود.
         try:
             config_anchor = int(item.get("config_next_episode", configured_episode))
         except (TypeError, ValueError):
@@ -520,7 +510,7 @@ class EZTVTrackerService:
             return set(cached[1])
 
         try:
-            info = await CuteFTPService.inspect_remote_dir(remote_path)
+            info = await self._inspect_remote_directory(remote_path)
             directories = {
                 str(value).casefold()
                 for value in (info.get("dirs", []) or [])
@@ -570,13 +560,7 @@ class EZTVTrackerService:
                 path.mkdir(parents=True, exist_ok=True)
                 return path
 
-        # FullHD source and 2160p-HDR-x265 are explicit configured targets.
-        # 480p follows the destination's existing RMTeam/EBTV folder if possible.
-        if quality in ("fullhd_h264", "2160p"):
-            path = season_dir / candidates[0]
-            path.mkdir(parents=True, exist_ok=True)
-            return path
-        if quality == "480p":
+        if quality in ("fullhd_h264", "2160p", "480p"):
             path = season_dir / candidates[0]
             path.mkdir(parents=True, exist_ok=True)
             return path
@@ -617,21 +601,13 @@ class EZTVTrackerService:
         cache_key = str(remote_dir or "").casefold()
         now = time.monotonic()
 
-        # Be defensive against legacy instances created before this cache was added,
-        # test fixtures that bypass __init__, or hot-reload edge cases.
         cache = getattr(self, "_remote_listing_cache", None)
         if not isinstance(cache, dict):
             cache = {}
             self._remote_listing_cache = cache
 
         cached = cache.get(cache_key)
-        cache = getattr(self, "_remote_listing_cache", None)
-        if not isinstance(cache, dict):
-            cache = {}
-            self._remote_listing_cache = cache
-
-        cached = cache.get(cache_key)
-        if not refresh and cached and now - cached[0] < 20:
+        if not refresh and cached and now - cached[0] < 30:
             return dict(cached[1])
         try:
             info = await CuteFTPService.inspect_remote_dir(remote_dir)
@@ -722,7 +698,6 @@ class EZTVTrackerService:
                 episodes.add(int(match.group(2)))
                 continue
 
-            # A task started on an earlier day may finish today before the next RSS poll.
             task = queue_engine.tasks.get(str(item.get("task_id") or ""))
             finished_ts = float(getattr(task, "finished_ts", 0) or 0) if task else 0.0
             if finished_ts > 0:
@@ -769,7 +744,6 @@ class EZTVTrackerService:
         expected_episode_tag: str,
         progress_callback=None,
     ):
-        # Import lazily to avoid creating a router/service import cycle.
         from bot.download_handlers import _smart_download_pipeline_job
         return await _smart_download_pipeline_job(
             bot,
@@ -874,7 +848,6 @@ class EZTVTrackerService:
             item["result"] = "success" if is_success else "failed"
             item["final_status"] = status
             if not is_success:
-                # بعد از خطا، ۱۵ دقیقه cooldown از زمان پایان محاسبه شود تا retry storm ایجاد نشود.
                 item["queued_at"] = now
 
             updates.append({
@@ -976,7 +949,6 @@ class EZTVTrackerService:
                         seen_ids.add(release_id)
                         added_ids.append(release_id)
 
-                # If the expected episode is already fully processed locally, progress safely.
                 report = await self._episode_status(show, episode, season_dir)
                 if report["complete"]:
                     state.setdefault("progress", {}).setdefault(
@@ -1059,7 +1031,6 @@ class EZTVTrackerService:
                 local = parsed.astimezone(self._timezone())
                 times.append(local.hour * 60 + local.minute)
         if not times:
-            # Previous episode releases are a fallback when current episode hasn't appeared yet.
             previous_key = self._release_history_key(show, max(1, episode - 1))
             previous = state.get("release_history", {}).get(previous_key, [])
             for raw in previous[-8:]:
@@ -1289,6 +1260,15 @@ class EZTVTrackerService:
                 )
                 lines.append(f"وضعیت: {headline}")
 
+                configured_day = self.weekday_label(show.get("release_day"))
+                observed_days = self.observed_release_weekdays(show, state)
+                lines.append(f"📅 روز انتشار تنظیم‌شده: <b>{configured_day}</b>")
+                if observed_days:
+                    observed_labels = "، ".join(self.weekday_label(day) for day in observed_days)
+                    lines.append(f"📚 روز(های) ثبت‌شده از RSS: <b>{observed_labels}</b>")
+                else:
+                    lines.append("📚 روز انتشار ثبت‌شده: هنوز داده کافی وجود ندارد.")
+
                 quality_status = []
                 for folder_name, detail in status["quality_folders"].items():
                     if detail["present"]:
@@ -1344,34 +1324,6 @@ class EZTVTrackerService:
                         for item in status["remote_unavailable"]
                     )
                     lines.append(f"⚠️ دسترسی به برخی سرورها برقرار نشد: {unavailable}")
-            configured_day = self.weekday_label(show.get("release_day"))
-            observed_days = self.observed_release_weekdays(show, state)
-            lines.append(f"📅 روز انتشار تنظیم‌شده: <b>{configured_day}</b>")
-            if observed_days:
-                observed_labels = "، ".join(self.weekday_label(day) for day in observed_days)
-                lines.append(f"📚 روز(های) ثبت‌شده از RSS: <b>{observed_labels}</b>")
-            else:
-                lines.append("📚 روز انتشار ثبت‌شده: هنوز داده کافی وجود ندارد.")
-
-            quality_status = [
-                (
-                    f"✅ {html.escape(quality)}"
-                    if present
-                    else f"❌ {html.escape(quality)} خالی"
-                )
-                for quality, present in status["raw_present"].items()
-            ]
-            if quality_status:
-                lines.append("کیفیت‌ها: " + " | ".join(quality_status))
-            if status["missing_qualities"]:
-                lines.append(
-                    "کیفیت‌های خالی: "
-                    + ", ".join(html.escape(x) for x in status["missing_qualities"])
-                )
-            if "softsub" in [str(x).casefold() for x in status["required_outputs"]]:
-                lines.append("سافت‌ساب: " + ("✅ موجود" if status["softsub"] else "❌ خالی"))
-            if "hardsub" in [str(x).casefold() for x in status["required_outputs"]]:
-                lines.append("هاردساب: " + ("✅ موجود" if status["hardsub"] else "❌ خالی"))
 
                 expected_time = self._expected_release_time(state, show, episode)
                 if not published_in_feed and expected_time:

@@ -41,10 +41,115 @@ class SubtitleService:
                 except Exception:
                     text = raw_bytes.decode("cp1256", errors="replace")
 
-        # حذف تمام کاراکترهای نامرئی BOM و Zero-Width از ابتدای متن که پارسرهای موبایل را خراب می‌کنند
-        text = text.lstrip("\ufeff\u200b\u200e\u200f")
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        # حذف کاراکترهای نامرئی BOM و جهت‌دهی از ابتدای کل فایل
+        text = text.lstrip("\ufeff\u200b\u200e\u200f\u202a\u202b\u202c\u202d\u202e")
+        # استانداردسازی تمام انواع خط جدید (حتی \r\r\n ناشی از باگ ویندوز) به \n خالص
+        text = re.sub(r"\r+\n", "\n", text).replace("\r", "\n")
         return text
+
+    @classmethod
+    def normalize_subtitle_file(cls, sub_path: Path) -> Path:
+        """
+        بازسازی تضمینی زیرنویس به فرمت استاندارد SRT (حذف خطوط خالی اضافه بین شماره، تایم‌کد و متن)
+        """
+        sub_path = Path(sub_path)
+        if not sub_path.exists() or sub_path.suffix.lower() not in cls.SUB_EXTENSIONS:
+            return sub_path
+
+        content = cls.read_subtitle_safe(sub_path)
+        ext_low = sub_path.suffix.lower()
+
+        if ext_low == ".srt" and ("[script info]" in content[:300].lower() or "\ndialogue:" in content.lower()):
+            return cls.convert_ass_to_srt_file(sub_path, sub_path)
+
+        if ext_low == ".srt":
+            content = re.sub(r"^WEBVTT.*?\n+", "", content, flags=re.IGNORECASE | re.DOTALL)
+            raw_lines = content.split("\n")
+
+            clean_blocks = []
+            idx = 0
+            n_lines = len(raw_lines)
+            counter = 1
+
+            while idx < n_lines:
+                # پاک کردن کاراکترهای مخفی RTL/BOM از ابتدای خط برای تشخیص دقیق تایم‌کد و شماره
+                ln = raw_lines[idx].strip().lstrip("\ufeff\u200b\u200e\u200f\u202a\u202b\u202c")
+                std_time = cls._standardize_srt_timestamp_line(ln)
+                if std_time:
+                    idx += 1
+                    # ۱. رد کردن خطوط خالی احتمالی که به اشتباه بین تایم‌کد و متن دیالوگ افتاده‌اند
+                    while idx < n_lines and not raw_lines[idx].strip():
+                        idx += 1
+
+                    text_lines = []
+                    while idx < n_lines:
+                        curr_raw = raw_lines[idx].strip()
+                        curr_clean = curr_raw.lstrip("\ufeff\u200b\u200e\u200f\u202a\u202b\u202c")
+
+                        # ۲. اگر مستقیم به تایم‌کد بعدی رسیدیم، این بلوک تمام شده است
+                        if cls._standardize_srt_timestamp_line(curr_clean):
+                            break
+
+                        # ۳. اگر به شماره بلوک بعدی رسیدیم که بعد از آن (با یا بدون خط خالی) تایم‌کد قرار دارد:
+                        if curr_clean.isdigit():
+                            lookahead = idx + 1
+                            while lookahead < n_lines and not raw_lines[lookahead].strip():
+                                lookahead += 1
+                            if lookahead < n_lines and cls._standardize_srt_timestamp_line(
+                                    raw_lines[lookahead].strip().lstrip("\ufeff\u200b\u200e\u200f\u202a\u202b\u202c")
+                            ):
+                                idx = lookahead  # پرش مستقیم روی تایم‌کد بعدی
+                                break
+
+                        # ۴. اگر خط خالی دیدیم، بررسی کنیم آیا ادامه همین دیالوگ است یا پایان بلوک
+                        if not curr_raw:
+                            lookahead = idx + 1
+                            while lookahead < n_lines and not raw_lines[lookahead].strip():
+                                lookahead += 1
+                            if lookahead >= n_lines:
+                                idx = lookahead
+                                break
+                            next_clean = raw_lines[lookahead].strip().lstrip(
+                                "\ufeff\u200b\u200e\u200f\u202a\u202b\u202c")
+                            # اگر بعد از خط خالی، شماره بلوک بعدی یا تایم‌کد بعدی بود، بلوک فعلی تمام شده
+                            if cls._standardize_srt_timestamp_line(next_clean):
+                                idx = lookahead
+                                break
+                            if next_clean.isdigit():
+                                look2 = lookahead + 1
+                                while look2 < n_lines and not raw_lines[look2].strip():
+                                    look2 += 1
+                                if look2 < n_lines and cls._standardize_srt_timestamp_line(
+                                        raw_lines[look2].strip().lstrip("\ufeff\u200b\u200e\u200f\u202a\u202b\u202c")
+                                ):
+                                    idx = look2
+                                    break
+                            # در غیر این صورت، خط خالی بین دو خط از یک دیالوگ بوده؛ از رویش رد شو
+                            idx += 1
+                            continue
+
+                        cleaned_txt = re.sub(r"\{\\[^}]*\}", "", curr_raw).strip()
+                        if cleaned_txt:
+                            text_lines.append(cleaned_txt)
+                        idx += 1
+
+                    if text_lines:
+                        clean_blocks.append(f"{counter}\r\n{std_time}\r\n" + "\r\n".join(text_lines))
+                        counter += 1
+                else:
+                    idx += 1
+
+            if clean_blocks:
+                final_str = "\r\n\r\n".join(clean_blocks) + "\r\n"
+            else:
+                final_str = content.replace("\n", "\r\n")
+        else:
+            final_str = content.replace("\n", "\r\n")
+
+        with open(sub_path, "wb") as f:
+            f.write(final_str.encode("utf-8"))
+
+        return sub_path
 
     @staticmethod
     def _standardize_srt_timestamp_line(line: str) -> str | None:
@@ -75,74 +180,6 @@ class SubtitleService:
         ms2_pad = (ms2 + "000")[:3]
         return f"{int(h1):02d}:{int(m1):02d}:{int(s1):02d},{ms1_pad} --> {int(h2):02d}:{int(m2):02d}:{int(s2):02d},{ms2_pad}"
 
-    @classmethod
-    def normalize_subtitle_file(cls, sub_path: Path) -> Path:
-        """
-        ذخیره و بازسازی زیرنویس دقیقا مشابه Save As در Notepad ویندوز (UTF-8 بدون BOM + خطوط استاندارد):
-        - اگر محتوای فایل ASS/SSA باشد ولی پسوندش .srt گذاشته شده باشد، خودکار آن را به SRT واقعی تبدیل می‌کند!
-        - تمام تایم‌کدها و شماره‌گذاری‌های SRT را از نو و بدون هیچ کاراکتر مخفی بازنویسی می‌کند تا در تمام اپ‌های موبایل باز شود.
-        """
-        sub_path = Path(sub_path)
-        if not sub_path.exists() or sub_path.suffix.lower() not in cls.SUB_EXTENSIONS:
-            return sub_path
-
-        content = cls.read_subtitle_safe(sub_path)
-        ext_low = sub_path.suffix.lower()
-
-        # اگر فایل پسوند .srt دارد اما محتوای داخل آن فرمت ASS/SSA است ([Script Info] یا Dialogue:)
-        if ext_low == ".srt" and ("[script info]" in content[:300].lower() or "\ndialogue:" in content.lower()):
-            return cls.convert_ass_to_srt_file(sub_path, sub_path)
-
-        if ext_low == ".srt":
-            # حذف هدر WEBVTT در صورتی که زیرنویس استخراجی از نوع VTT بوده باشد
-            content = re.sub(r"^WEBVTT.*?\n\n", "", content, flags=re.IGNORECASE | re.DOTALL)
-            raw_lines = content.split("\n")
-
-            clean_blocks = []
-            idx = 0
-            n_lines = len(raw_lines)
-            counter = 1
-
-            while idx < n_lines:
-                ln = raw_lines[idx].strip()
-                std_time = cls._standardize_srt_timestamp_line(ln)
-                if std_time:
-                    idx += 1
-                    text_lines = []
-                    while idx < n_lines:
-                        curr_ln = raw_lines[idx].strip()
-                        if not curr_ln:
-                            break
-                        # اگر بدون خط خالی به تایم‌کد بعدی رسیدیم یا شماره بلوک بعدی قبل از تایم‌کد بود:
-                        if cls._standardize_srt_timestamp_line(curr_ln):
-                            break
-                        if curr_ln.isdigit() and (idx + 1 < n_lines) and cls._standardize_srt_timestamp_line(
-                                raw_lines[idx + 1]):
-                            break
-                        # پاکسازی تگ‌های استایل ASS سرگردان مثل {\an8}
-                        cleaned_txt = re.sub(r"\{\\[^}]*\}", "", curr_ln).strip()
-                        if cleaned_txt:
-                            text_lines.append(cleaned_txt)
-                        idx += 1
-
-                    if text_lines:
-                        clean_blocks.append(f"{counter}\r\n{std_time}\r\n" + "\r\n".join(text_lines))
-                        counter += 1
-                else:
-                    idx += 1
-
-            if clean_blocks:
-                final_str = "\r\n\r\n".join(clean_blocks) + "\r\n"
-            else:
-                final_str = content.replace("\n", "\r\n")
-        else:
-            final_str = content.replace("\n", "\r\n")
-
-        # ذخیره با UTF-8 خالص (بدون BOM) دقیقاً مشابه Save As پیش‌فرض ویندوز تا در موبایل و دسکتاپ بدون خطا باز شود
-        with open(sub_path, "wb") as f:
-            f.write(final_str.encode("utf-8"))
-
-        return sub_path
 
     normalize_srt_utf8 = normalize_subtitle_file
 
@@ -472,6 +509,8 @@ class SubtitleService:
 
     @classmethod
     def style_srt_bold_yellow(cls, input_srt: Path, output_srt: Path) -> Path:
+        # ابتدا فایل ورودی را استاندارد می‌کنیم تا هیچ خط خالی اضافه‌ای بین شماره و تایم‌کد نباشد
+        cls.normalize_subtitle_file(input_srt)
         content = cls.read_subtitle_safe(input_srt)
         hex_color = cfg.get("subtitle_style", "hex_color", "#fbff00")
 
@@ -481,7 +520,6 @@ class SubtitleService:
         for blocks_item in blocks:
             lines = [line.strip("\r") for line in blocks_item.split("\n") if line.strip()]
             if len(lines) < 3:
-                styled_blocks.append(blocks_item)
                 continue
 
             idx_line = lines[0]
@@ -494,5 +532,5 @@ class SubtitleService:
             styled_text = f'<b><font color="{hex_color}">{joined_text}</font></b>'
             styled_blocks.append(f"{idx_line}\n{time_line}\n{styled_text}")
 
-        output_srt.write_text("\n\n".join(styled_blocks) + "\n", encoding="utf-8-sig")
+        output_srt.write_text("\n\n".join(styled_blocks) + "\n", encoding="utf-8", newline="\n")
         return cls.normalize_subtitle_file(output_srt)
