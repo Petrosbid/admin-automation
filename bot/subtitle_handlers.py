@@ -7,6 +7,8 @@ import shutil
 import uuid
 from pathlib import Path
 from typing import Any
+from unittest.mock import call
+
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardButton
 from aiogram.filters import StateFilter
@@ -1707,6 +1709,16 @@ async def _execute_smart_automation_batch(
     await call.answer("اتوماسیون در صف قرار گرفت؛ گزارش نهایی پس از پایان ارسال می‌شود.")
 
 
+# وضعیت‌هایی که خودشان منتظر دریافت فایل زیرنویس در یک مرحله خاص هستند
+_EXPLICIT_SUB_UPLOAD_STATES = {
+    SubtitleStates.sauto_waiting_fa_sub.state,
+    SubtitleStates.sauto_waiting_en_upload.state,
+    SubtitleStates.waiting_fa_subtitle.state,
+    SubtitleStates.waiting_en_subtitle.state,
+    "MainStates:waiting_target_folder_sub_file",
+}
+
+
 def _incoming_subtitle_episode_tags(sub_files: list[Path], target_dir: Path) -> list[str]:
     fallback_season = AutomationService.extract_season_num_from_dir(target_dir)
     tags = {
@@ -1750,7 +1762,11 @@ def _resolve_incoming_subtitle_target(target_dir: Path, sub_files: list[Path]) -
             if len(local_seasons) == 1:
                 target_dir = local_seasons[0]
 
+    # بار دوم پس از مشخص شدن پوشه فصل، دوباره تگ قسمت را با fallback_season استخراج کن
+    # (تا اگر نام زیرنویس فقط E01 بود، الان به SxxE01 تبدیل شود)
+    ep_tags = _incoming_subtitle_episode_tags(sub_files, target_dir)
     return target_dir.resolve(), ep_tags
+
 
 async def _show_incoming_subtitle_actions(
         call_or_msg: CallbackQuery | Message,
@@ -1771,8 +1787,14 @@ async def _show_incoming_subtitle_actions(
     kb = InlineKeyboardBuilder()
     kb.row(
         InlineKeyboardButton(
-            text="🚀 اجرای اتوماسیون کامل با این زیرنویس",
+            text="🚀 شروع فوری اتوماسیون با این زیرنویس",
             callback_data=f"subfind:auto:{token}",
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="📂 باز کردن این پوشه در پنل اتوماسیون",
+            callback_data=f"subfind:open_dir:{token}",
         )
     )
     kb.row(
@@ -1783,20 +1805,20 @@ async def _show_incoming_subtitle_actions(
     )
     kb.row(
         InlineKeyboardButton(
-            text="📂 انتخاب پوشه دیگری",
+            text="🔍 انتخاب پوشه دیگر از لیست Workspace",
             callback_data=f"subfind:manual:{token}",
         )
     )
     kb.row(InlineKeyboardButton(text="❌ لغو", callback_data=f"subfind:cancel:{token}"))
 
     text = (
-        "✅ <b>مقصد زیرنویس انتخاب شد</b>\n"
+        "✅ <b>پوشه مقصد زیرنویس مشخص شد</b>\n"
         f"🎬 عنوان/پوشه: <b>{html.escape(target_dir.parent.name if AutomationService.SEASON_DIR_REGEX.match(target_dir.name) else target_dir.name)}</b>\n"
         f"📁 دسته‌بندی: <b>{html.escape(category)}</b>\n"
-        f"📂 فصل/مسیر: <code>{html.escape(str(target_dir))}</code>\n"
-        f"🎞 قسمت‌های شناسایی‌شده: <code>{html.escape(', '.join(ep_tags) or 'از روی فایل‌ها قابل تشخیص نبود')}</code>\n"
+        f"📂 مسیر فصل/فیلم: <code>{html.escape(str(target_dir))}</code>\n"
+        f"🎞 قسمت‌های شناسایی‌شده: <code>{html.escape(', '.join(ep_tags) or 'همه قسمت‌های موجود در پوشه')}</code>\n"
         f"📄 تعداد زیرنویس‌ها: <b>{len(sub_files)}</b>\n\n"
-        "عملیات موردنظر را انتخاب کنید. در حالت آپلود، ربات پوشهٔ استاندارد زیرنویس همان فیلم/فصل را روی Workspace و سرور مقصد استفاده می‌کند."
+        "می‌توانید بلافاصله اتوماسیون را شروع کنید یا پوشه را باز کنید:"
     )
 
     if isinstance(call_or_msg, CallbackQuery):
@@ -1814,6 +1836,288 @@ async def _show_incoming_subtitle_actions(
             disable_web_page_preview=True,
         )
 
+
+def _copy_incoming_subs_into_target_srt_folder(target_dir: Path, sub_files: list[Path]) -> list[Path]:
+    """کپی کردن فوری زیرنویس‌های دریافتی به داخل پوشه استاندارد srt مقصد تا در مرورگر پوشه آماده باشند."""
+    category = AutomationService.detect_category_from_path(target_dir)
+    is_series = AutomationService.is_series_season_dir(target_dir) or category in ("Series", "Anime")
+
+    if is_series:
+        srt_fa_dir = (target_dir / "srt") if category == "Anime" else (target_dir / "srt" / "FA")
+        srt_en_dir = (target_dir / "srt") if category == "Anime" else (target_dir / "srt" / "EN")
+    else:
+        srt_fa_dir = target_dir / "srt"
+        srt_en_dir = target_dir / "srt"
+
+    srt_fa_dir.mkdir(parents=True, exist_ok=True)
+    srt_en_dir.mkdir(parents=True, exist_ok=True)
+
+    copied: list[Path] = []
+    for src in sub_files:
+        if not src.exists() or src.suffix.lower() not in SubtitleService.SUB_EXTENSIONS:
+            continue
+        low = src.name.casefold()
+        is_en = low.startswith("en_") or ".en." in low or low.endswith(("_en.srt", "_en.ass", "_en.ssa"))
+        dest_folder = srt_en_dir if (is_en and category != "Anime") else srt_fa_dir
+        dest_path = dest_folder / src.name
+        if src.resolve() != dest_path.resolve():
+            shutil.copy2(src, dest_path)
+        if dest_path.suffix.lower() == ".srt":
+            SubtitleService.normalize_srt_utf8(dest_path)
+        copied.append(dest_path.resolve())
+    return copied
+
+
+@router.callback_query(F.data.startswith("subfind:auto:"))
+async def cb_incoming_subtitle_auto(call: CallbackQuery, state: FSMContext):
+    token = call.data.split(":")[2]
+    info = PENDING_INCOMING_SUBTITLES.pop(token, None)
+    if not info:
+        return await call.answer("این انتخاب منقضی شده است.", show_alert=True)
+    await state.update_data(sauto_incoming_subs=[])
+
+    target_dir = Path(info["target_dir"])
+    subs = [Path(p) for p in info["sub_files"] if Path(p).exists()]
+    target_dir, inferred_eps = _resolve_incoming_subtitle_target(target_dir, subs)
+    eps = list(info.get("episode_tags") or inferred_eps)
+
+    # اگر در نام زیرنویس تگ قسمت نبود، قسمت‌های موجود در پوشه فصل را اسکن کن
+    if not eps:
+        eps = AutomationService.scan_available_episodes_in_season(target_dir)
+
+    plans = await AutomationService.analyze_multi_episodes_plan(target_dir, eps)
+    if not plans:
+        # اگر 아직 ویدئویی در پوشه نیست یا نیاز به بررسی دستی پوشه است، زیرنویس را در پوشه بگذار و پوشه را باز کن!
+        _copy_incoming_subs_into_target_srt_folder(target_dir, subs)
+        await call.answer("📂 زیرنویس در پوشه قرار گرفت؛ پوشه باز شد.", show_alert=False)
+        return await _render_smart_auto_browser(call, state, target_dir, page=0)
+
+    await _init_smart_auto_batch(call, state, target_dir, eps, pre_uploaded_subs=subs)
+
+
+@router.callback_query(F.data.startswith("subfind:open_dir:"))
+async def cb_incoming_subtitle_open_dir(call: CallbackQuery, state: FSMContext):
+    """قرار دادن زیرنویس در پوشه انتخاب‌شده و باز کردن مستقیم همان پوشه در پنل اتوماسیون"""
+    token = call.data.split(":")[2]
+    info = PENDING_INCOMING_SUBTITLES.pop(token, None)
+    if not info:
+        return await call.answer("این انتخاب منقضی شده است.", show_alert=True)
+
+    target_dir = Path(info["target_dir"])
+    subs = [Path(p) for p in info["sub_files"] if Path(p).exists()]
+    target_dir, eps = _resolve_incoming_subtitle_target(target_dir, subs)
+
+    # ساخت ساختار فصل/فیلم و کپی زیرنویس در پوشه srt همان مقصد
+    category = AutomationService.detect_category_from_path(target_dir)
+    if category in ("Series", "Anime") or AutomationService.SEASON_DIR_REGEX.match(target_dir.name):
+        await AutomationService.create_season_structure_from_server(target_dir, category=category)
+    else:
+        AutomationService.create_movie_structure(target_dir)
+
+    placed_subs = _copy_incoming_subs_into_target_srt_folder(target_dir, subs)
+    await state.update_data(
+        sauto_incoming_subs=[str(p) for p in placed_subs],
+        sauto_selected_eps=eps,
+    )
+    await call.answer("📂 پوشه باز شد و زیرنویس در پوشه srt قرار گرفت!")
+    await _render_smart_auto_browser(call, state, target_dir, page=0)
+
+
+@router.callback_query(F.data.startswith("subfind:upload:"))
+async def cb_incoming_subtitle_upload(call: CallbackQuery, state: FSMContext):
+    token = call.data.split(":")[2]
+    info = PENDING_INCOMING_SUBTITLES.pop(token, None)
+    if not info:
+        return await call.answer("این انتخاب منقضی شده است.", show_alert=True)
+    await state.update_data(sauto_incoming_subs=[])
+    await _start_incoming_subtitle_upload_batch(
+        call,
+        Path(info["target_dir"]),
+        [Path(p) for p in info["sub_files"]],
+    )
+
+
+@router.callback_query(F.data.startswith("subfind:manual:"))
+async def cb_incoming_subtitle_manual(call: CallbackQuery, state: FSMContext):
+    token = call.data.split(":")[2]
+    info = PENDING_INCOMING_SUBTITLES.pop(token, None)
+    if not info:
+        return await call.answer("این انتخاب منقضی شده است.", show_alert=True)
+    subs = [Path(p) for p in info["sub_files"]]
+    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
+    await state.update_data(sauto_incoming_subs=[str(p.resolve()) for p in subs])
+    await _render_smart_auto_browser(call, state, workspace, page=0)
+
+
+@router.callback_query(F.data.startswith("subfind:cancel:"))
+async def cb_incoming_subtitle_cancel(call: CallbackQuery, state: FSMContext):
+    token = call.data.split(":")[2]
+    PENDING_INCOMING_SUBTITLES.pop(token, None)
+    await state.update_data(sauto_incoming_subs=[])
+    await call.message.edit_text("⏭ عملیات زیرنویس لغو شد.", reply_markup=main_menu_kb())
+
+
+@router.message(StateFilter("*"), F.document)
+async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSMContext):
+    """
+    دریافت مستقیم فایل زیرنویس در هر وضعیتی (حتی زمانی که قبلاً داخل منوی فایل‌منیجر، دانلود یا اتوماسیون بوده‌اید).
+    فقط اگر ربات در یکی از مراحل صریحِ درخواست آپلود زیرنویس باشد، به این هندلر وارد نمی‌شود.
+    """
+    if not is_admin(message.from_user.id):
+        return
+
+    current_state = await state.get_state()
+    if current_state in _EXPLICIT_SUB_UPLOAD_STATES:
+        return
+
+    fname = message.document.file_name or ""
+    ext_low = Path(fname).suffix.lower()
+    if ext_low not in (".srt", ".ass", ".ssa", ".zip", ".rar", ".7z"):
+        return
+
+    wait_msg = await message.answer(
+        f"🔎 در حال بررسی فایل <code>{html.escape(fname)}</code> و جستجوی پوشه‌های مرتبط در Workspace و سرور...",
+        parse_mode="HTML"
+    )
+
+    temp_dir = Path(cfg.get("paths", "workspace_dir")) / "_incoming_subs" / uuid.uuid4().hex[:8]
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    saved_p = temp_dir / fname
+    await message.bot.download(message.document, destination=saved_p)
+
+    sub_files: list[Path] = []
+    if ext_low in SubtitleService.ARCHIVE_EXTENSIONS:
+        try:
+            extracted = SubtitleService.extract_archive(saved_p, temp_dir, remove_archive=True)
+            sub_files = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
+        except Exception as exc:
+            return await wait_msg.edit_text(f"❌ خطا در اکسترکت فایل فشرده:\n<code>{html.escape(str(exc))}</code>", parse_mode="HTML")
+        if not sub_files:
+            return await wait_msg.edit_text("❌ فایل فشرده اکسترکت شد اما زیرنویسی داخل آن نبود.")
+    else:
+        if ext_low == ".srt":
+            SubtitleService.normalize_srt_utf8(saved_p)
+        sub_files = [saved_p]
+
+    search_references = [fname] + [p.name for p in sub_files[:5]]
+    candidates = []
+    search_errors = []
+    for reference in search_references:
+        try:
+            candidates = await AutomationService.search_media_destination_candidates(reference, limit=7)
+        except Exception as exc:
+            logging.warning("Subtitle destination search failed for %s: %s", reference, exc)
+            search_errors.append(str(exc))
+        if candidates:
+            break
+
+    # اگر از طریق متد جدید کاندیدایی پیدا نشد، از متد لوکال قدیمی هم به عنوان پشتیبان کمک بگیر
+    if not candidates:
+        for reference in search_references:
+            fallback_dir, fallback_eps = AutomationService.find_matching_workspace_folder_for_sub(reference)
+            if fallback_dir and fallback_dir.exists():
+                cat = AutomationService.detect_category_from_path(fallback_dir)
+                candidates.append({
+                    "name": fallback_dir.name,
+                    "label": f"{fallback_dir.parent.name} · {fallback_dir.name}" if AutomationService.SEASON_DIR_REGEX.match(fallback_dir.name) else fallback_dir.name,
+                    "category": cat,
+                    "path": str(fallback_dir.resolve()),
+                    "remote_path": AutomationService.compute_server_remote_dir_for_local_path(fallback_dir),
+                    "score": 1.0,
+                    "exists_local": True,
+                    "episode_tag": fallback_eps[0] if fallback_eps else "",
+                })
+                break
+
+    if candidates:
+        token = uuid.uuid4().hex[:8]
+        PENDING_INCOMING_SUBTITLES[token] = {
+            "sub_files": [str(p.resolve()) for p in sub_files],
+            "candidates": candidates,
+        }
+        kb = InlineKeyboardBuilder()
+        lines = []
+        for idx, candidate in enumerate(candidates):
+            loc_icon = "📂" if candidate.get("exists_local") else "☁️"
+            kb.row(
+                InlineKeyboardButton(
+                    text=f"{loc_icon} {candidate['label'][:42]}",
+                    callback_data=f"subfind:pick:{token}:{idx}",
+                )
+            )
+            lines.append(
+                f"<b>{idx + 1}.</b> {html.escape(candidate['label'])} "
+                f"— <code>{html.escape(candidate['category'])}</code> "
+                f"({'موجود در Workspace' if candidate.get('exists_local') else 'موجود در سرور'})"
+            )
+        kb.row(
+            InlineKeyboardButton(
+                text="📂 پیشنهاد مناسب نبود؛ انتخاب دستی مقصد",
+                callback_data=f"subfind:manual:{token}",
+            )
+        )
+        kb.row(InlineKeyboardButton(text="❌ لغو", callback_data=f"subfind:cancel:{token}"))
+        query = AutomationService.extract_media_title_query(fname)
+        if not query and sub_files:
+            query = AutomationService.extract_media_title_query(sub_files[0].name)
+        return await wait_msg.edit_text(
+            f"🔎 عنوان تشخیص‌داده‌شده از زیرنویس: <b>{html.escape(query or 'نامشخص')}</b>\n"
+            f"📄 تعداد فایل‌های زیرنویس: <b>{len(sub_files)}</b>\n\n"
+            "چند مقصد احتمالی از روی نام زیرنویس و پوشه‌های Workspace/سرور پیدا شد. "
+            "پوشه مورد نظر را انتخاب کنید:\n\n"
+            + "\n".join(lines),
+            reply_markup=kb.as_markup(),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+    token = uuid.uuid4().hex[:8]
+    PENDING_INCOMING_SUBTITLES[token] = {
+        "sub_files": [str(p.resolve()) for p in sub_files],
+        "candidates": [],
+    }
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text="📂 انتخاب دستی مقصد از Workspace",
+            callback_data=f"subfind:manual:{token}",
+        )
+    )
+    kb.row(InlineKeyboardButton(text="❌ لغو", callback_data=f"subfind:cancel:{token}"))
+    error_note = (
+        f"\nجزئیات بررسی: <code>{html.escape(search_errors[-1][:200])}</code>"
+        if search_errors else ""
+    )
+    await wait_msg.edit_text(
+        f"📥 تعداد <b>{len(sub_files)}</b> فایل زیرنویس دریافت شد، اما مقصد مطمئنی از روی نام پیدا نشد."
+        f"{error_note}\n"
+        "می‌توانید پوشه فیلم یا فصل سریال را دستی انتخاب کنید:",
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("subfind:pick:"))
+async def cb_incoming_subtitle_pick(call: CallbackQuery, state: FSMContext):
+    parts = call.data.split(":")
+    if len(parts) != 4:
+        return await call.answer("درخواست نامعتبر است.", show_alert=True)
+    token, idx_text = parts[2], parts[3]
+    info = PENDING_INCOMING_SUBTITLES.pop(token, None)
+    if not info:
+        return await call.answer("این پیشنهاد منقضی شده است.", show_alert=True)
+    try:
+        candidate = info.get("candidates", [])[int(idx_text)]
+    except (IndexError, ValueError, TypeError):
+        return await call.answer("پوشهٔ انتخاب‌شده معتبر نیست.", show_alert=True)
+
+    subs = [Path(p) for p in info["sub_files"] if Path(p).exists()]
+    await _show_incoming_subtitle_actions(
+        call,
+        Path(candidate["path"]),
+        subs,
+        [candidate["episode_tag"]] if candidate.get("episode_tag") else None,
+    )
 
 async def _start_incoming_subtitle_upload_batch(
         call: CallbackQuery,
