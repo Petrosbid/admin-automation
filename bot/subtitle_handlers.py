@@ -1017,7 +1017,43 @@ async def cb_sauto_upload_en_ask(call: CallbackQuery, state: FSMContext):
 async def _process_sauto_en_sub_messages(messages: list[Message], state: FSMContext):
     message = messages[0]
     data = await state.get_data()
-    target_dir = Path(data["sauto_target_dir"])
+    target_dir_value = data.get("sauto_target_dir")
+    if not target_dir_value:
+        logging.error(
+            "Smart automation launch rejected: FSM data is missing sauto_target_dir; "
+            "user_id=%s chat_id=%s state=%s data_keys=%s",
+            call.from_user.id if call.from_user else None,
+            call.message.chat.id if call.message else None,
+            await state.get_state(),
+            sorted(data.keys()),
+        )
+        await call.answer(
+            "اطلاعات مسیر اجرای اتوماسیون منقضی یا ناقص شده است. لطفاً فرایند اتوماسیون را از ابتدا شروع کنید.",
+            show_alert=True,
+        )
+        if call.message:
+            try:
+                await call.message.answer(
+                    "⚠️ اجرای اتوماسیون آغاز نشد؛ اطلاعات پوشه مبدأ در حافظه موقت موجود نیست. "
+                    "برای جلوگیری از پردازش یا آپلود در مسیر اشتباه، عملیات متوقف شد. "
+                    "لطفاً اتوماسیون را دوباره از ابتدا اجرا کنید."
+                )
+            except Exception:
+                logging.exception("Could not notify user about expired smart automation state")
+        return
+
+    target_dir = Path(target_dir_value)
+    if not target_dir.exists() or not target_dir.is_dir():
+        logging.error(
+            "Smart automation launch rejected: target directory is unavailable: %s",
+            target_dir,
+        )
+        await call.answer(
+            "پوشه مبدأ دیگر در دسترس نیست. لطفاً اتوماسیون را از ابتدا اجرا کنید.",
+            show_alert=True,
+        )
+        return
+
     ep_tags = data.get("sauto_ep_tags", [])
     fa_map: dict[str, str] = data.get("sauto_final_fa_map", {})
     en_map: dict[str, str] = data.get("sauto_final_en_map", {})
