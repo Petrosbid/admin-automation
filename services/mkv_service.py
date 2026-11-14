@@ -558,21 +558,44 @@ class MKVService:
                 stderr=asyncio.subprocess.STDOUT
             )
 
+            # Keep the complete mkvmerge output: it contains the actual reason for
+            # exit code 2 (unsupported input, invalid subtitle, inaccessible path, etc.).
+            output_chunks: list[str] = []
             buffer = ""
             while True:
-                chunk = await proc.stdout.read(128)
+                chunk = await proc.stdout.read(4096)
                 if not chunk:
                     break
-                buffer += chunk.decode("utf-8", errors="replace")
+                decoded = chunk.decode("utf-8", errors="replace")
+                output_chunks.append(decoded)
+                buffer += decoded
                 lines = re.split(r"[\r\n]+", buffer)
                 buffer = lines.pop()
                 for line in lines:
                     if "Progress:" in line and progress_callback:
                         progress_callback(line.replace("Progress:", "").strip())
 
+            if buffer.strip() and "Progress:" in buffer and progress_callback:
+                progress_callback(buffer.replace("Progress:", "").strip())
+
             await proc.wait()
+            mkvmerge_output = "".join(output_chunks).strip()
             if proc.returncode not in (0, 1):
-                raise RuntimeError(f"mkvmerge failed with code {proc.returncode}")
+                # Remove incomplete output so a failed task cannot be mistaken for
+                # a successfully generated soft-sub file on a later run.
+                try:
+                    output_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                diagnostic = mkvmerge_output[-8000:] or "(mkvmerge produced no diagnostic output)"
+                raise RuntimeError(
+                    f"mkvmerge failed with code {proc.returncode}. "
+                    f"Input video: {video_path}\n"
+                    f"Persian subtitle: {clean_fa_sub or '(none)'}\n"
+                    f"English subtitle: {clean_en_sub or '(none)'}\n"
+                    f"Output: {output_path}\n"
+                    f"mkvmerge output:\n{diagnostic}"
+                )
 
             return output_path
 
