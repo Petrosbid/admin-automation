@@ -347,20 +347,59 @@ class SiteMonitorService:
         return result
 
     @staticmethod
-    def _is_captcha_page(html: str) -> bool:
-        lower = html.lower()
+    def _captcha_detection_reason(html: str) -> str | None:
+        """
+        Return a reason only for a real challenge document.
+        Do not treat generic Cloudflare scripts/resources or HTTP 403 pages as CAPTCHA.
+        """
+        lower = (html or "").lower()
+        soup = _make_soup(html or "")
+        title = (soup.title.get_text(" ", strip=True).lower() if soup.title else "")
+        body_text = re.sub(r"\\s+", " ", soup.get_text(" ", strip=True).lower())
+
+        # Strong Cloudflare interstitial signals; generic "cf-chl-" resource names
+        # are deliberately excluded because normal pages may load challenge scripts.
+        if title.startswith("just a moment"):
+            return "Cloudflare interstitial title"
+        if any(marker in lower for marker in (
+            'id="challenge-form"',
+            "id='challenge-form'",
+            "cf-chl-widget",
+            "__cf_chl_tk",
+            "cf_chl_opt",
+        )):
+            return "Cloudflare challenge form/token"
         if (
-            "<title>just a moment..." in lower
-            or "cf-browser-verification" in lower
-            or "cf-chl-" in lower
-            or "challenge-platform" in lower
+            ("verify you are human" in body_text or "checking your browser" in body_text
+             or "performing security verification" in body_text)
+            and ("cloudflare" in lower or "challenge" in lower or "security" in body_text)
         ):
-            return True
-        if "verify you are human" in lower and ("cloudflare" in lower or "captcha" in lower):
-            return True
-        if "hcaptcha" in lower and ("challenge" in lower or "verify" in lower):
-            return True
-        return False
+            return "visible browser verification text"
+
+        # hCaptcha must have an actual challenge/verification UI, not merely a script include.
+        has_hcaptcha_frame = bool(soup.select(
+            'iframe[src*="hcaptcha.com"], iframe[title*="hCaptcha" i], '
+            '[data-hcaptcha], .h-captcha'
+        ))
+        if has_hcaptcha_frame and any(
+            phrase in body_text for phrase in ("verify", "select", "challenge", "captcha")
+        ):
+            return "hCaptcha challenge widget"
+
+        # Generic CAPTCHA wording is accepted only when paired with a visible form/widget.
+        has_captcha_widget = bool(soup.select(
+            'iframe[src*="captcha"], [class*="captcha" i], [id*="captcha" i], '
+            'input[name*="captcha" i]'
+        ))
+        if has_captcha_widget and any(
+            phrase in body_text for phrase in ("verify", "captcha", "security check")
+        ):
+            return "CAPTCHA widget in document"
+        return None
+
+    @staticmethod
+    def _is_captcha_page(html: str) -> bool:
+        return SiteMonitorService._captcha_detection_reason(html) is not None
 
     async def _wait_for_manual_captcha(
         self,
@@ -482,11 +521,30 @@ class SiteMonitorService:
                         site_key,
                     )
 
-                if self._is_captcha_page(page_html):
+                captcha_reason = self._captcha_detection_reason(page_html)
+                if captcha_reason:
+                    logging.warning(
+                        "Real CAPTCHA challenge detected for %s: %s (HTTP status=%s, URL=%s)",
+                        site_key,
+                        captcha_reason,
+                        status,
+                        page.url,
+                    )
                     page_html = await self._wait_for_manual_captcha(
                         page,
                         site_key,
                         bot=bot,
+                    )
+                elif status is not None and status >= 400:
+                    title = ""
+                    try:
+                        title = await page.title()
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"سایت {site_key} پاسخ HTTP {status} برگرداند، اما صفحه نشانه معتبر CAPTCHA ندارد. "
+                        f"عنوان صفحه: {title[:120] or 'بدون عنوان'}. "
+                        "این خطا به‌عنوان CAPTCHA در نظر گرفته نشد؛ احتمالاً دسترسی توسط سایت رد شده است."
                     )
 
                 return page_html
