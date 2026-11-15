@@ -355,7 +355,7 @@ class SiteMonitorService:
         lower = (html or "").lower()
         soup = _make_soup(html or "")
         title = (soup.title.get_text(" ", strip=True).lower() if soup.title else "")
-        body_text = re.sub(r"\\s+", " ", soup.get_text(" ", strip=True).lower())
+        body_text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True).lower())
 
         # Strong Cloudflare interstitial signals; generic "cf-chl-" resource names
         # are deliberately excluded because normal pages may load challenge scripts.
