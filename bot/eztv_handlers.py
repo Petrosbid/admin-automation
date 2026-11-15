@@ -13,6 +13,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.config_loader import cfg
 from services.eztv_tracker_service import eztv_tracker_service
+from services.daily_activity_service import DailyActivityService
 
 router = Router()
 
@@ -890,6 +891,27 @@ async def cmd_eztv_report(message: Message):
         logging.exception("Manual EZTV report failed")
         await wait.edit_text(
             "❌ تهیه گزارش با خطا مواجه شد:\n<code>"
+            + html.escape(str(exc)[:1000])
+            + "</code>",
+            parse_mode="HTML",
+        )
+
+@router.message(Command("daily_report", "today_report"))
+async def cmd_daily_activity_report(message: Message):
+    if not _is_admin(message):
+        return
+    wait = await message.answer("📊 در حال جمع‌آوری گزارش جامع عملکرد امروز...")
+    try:
+        report = DailyActivityService.build_report()
+        chunks = _split_html_lines(report)
+        await wait.edit_text(chunks[0], parse_mode="HTML", disable_web_page_preview=True)
+        for chunk in chunks[1:]:
+            await asyncio.sleep(1.1)
+            await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as exc:
+        logging.exception("Daily activity report failed")
+        await wait.edit_text(
+            "❌ تهیه گزارش روزانه ناموفق بود:\\n<code>"
             + html.escape(str(exc)[:1000])
             + "</code>",
             parse_mode="HTML",
