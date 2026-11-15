@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime
+import html
 import importlib.util
 import json
 import logging
@@ -51,6 +52,8 @@ class SiteMonitorService:
         self._browser_lock = asyncio.Lock()
         self._check_lock = asyncio.Lock()
         self._pw_installed = importlib.util.find_spec("playwright") is not None
+        self._browser_start_error: str = ""
+        self._browser_warmup_task: asyncio.Task | None = None
         self._last_error_notified: dict[str, float] = {}
 
     @classmethod
@@ -132,7 +135,8 @@ class SiteMonitorService:
     @property
     def profile_dir(self) -> Path:
         ws = Path(cfg.get("paths", "workspace_dir", "./workspace")).resolve()
-        p_dir = ws / "browser_profile"
+        # Keep Playwright isolated from any regular Chrome profile.
+        p_dir = ws / "browser_profile_playwright"
         p_dir.mkdir(parents=True, exist_ok=True)
         return p_dir
 
@@ -185,16 +189,30 @@ class SiteMonitorService:
                 logging.error(f"Failed to send monitor error alert to {admin_id}: {e}")
 
     async def ensure_real_browser_open(self) -> bool:
-        if not self._pw_installed:
+        """Start the Playwright-managed headed Chromium browser, never silently degrade."""
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            self._pw_installed = False
+            self._browser_start_error = (
+                f"کتابخانه Playwright در همین Python فعال نیست: {type(exc).__name__}: {exc}"
+            )
+            logging.exception("Playwright Python package could not be imported")
             return False
 
+        self._pw_installed = True
         async with self._browser_lock:
             if self._browser_context is not None:
-                return True
-            try:
-                from playwright.async_api import async_playwright
-                self._pw = await async_playwright().start()
+                try:
+                    _ = self._browser_context.pages
+                    return True
+                except Exception:
+                    logging.warning("Previous Playwright browser context is no longer usable.")
+                    self._browser_context = None
+                    self._pages.clear()
 
+            try:
+                self._pw = await async_playwright().start()
                 launch_kwargs = {
                     "user_data_dir": str(self.profile_dir),
                     "headless": False,
@@ -204,72 +222,129 @@ class SiteMonitorService:
                         "--disable-blink-features=AutomationControlled",
                         "--start-maximized",
                         "--disable-http-cache",
+                        "--no-first-run",
+                        "--no-default-browser-check",
                     ],
                 }
-                proxy_url = ProxyManager.get_proxy_url()
-                if proxy_url:
-                    launch_kwargs["proxy"] = {"server": proxy_url}
 
-                try:
-                    self._browser_context = await self._pw.chromium.launch_persistent_context(
-                        channel="chrome", **launch_kwargs
+                # Chromium uses Windows/system proxy by default. Only force the bot's SOCKS
+                # proxy when the explicit monitor.browser_use_proxy setting is enabled.
+                use_proxy = bool(cfg.get("monitor", "browser_use_proxy", False))
+                if use_proxy:
+                    proxy_url = ProxyManager.get_proxy_url()
+                    if proxy_url:
+                        launch_kwargs["proxy"] = {"server": proxy_url}
+                        logging.info("Playwright Chromium will use configured proxy: %s", proxy_url)
+                    else:
+                        logging.warning(
+                            "monitor.browser_use_proxy is true, but no valid app proxy is configured."
+                        )
+                else:
+                    logging.info(
+                        "Playwright Chromium will use Windows/system proxy settings (browser_use_proxy=false)."
                     )
-                except Exception:
-                    self._browser_context = await self._pw.chromium.launch_persistent_context(
-                        **launch_kwargs
-                    )
 
-                sites_cfg = self.get_all_sites_config()
-                for key, info in sites_cfg.items():
-                    if not info["enabled"]:
-                        continue
-                    page = await self._browser_context.new_page()
-                    self._pages[key] = page
-                    try:
-                        await page.goto(info["url"], wait_until="domcontentloaded", timeout=25000)
-                    except Exception as e:
-                        logging.warning(f"Initial navigation warning for {key}: {e}")
+                # Use the bundled Chromium installed via the Playwright CLI.
+                # No channel='chrome' fallback: it used to hide the bundled-browser launch error.
+                self._browser_context = await self._pw.chromium.launch_persistent_context(
+                    **launch_kwargs
+                )
+                self._pages = {}
 
-                logging.info("Real Browser opened for active monitored sites.")
+                # A visible page forces the persistent headed browser window to appear.
+                control_page = await self._browser_context.new_page()
+                self._pages["__control__"] = control_page
+                await control_page.goto("about:blank")
+
+                self._browser_start_error = ""
+                logging.info(
+                    "Playwright headed Chromium started. Profile=%s Executable=%s",
+                    self.profile_dir,
+                    self._pw.chromium.executable_path,
+                )
                 return True
-            except Exception as e:
-                logging.warning(f"Playwright browser could not start: {e}")
-                self._pw_installed = False
+
+            except Exception as exc:
+                self._browser_start_error = f"{type(exc).__name__}: {exc}"
+                logging.exception(
+                    "Could not launch Playwright Chromium. Profile=%s",
+                    self.profile_dir,
+                )
+                self._browser_context = None
+                self._pages.clear()
+                if self._pw is not None:
+                    try:
+                        await self._pw.stop()
+                    except Exception:
+                        logging.debug("Could not stop failed Playwright driver cleanly.", exc_info=True)
+                self._pw = None
                 return False
 
     async def open_captcha_tabs_for_admin(self) -> str:
-        self._pw_installed = importlib.util.find_spec("playwright") is not None
+        """Open all enabled monitor sites in visible Playwright Chromium tabs."""
         sites_cfg = self.get_all_sites_config()
-        active_sites = {k: v for k, v in sites_cfg.items() if v["enabled"]}
+        active_sites = {key: value for key, value in sites_cfg.items() if value["enabled"]}
 
         ok = await self.ensure_real_browser_open()
-        if ok and self._browser_context:
-            for key, info in active_sites.items():
+        if not ok or self._browser_context is None:
+            detail = self._browser_start_error or "خطای نامشخص در راه‌اندازی مرورگر"
+            return (
+                "مرورگر Chromium متعلق به Playwright اجرا نشد.\n\n"
+                f"علت: {detail}\n\n"
+                "در PowerShell و در پوشه پروژه این دستورات را اجرا کنید:\n"
+                "cd C:\\MediaBot\\bot\n"
+                ".\\.venv\\Scripts\\python.exe -m pip install --upgrade playwright\n"
+                ".\\.venv\\Scripts\\python.exe -m playwright install chromium\n"
+                ".\\.venv\\Scripts\\python.exe -c \"from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=False); print(b.version); b.close(); p.stop()\"\n\n"
+                "این بار به‌جای مرورگر معمولی ویندوز، خطای واقعی اجرای Chromium گزارش شده است."
+            )
+
+        opened: list[str] = []
+        failed: list[str] = []
+        for key, info in active_sites.items():
+            try:
                 page = self._pages.get(key)
                 if page is None or page.is_closed():
                     page = await self._browser_context.new_page()
                     self._pages[key] = page
-                try:
-                    await page.goto(info["url"], wait_until="domcontentloaded", timeout=25000)
-                    await page.bring_to_front()
-                except Exception:
-                    pass
-            return (
-                f"✅ پنجره مرورگر روی دسکتاپ ویندوز سرور باز شد و تب‌های `{len(active_sites)}` سایت فعال بارگذاری شدند.\n\n"
-                "🔓 اکنون می‌توانید روی سرور کپچای آن‌ها را حل کنید؛ کوکی‌های حل کپچا ذخیره می‌شوند."
-            )
 
-        for info in active_sites.values():
-            try:
-                webbrowser.open(info["url"])
-            except Exception:
-                pass
-        return (
-            "🌐 صفحات سایت‌های فعال در مرورگر ویندوز سرور باز شدند.\n\n"
-            "💡 برای راه‌اندازی مرورگر خودکار پایتون، دستورات زیر را در ترمینال سرور اجرا کنید:\n"
-            "`pip install playwright`\n"
-            "`playwright install chromium`"
+                try:
+                    await page.goto(
+                        info["url"],
+                        wait_until="domcontentloaded",
+                        timeout=45000,
+                    )
+                except Exception as nav_exc:
+                    # Keep a partially loaded document open for manual inspection.
+                    try:
+                        page_html = await page.content()
+                    except Exception:
+                        page_html = ""
+                    if not page_html.strip() or page.url == "about:blank":
+                        raise nav_exc
+                    logging.warning(
+                        "Playwright navigation warning for %s (%s); keeping tab open.",
+                        key,
+                        nav_exc,
+                    )
+
+                await page.bring_to_front()
+                opened.append(key.upper())
+            except Exception as exc:
+                logging.exception("Could not open Playwright tab for %s", key)
+                failed.append(f"{key.upper()}: {type(exc).__name__}: {str(exc)[:180]}")
+
+        result = (
+            "پنجره Chromium با Playwright باز شد.\n"
+            f"تب‌های بازشده: {', '.join(opened) if opened else 'هیچ‌کدام'}"
         )
+        if failed:
+            result += "\n\nخطا در باز کردن بعضی تب‌ها:\n" + "\n".join(failed)
+        result += (
+            "\n\nاگر CAPTCHA مشاهده می‌کنی، آن را در همین پنجره حل کن. "
+            "کوکی‌ها در پروفایل اختصاصی Playwright ذخیره می‌شوند."
+        )
+        return result
 
     @staticmethod
     def _is_captcha_page(html: str) -> bool:
@@ -354,32 +429,69 @@ class SiteMonitorService:
         base_url = self.get_site_url(site_key)
         fresh_url = _add_cache_buster(base_url)
 
-        if cfg.get("monitor", "use_real_browser", True) and self._pw_installed:
+        use_real_browser = bool(cfg.get("monitor", "use_real_browser", True))
+        if use_real_browser:
             ok = await self.ensure_real_browser_open()
-            if ok and self._browser_context:
-                async with self._browser_lock:
-                    page = self._pages.get(site_key)
-                    if page is None or page.is_closed():
-                        page = await self._browser_context.new_page()
-                        self._pages[site_key] = page
+            if not ok or self._browser_context is None:
+                detail = self._browser_start_error or "دلیل نامشخص"
+                raise RuntimeError(
+                    "Playwright/Chromium در دسترس نیست و چون monitor.use_real_browser فعال است "
+                    "درخواست به cloudscraper واگذار نشد. علت راه‌اندازی مرورگر: " + detail
+                )
 
-                    try:
-                        await page.goto(fresh_url, wait_until="domcontentloaded", timeout=25000)
-                    except Exception:
-                        await page.reload(wait_until="domcontentloaded", timeout=25000)
+            async with self._browser_lock:
+                page = self._pages.get(site_key)
+                if page is None or page.is_closed():
+                    page = await self._browser_context.new_page()
+                    self._pages[site_key] = page
 
-                    await asyncio.sleep(1.5)
-                    html = await page.content()
+                navigation_error = None
+                response = None
+                try:
+                    response = await page.goto(
+                        fresh_url,
+                        wait_until="domcontentloaded",
+                        timeout=45000,
+                    )
+                except Exception as exc:
+                    navigation_error = exc
+                    logging.warning(
+                        "Playwright navigation did not reach DOMContentLoaded for %s: %s",
+                        site_key,
+                        exc,
+                    )
 
-                    if self._is_captcha_page(html):
-                        html = await self._wait_for_manual_captcha(
-                            page,
-                            site_key,
-                            bot=bot,
-                        )
+                await asyncio.sleep(1.5)
+                try:
+                    page_html = await page.content()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Playwright نتوانست HTML صفحه {site_key} را بخواند: {exc}"
+                    ) from exc
 
-                    return html
+                if not page_html.strip() or page.url == "about:blank":
+                    raise RuntimeError(
+                        f"Chromium نتوانست صفحه {site_key} را بارگذاری کند: {navigation_error or 'صفحه خالی است'}"
+                    )
 
+                status = response.status if response is not None else None
+                if status is not None and status >= 400:
+                    logging.warning(
+                        "Playwright received HTTP %s for %s; page remains available for manual inspection.",
+                        status,
+                        site_key,
+                    )
+
+                if self._is_captcha_page(page_html):
+                    page_html = await self._wait_for_manual_captcha(
+                        page,
+                        site_key,
+                        bot=bot,
+                    )
+
+                return page_html
+
+        # Legacy HTTP scraping is used only when explicitly selected in config.yaml.
         def _sync_get():
             scraper = cloudscraper.create_scraper(
                 browser={"browser": "chrome", "platform": "windows", "desktop": True}
@@ -396,10 +508,10 @@ class SiteMonitorService:
             resp.raise_for_status()
             return resp.text
 
-        html = await asyncio.to_thread(_sync_get)
-        if self._is_captcha_page(html):
+        page_html = await asyncio.to_thread(_sync_get)
+        if self._is_captcha_page(page_html):
             raise RuntimeError("سایت با چالش کپچا/کلودفلر مواجه شد.")
-        return html
+        return page_html
 
     @staticmethod
     def _parse_pahe_html(html: str, base_url: str) -> list[dict]:
@@ -870,11 +982,33 @@ class SiteMonitorService:
 
         logging.info("Site monitor loop stopped.")
 
+    async def _warmup_browser(self) -> None:
+        try:
+            ok = await self.ensure_real_browser_open()
+            if ok:
+                logging.info(
+                    "Monitor browser warmup complete; headed Chromium is open and ready for site tabs."
+                )
+            else:
+                logging.error(
+                    "Monitor browser warmup failed. Use /monitor_browser for diagnostics. Cause: %s",
+                    self._browser_start_error or "unknown",
+                )
+        except Exception:
+            logging.exception("Unexpected Playwright browser warmup error")
+
     def start(self, bot: Bot):
         self._running = True
         if self._task is not None and not self._task.done():
             logging.info("Site Monitor is already running; duplicate start ignored.")
             return
+
+        if bool(cfg.get("monitor", "use_real_browser", True)):
+            if self._browser_warmup_task is None or self._browser_warmup_task.done():
+                self._browser_warmup_task = asyncio.create_task(
+                    self._warmup_browser(),
+                    name="monitor-playwright-warmup",
+                )
 
         self._task = asyncio.create_task(
             self._loop(bot),

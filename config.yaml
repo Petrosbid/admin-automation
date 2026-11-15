@@ -17,6 +17,7 @@ monitor:
   enabled: true
   interval_seconds: 300    # هر ۵ دقیقه (۳۰۰ ثانیه)
   use_real_browser: true
+  browser_use_proxy: false   # false: تنظیمات پروکسی ویندوز/Chrome؛ true: استفاده از proxy.url ربات
   captcha_wait_seconds: 300  # مدت انتظار برای حل دستی CAPTCHA در مرورگر Playwright
   sites:
     pahe:

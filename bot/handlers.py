@@ -366,6 +366,24 @@ async def cb_monitor_toggle(call: CallbackQuery):
     await cb_monitor_menu(call)
 
 
+@router.message(Command("monitor_browser"))
+async def cmd_monitor_browser(message: Message):
+    """Launch headed Playwright Chromium and open all enabled monitor sites."""
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    wait = await message.answer("در حال راه‌اندازی Chromium با Playwright...")
+    try:
+        result = await monitor_service.open_captcha_tabs_for_admin()
+        await wait.edit_text(result, disable_web_page_preview=True)
+    except Exception as exc:
+        import logging
+        logging.exception("Manual monitor browser launch failed")
+        await wait.edit_text(
+            "راه‌اندازی مرورگر ناموفق بود:\n" + str(exc)[:1200],
+            disable_web_page_preview=True,
+        )
+
+
 @router.callback_query(F.data == "mon:open_captcha")
 async def cb_monitor_open_captcha(call: CallbackQuery):
     await call.message.edit_text(
@@ -374,7 +392,7 @@ async def cb_monitor_open_captcha(call: CallbackQuery):
     )
     msg = await monitor_service.open_captcha_tabs_for_admin()
     enabled = bool(cfg.get("monitor", "enabled", True))
-    await call.message.edit_text(msg, reply_markup=monitor_menu_kb(enabled), parse_mode="Markdown")
+    await call.message.edit_text(msg, reply_markup=monitor_menu_kb(enabled))
 
 
 @router.callback_query(F.data == "mon:check_now")
