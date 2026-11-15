@@ -880,7 +880,8 @@ class EZTVTrackerService:
             for show in shows:
                 episode = self._episode_progress(show, state)
                 expected_tag = self._episode_tag(show["season"], episode)
-                season_dir = await self._prepare_season(show, episode)
+                season_dir = self._show_folder(show, episode)
+                season_prepared = False
 
                 for release in releases:
                     release_id = str(release["id"])
@@ -896,6 +897,16 @@ class EZTVTrackerService:
                     ]
                     if not matching_qualities:
                         continue
+
+                    # Ignore non-torrent feed links; create the local series structure only
+                    # after a real magnet or .torrent release has been found.
+                    release_link = str(release.get("link", "") or "").strip()
+                    if not DownloaderService.is_torrent_target(release_link):
+                        continue
+
+                    if not season_prepared:
+                        season_dir = await self._prepare_season(show, episode)
+                        season_prepared = True
 
                     self._record_release_time(
                         state, show, episode, release.get("published_at")
@@ -1050,7 +1061,6 @@ class EZTVTrackerService:
         season_dir: Path | None = None,
     ) -> dict[str, Any]:
         season_dir = season_dir or self._show_folder(show, episode)
-        season_dir.mkdir(parents=True, exist_ok=True)
 
         remote_root = AutomationService.compute_server_remote_dir_for_local_path(season_dir)
         remote_root_info = await self._inspect_remote_directory(remote_root)
@@ -1063,17 +1073,27 @@ class EZTVTrackerService:
             child.name.casefold(): child.name
             for child in season_dir.iterdir()
             if child.is_dir()
-        }
+        } if season_dir.is_dir() else {}
 
+        # Show only configured alternatives that physically exist locally/on the server.
+        # If none exists yet, keep one canonical expected folder instead of listing every
+        # mutually exclusive option (e.g. both 480p-RMTeam and 480p-EBTV).
+        actual_name_map = {**remote_name_map, **local_name_map}
         configured_candidates: dict[str, list[str]] = {}
         candidate_names: dict[str, str] = {}
         for quality in show["qualities"]:
             names = self._quality_folder_candidates(show, quality)
-            configured_candidates[quality] = names
-            for name in names:
+            existing_names = [
+                actual_name_map[name.casefold()]
+                for name in names
+                if name.casefold() in actual_name_map
+            ]
+            selected_names = existing_names or names[:1]
+            configured_candidates[quality] = selected_names
+            for name in selected_names:
                 candidate_names.setdefault(name.casefold(), name)
 
-        for folded, name in {**local_name_map, **remote_name_map}.items():
+        for folded, name in actual_name_map.items():
             if self._is_quality_folder_name(name):
                 candidate_names.setdefault(folded, name)
 
@@ -1224,7 +1244,7 @@ class EZTVTrackerService:
             for episode in today_episodes:
                 activity_count += 1
                 tag = self._episode_tag(show["season"], episode)
-                season_dir = await self._prepare_season(show, episode)
+                season_dir = self._show_folder(show, episode)
                 status = await self._episode_status(show, episode, season_dir)
 
                 scheduled_keys = [

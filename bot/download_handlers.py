@@ -72,6 +72,15 @@ def _extract_batch_links(raw_text: str) -> list[str]:
 # خط لوله هوشمند پس از دانلود (Post-Download Smart Pipeline)
 # ==============================================================================
 
+def _is_480p_download(dest_dir: Path, video_path: Path) -> bool:
+    """Return True when the downloaded file belongs to a 480p quality folder/release."""
+    candidates = [Path(dest_dir).name, Path(video_path).name]
+    return any(
+        bool(re.search(r"(?<!\d)480p(?!\d)", value, flags=re.IGNORECASE))
+        for value in candidates
+    )
+
+
 def _resolve_series_or_movie_context(dest_dir: Path) -> tuple[bool, Path, str]:
     """
     تشخیص اینکه پوشه دانلود مربوط به فصل سریال است یا فیلم سینمایی:
@@ -347,6 +356,14 @@ async def _smart_download_pipeline_job(
     auto_upload_cfg = bool(cfg.get("cuteftp", "auto_upload_after_download", True))
 
     for vid in new_videos:
+        if _is_480p_download(dest_dir, vid):
+            if progress_callback:
+                progress_callback("در حال بررسی کدک صدا در فایل 480p...")
+            vid = await MKVService.convert_eac3_audio_to_aac(
+                vid,
+                progress_callback=progress_callback,
+            )
+
         ep_tag = AutomationService.extract_episode_tag(
             vid.name,
             fallback_season=AutomationService.extract_season_num_from_dir(season_or_movie_dir),
@@ -2280,7 +2297,7 @@ async def cb_link_cancel(call: CallbackQuery):
     await call.message.edit_text("⏭ عملیات لینک لغو شد.", reply_markup=main_menu_kb())
 
 
-@router.message(StateFilter(None), F.document)
+@router.message(StateFilter(None), F.document.file_name.regexp(r"(?i)\.torrent$"))
 async def receive_download_torrent(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
