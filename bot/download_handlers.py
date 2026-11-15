@@ -321,6 +321,23 @@ async def _smart_download_pipeline_job(
 
             shutil.move(str(source_video), str(target_video))
             new_videos.append(target_video.resolve())
+            try:
+                quality_folder = dest_dir.name
+                is_quality_folder = bool(
+                    re.search(
+                        r"(?i)(?<!\\d)(?:2160p|1080p|720p|480p|360p|240p|fullhd)(?!\\d)",
+                        quality_folder,
+                    )
+                )
+                from services.daily_activity_service import DailyActivityService
+                DailyActivityService.record_media_file(
+                    "quality_added" if is_quality_folder else "download_completed",
+                    target_video,
+                    source="EZTV" if automated_background else "Manual",
+                    quality_folder=quality_folder,
+                )
+            except Exception:
+                logging.exception("Could not record downloaded media file")
 
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)

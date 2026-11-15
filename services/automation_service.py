@@ -1460,6 +1460,16 @@ class AutomationService:
             sync_offset_ms=0,
             progress_callback=progress_callback
         )
+        if res_path.exists():
+            try:
+                from services.daily_activity_service import DailyActivityService
+                DailyActivityService.record_media_file(
+                    "softsub_created",
+                    res_path,
+                    source=raw_video.name,
+                )
+            except Exception:
+                logging.exception("Could not record SoftSub output")
         if auto_upload and res_path.exists():
             remote_dir = cls.compute_server_remote_dir_for_local_path(res_path)
             await queue_engine.add_task(
@@ -1516,6 +1526,17 @@ class AutomationService:
                 progress_callback=progress_callback
             )
 
+        if res_path.exists():
+            try:
+                from services.daily_activity_service import DailyActivityService
+                DailyActivityService.record_media_file(
+                    "hardsub_created",
+                    res_path,
+                    source=ht.source_video.name,
+                    mode=ht.mode,
+                )
+            except Exception:
+                logging.exception("Could not record HardSub output")
         if auto_upload and res_path.exists():
             remote_dir = cls.compute_server_remote_dir_for_local_path(res_path)
             await queue_engine.add_task(

@@ -26,6 +26,15 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 _MESSAGE_EDIT_CACHE: dict[tuple[int, int], tuple[float, str]] = {}
 
 
+def _record_daily_activity(event: str, **details):
+    try:
+        from services.daily_activity_service import DailyActivityService
+        DailyActivityService.record(event, **details)
+    except Exception:
+        logging.exception("Could not record queue activity event %s", event)
+
+
+
 async def safe_throttled_edit_text(
     msg: Message,
     new_text: str,
@@ -238,6 +247,12 @@ class QueueManager:
             batch_id=effective_batch_id,
         )
         self.tasks[task_id] = task
+        _record_daily_activity(
+            "task_queued",
+            task_id=task.task_id,
+            queue_type=task.queue_type,
+            title=task.title,
+        )
 
         async with self._locks[queue_type]:
             if priority_top:
@@ -635,6 +650,21 @@ class QueueManager:
                 task.status = "✅ تکمیل شد"
                 task.progress = "100%"
                 task.is_finished = True
+                result_path = str(res) if isinstance(res, (str, Path)) else ""
+                _record_daily_activity(
+                    "task_completed",
+                    task_id=task.task_id,
+                    queue_type=task.queue_type,
+                    title=task.title,
+                    result=result_path,
+                )
+                if task.queue_type == "upload":
+                    _record_daily_activity(
+                        "upload_completed",
+                        task_id=task.task_id,
+                        title=task.title,
+                        result=result_path,
+                    )
 
                 if task_notify_completion:
                     await self._send_completion_notification(task, res)
@@ -644,6 +674,12 @@ class QueueManager:
                 task.status = "🛑 لغو شد"
                 task.progress = "متوقف شده توسط کاربر"
                 task.is_finished = True
+                _record_daily_activity(
+                    "task_cancelled",
+                    task_id=task.task_id,
+                    queue_type=task.queue_type,
+                    title=task.title,
+                )
             except Exception as e:
                 if getattr(e, "requires_server_selection", False):
                     server_choices = list(getattr(e, "servers", []) or [])
@@ -688,6 +724,13 @@ class QueueManager:
                 task.status = "❌ خطا"
                 task.progress = "متوقف شده به دلیل خطا"
                 task.is_finished = True
+                _record_daily_activity(
+                    "task_failed",
+                    task_id=task.task_id,
+                    queue_type=task.queue_type,
+                    title=task.title,
+                    error=str(e)[:700],
+                )
                 if task_notify_completion:
                     await self._notify_admins(
                         f"❌ <b>خطا در پردازش!</b>\n"
