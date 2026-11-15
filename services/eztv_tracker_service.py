@@ -815,6 +815,19 @@ class EZTVTrackerService:
             self._episode_tag(show["season"], episode),
             notify_completion=False,
         )
+        try:
+            from services.daily_activity_service import DailyActivityService
+            DailyActivityService.record(
+                "eztv_release_queued",
+                media_title=show["title"],
+                category=show["category"],
+                episode=self._episode_tag(show["season"], episode),
+                quality=quality,
+                task_id=queue_task.task_id,
+                release_title=release.get("title", ""),
+            )
+        except Exception:
+            logging.exception("Could not record EZTV release queue event")
         scheduled[key] = {
             "task_id": queue_task.task_id,
             "release_id": release["id"],
