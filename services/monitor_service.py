@@ -274,11 +274,81 @@ class SiteMonitorService:
     @staticmethod
     def _is_captcha_page(html: str) -> bool:
         lower = html.lower()
-        if "<title>just a moment..." in lower or "cf-browser-verification" in lower:
+        if (
+            "<title>just a moment..." in lower
+            or "cf-browser-verification" in lower
+            or "cf-chl-" in lower
+            or "challenge-platform" in lower
+        ):
             return True
-        if "verify you are human" in lower and "cloudflare" in lower:
+        if "verify you are human" in lower and ("cloudflare" in lower or "captcha" in lower):
+            return True
+        if "hcaptcha" in lower and ("challenge" in lower or "verify" in lower):
             return True
         return False
+
+    async def _wait_for_manual_captcha(
+        self,
+        page,
+        site_key: str,
+        bot: Bot | None = None,
+    ) -> str:
+        try:
+            wait_seconds = int(cfg.get("monitor", "captcha_wait_seconds", 300) or 300)
+        except (TypeError, ValueError):
+            wait_seconds = 300
+        wait_seconds = max(60, min(wait_seconds, 1800))
+
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+
+        notice = (
+            f"🔐 <b>کپچا در مانیتورینگ {site_key.upper()} شناسایی شد.</b>\\n"
+            f"مرورگر Playwright باز و فعال است. کپچا را روی دسکتاپ ویندوز سرور حل کنید.\\n"
+            f"ربات تا <b>{wait_seconds // 60} دقیقه</b> منتظر می‌ماند و سپس صفحه را می‌خواند."
+        )
+        if bot:
+            for admin_id in cfg.get("telegram", "admin_ids", []) or []:
+                try:
+                    await bot.send_message(
+                        chat_id=int(admin_id),
+                        text=notice,
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    logging.exception("Could not send CAPTCHA notice to admin %s", admin_id)
+
+        logging.warning(
+            "CAPTCHA detected for %s; waiting up to %s seconds for manual completion in Playwright.",
+            site_key,
+            wait_seconds,
+        )
+        deadline = asyncio.get_running_loop().time() + wait_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            if page.is_closed():
+                raise RuntimeError(
+                    f"تب مرورگر {site_key} بسته شد؛ از پنل مانیتورینگ تب CAPTCHA را دوباره باز کنید."
+                )
+            await asyncio.sleep(3)
+            html = await page.content()
+            if not self._is_captcha_page(html):
+                await asyncio.sleep(2)
+                html = await page.content()
+                if not self._is_captcha_page(html):
+                    logging.info("Manual CAPTCHA challenge solved for %s.", site_key)
+                    return html
+            else:
+                try:
+                    await page.bring_to_front()
+                except Exception:
+                    pass
+
+        raise RuntimeError(
+            f"CAPTCHA سایت {site_key} در مهلت {wait_seconds} ثانیه‌ای حل نشد. "
+            "از پنل مانیتورینگ تب‌های CAPTCHA را باز کنید و دوباره بررسی کنید."
+        )
 
     async def _get_site_html(self, site_key: str, bot: Bot | None = None) -> str:
         base_url = self.get_site_url(site_key)
@@ -302,14 +372,11 @@ class SiteMonitorService:
                     html = await page.content()
 
                     if self._is_captcha_page(html):
-                        await page.bring_to_front()
-                        for _ in range(4):
-                            await asyncio.sleep(3)
-                            html = await page.content()
-                            if not self._is_captcha_page(html):
-                                break
-                        if self._is_captcha_page(html):
-                            raise RuntimeError("صفحه درگیر کپچای کلودفلر است و نیاز به حل دستی روی سرور دارد.")
+                        html = await self._wait_for_manual_captcha(
+                            page,
+                            site_key,
+                            bot=bot,
+                        )
 
                     return html
 
@@ -597,7 +664,15 @@ class SiteMonitorService:
 
     async def fetch_site_posts(self, site_key: str, bot: Bot | None = None) -> list[dict]:
         base_url = self.get_site_url(site_key)
-        html = await asyncio.wait_for(self._get_site_html(site_key, bot=bot), timeout=40.0)
+        try:
+            captcha_wait = int(cfg.get("monitor", "captcha_wait_seconds", 300) or 300)
+        except (TypeError, ValueError):
+            captcha_wait = 300
+        fetch_timeout = max(60, min(captcha_wait, 1800) + 45)
+        html = await asyncio.wait_for(
+            self._get_site_html(site_key, bot=bot),
+            timeout=fetch_timeout,
+        )
         if site_key == "pahe":
             posts = self._parse_pahe_html(html, base_url)
         elif site_key == "psa":
@@ -685,6 +760,15 @@ class SiteMonitorService:
                     continue
                 try:
                     posts = await self.fetch_site_posts(site_key, bot=bot)
+                    try:
+                        from services.daily_activity_service import DailyActivityService
+                        DailyActivityService.record(
+                            "monitor_checked",
+                            site=site_key,
+                            posts_scanned=len(posts),
+                        )
+                    except Exception:
+                        logging.exception("Could not record monitor check")
                     seen_list = state.get(site_key, [])
                     seen_ids = set(seen_list)
                     # تطبیق شناسه‌های قدیمی که با کل URL ذخیره شده بودند با شناسه‌های جدید مبتنی بر Path
@@ -707,6 +791,16 @@ class SiteMonitorService:
                         if new_posts:
                             logging.info(f"🎉 [MONITOR] سایت {site_key}: تعداد {len(new_posts)} محتوای جدید پیدا شد!")
                             for post in new_posts:
+                                try:
+                                    from services.daily_activity_service import DailyActivityService
+                                    DailyActivityService.record(
+                                        "monitor_post_found",
+                                        site=site_key,
+                                        title=post.get("title", ""),
+                                        url=post.get("url", ""),
+                                    )
+                                except Exception:
+                                    logging.exception("Could not record monitored post")
                                 await self.send_post_notification(bot, post)
                                 state.setdefault(site_key, []).append(post["id"])
                                 new_counts[site_key] += 1
@@ -717,6 +811,15 @@ class SiteMonitorService:
 
                 except Exception as e:
                     logging.warning(f"⚠️ [MONITOR ERROR] خطا در بررسی سایت {site_key}: {e}")
+                    try:
+                        from services.daily_activity_service import DailyActivityService
+                        DailyActivityService.record(
+                            "monitor_error",
+                            site=site_key,
+                            error=str(e)[:700],
+                        )
+                    except Exception:
+                        logging.exception("Could not record monitor error")
                     await self.send_error_notification(bot, site_key, str(e), force=notify_on_first_seed)
 
             return new_counts
