@@ -35,6 +35,7 @@ from bot.keyboards import (
 )
 
 router = Router()
+incoming_subtitle_router = Router()
 
 # نگه‌داشتن reference تسک‌های مانیتور تا زمان پایان آن‌ها.
 _ACTIVE_AUTOMATION_MONITORS: set[asyncio.Task] = set()
@@ -1969,7 +1970,7 @@ async def cb_incoming_subtitle_cancel(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("⏭ عملیات زیرنویس لغو شد.", reply_markup=main_menu_kb())
 
 
-@router.message(StateFilter("*"), F.document.file_name.regexp(r"(?i)\.(?:srt|ass|ssa|zip|rar|7z)$"))
+@incoming_subtitle_router.message(F.document)
 async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSMContext):
     """
     دریافت مستقیم فایل زیرنویس در هر وضعیتی (حتی زمانی که قبلاً داخل منوی فایل‌منیجر، دانلود یا اتوماسیون بوده‌اید).
@@ -1985,7 +1986,19 @@ async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSM
     fname = message.document.file_name or ""
     ext_low = Path(fname).suffix.lower()
     if ext_low not in (".srt", ".ass", ".ssa", ".zip", ".rar", ".7z"):
+        logging.info(
+            "Incoming document ignored by subtitle matcher: user_id=%s file_name=%r mime_type=%r",
+            message.from_user.id if message.from_user else None,
+            fname,
+            message.document.mime_type,
+        )
         return
+
+    logging.info(
+        "Incoming subtitle received for destination matching: user_id=%s file_name=%r state=direct",
+        message.from_user.id,
+        fname,
+    )
 
     wait_msg = await message.answer(
         f"🔎 در حال بررسی فایل <code>{html.escape(fname)}</code> و جستجوی پوشه‌های مرتبط در Workspace و سرور...",
@@ -1995,7 +2008,14 @@ async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSM
     temp_dir = Path(cfg.get("paths", "workspace_dir")) / "_incoming_subs" / uuid.uuid4().hex[:8]
     temp_dir.mkdir(parents=True, exist_ok=True)
     saved_p = temp_dir / fname
-    await message.bot.download(message.document, destination=saved_p)
+    try:
+        await message.bot.download(message.document, destination=saved_p)
+    except Exception as exc:
+        logging.exception("Could not download incoming subtitle document %s", fname)
+        return await wait_msg.edit_text(
+            f"❌ دریافت فایل از تلگرام ناموفق بود: <code>{html.escape(str(exc)[:500])}</code>",
+            parse_mode="HTML",
+        )
 
     sub_files: list[Path] = []
     if ext_low in SubtitleService.ARCHIVE_EXTENSIONS:
