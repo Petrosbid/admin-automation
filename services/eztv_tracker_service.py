@@ -270,6 +270,15 @@ class EZTVTrackerService:
                 "aliases": [str(x).strip() for x in raw.get("aliases", []) if str(x).strip()]
                     if isinstance(raw.get("aliases", []), list) else [],
                 "release_day": str(raw.get("release_day", "") or "").strip().title(),
+                "release_days": list(dict.fromkeys(
+                    str(day).strip().title()
+                    for day in (
+                        raw.get("release_days")
+                        if isinstance(raw.get("release_days"), list)
+                        else ([raw.get("release_day")] if raw.get("release_day") else [])
+                    )
+                    if str(day).strip().title() in self.WEEKDAY_LABELS
+                )),
                 "quality_folders": dict(raw.get("quality_folders", {}))
                     if isinstance(raw.get("quality_folders", {}), dict) else {},
             })
@@ -473,6 +482,7 @@ class EZTVTrackerService:
         if config_anchor != configured_episode:
             item["next_episode"] = configured_episode
             item["config_next_episode"] = configured_episode
+            item["completed_episodes"] = []
 
         try:
             current = int(item.get("next_episode", configured_episode))
@@ -878,19 +888,28 @@ class EZTVTrackerService:
             current_time = datetime.now(timezone.utc)
 
             for show in shows:
-                episode = self._episode_progress(show, state)
-                expected_tag = self._episode_tag(show["season"], episode)
-                season_dir = self._show_folder(show, episode)
+                first_expected_episode = self._episode_progress(show, state)
+                season_dir = self._show_folder(show, first_expected_episode)
                 season_prepared = False
+                candidate_episodes: set[int] = {first_expected_episode}
 
+                # Process every matching RSS release at/after the configured episode.
+                # Release weekdays are informational only: releases can appear on several
+                # days, and several episode entries can appear in a single poll.
                 for release in releases:
                     release_id = str(release["id"])
                     parsed_episode = self._release_episode(release["title"])
-                    if parsed_episode != (show["season"], episode):
+                    if (
+                        parsed_episode is None
+                        or parsed_episode[0] != show["season"]
+                        or parsed_episode[1] < first_expected_episode
+                    ):
                         continue
                     if not self._matches_show(release["title"], show):
                         continue
 
+                    release_episode = parsed_episode[1]
+                    release_tag = self._episode_tag(show["season"], release_episode)
                     matching_qualities = [
                         quality for quality in show["qualities"]
                         if self._quality_matches(release["title"], quality)
@@ -898,23 +917,26 @@ class EZTVTrackerService:
                     if not matching_qualities:
                         continue
 
-                    # Ignore non-torrent feed links; create the local series structure only
-                    # after a real magnet or .torrent release has been found.
                     release_link = str(release.get("link", "") or "").strip()
                     if not DownloaderService.is_torrent_target(release_link):
                         continue
 
                     if not season_prepared:
-                        season_dir = await self._prepare_season(show, episode)
+                        season_dir = await self._prepare_season(show, release_episode)
                         season_prepared = True
+                    candidate_episodes.add(release_episode)
 
                     self._record_release_time(
-                        state, show, episode, release.get("published_at")
+                        state, show, release_episode, release.get("published_at")
                     )
                     rss_matches = state.setdefault("rss_matches", {})
-                    episode_history_key = self._release_history_key(show, episode)
+                    episode_history_key = self._release_history_key(show, release_episode)
                     rss_matches.setdefault(episode_history_key, {
                         "first_seen_at": current_time.isoformat(),
+                        "published_at": (
+                            release.get("published_at").isoformat()
+                            if release.get("published_at") else ""
+                        ),
                         "release_id": release_id,
                         "release_title": release["title"],
                     })
@@ -923,7 +945,7 @@ class EZTVTrackerService:
                             show, season_dir, quality
                         )
                         local_files, remote_files, _ = await self._episode_folder_presence(
-                            destination, show["season"], episode
+                            destination, show["season"], release_episode
                         )
                         if local_files or remote_files:
                             location = (
@@ -933,7 +955,7 @@ class EZTVTrackerService:
                                 if local_files
                                 else "سرور مقصد"
                             )
-                            note = f"{show['title']} {expected_tag} {quality}: موجود ({location})"
+                            note = f"{show['title']} {release_tag} {quality}: موجود ({location})"
                             if local_files:
                                 already_local.append(note)
                             if remote_files:
@@ -943,7 +965,7 @@ class EZTVTrackerService:
                         task_id = await self._queue_release(
                             bot,
                             show,
-                            episode,
+                            release_episode,
                             quality,
                             release,
                             destination,
@@ -952,7 +974,7 @@ class EZTVTrackerService:
                         if task_id:
                             queued.append({
                                 "show": show["title"],
-                                "episode": expected_tag,
+                                "episode": release_tag,
                                 "quality": quality,
                                 "task_id": task_id,
                             })
@@ -960,15 +982,32 @@ class EZTVTrackerService:
                         seen_ids.add(release_id)
                         added_ids.append(release_id)
 
-                report = await self._episode_status(show, episode, season_dir)
-                if report["complete"]:
-                    state.setdefault("progress", {}).setdefault(
-                        self._show_state_key(show), {}
-                    )["next_episode"] = episode + 1
-                    for quality in show["qualities"]:
-                        state.setdefault("scheduled_tasks", {}).pop(
-                            self._scheduled_key(show, episode, quality), None
-                        )
+                progress_item = state.setdefault("progress", {}).setdefault(
+                    self._show_state_key(show), {}
+                )
+                completed_episodes = {
+                    int(value)
+                    for value in progress_item.get("completed_episodes", [])
+                    if str(value).isdigit()
+                }
+                for candidate_episode in sorted(candidate_episodes):
+                    episode_status = await self._episode_status(
+                        show, candidate_episode, season_dir
+                    )
+                    if episode_status["complete"]:
+                        completed_episodes.add(candidate_episode)
+                        for quality in show["qualities"]:
+                            state.setdefault("scheduled_tasks", {}).pop(
+                                self._scheduled_key(show, candidate_episode, quality), None
+                            )
+                    else:
+                        completed_episodes.discard(candidate_episode)
+
+                next_episode = first_expected_episode
+                while next_episode in completed_episodes:
+                    next_episode += 1
+                progress_item["completed_episodes"] = sorted(completed_episodes)[-250:]
+                progress_item["next_episode"] = next_episode
 
             state["seen_item_ids"] = list(seen_ids)[-self.MAX_SEEN_IDS:]
             state["last_feed_check"] = current_time.isoformat()

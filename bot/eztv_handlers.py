@@ -239,7 +239,7 @@ async def _render_detail(target: Message, index: int, edit: bool = True):
         f"قسمت بعدی: <code>{episode_tag}</code>\n"
         f"نام‌های جایگزین: {html.escape(aliases_text)}\n"
         f"کیفیت‌ها: <b>{html.escape(_quality_text(show.get('qualities', [])))}</b>\n"
-        f"روز انتشار تنظیم‌شده: <b>{html.escape(_day_text(show.get('release_day')))}</b>\n"
+        f"روزهای انتشار تنظیم‌شده: <b>{html.escape('، '.join(_day_text(day) for day in (show.get('release_days') or ([show.get('release_day')] if show.get('release_day') else []))) or 'نامشخص / متغیر')}</b>\n"
         f"روزهای ثبت‌شده از RSS: <b>{html.escape(observed_text)}</b>\n"
         f"پوشه‌های مقصد:\n<code>{html.escape(_folder_text(folders))}</code>"
     )
@@ -390,20 +390,27 @@ async def _prompt_folders(target: Message, state: FSMContext):
     await target.answer("\n".join(lines), parse_mode="HTML", reply_markup=_cancel_keyboard())
 
 
-def _release_day_keyboard(current: str | None):
+def _release_day_keyboard(current: list[str] | str | None):
+    if isinstance(current, str):
+        selected = {current} if current else set()
+    else:
+        selected = {str(item) for item in (current or []) if str(item)}
     builder = InlineKeyboardBuilder()
-    for index in range(0, len(DAY_OPTIONS), 2):
+    for index in range(0, 7, 2):
         row = []
         for day, label in DAY_OPTIONS[index:index + 2]:
-            mark = "✅ " if (day or "") == (current or "") else ""
-            value = day or "Unknown"
+            mark = "✅ " if day in selected else "⬜ "
             row.append(
                 InlineKeyboardButton(
                     text=mark + label,
-                    callback_data=f"eztv:day:{value}",
+                    callback_data=f"eztv:daytoggle:{day}",
                 )
             )
         builder.row(*row)
+    builder.row(
+        InlineKeyboardButton(text="🗓 نامشخص / هر روز", callback_data="eztv:dayclear"),
+        InlineKeyboardButton(text="✅ تأیید روزها", callback_data="eztv:days_done"),
+    )
     builder.row(InlineKeyboardButton(text="✖️ انصراف", callback_data="eztv:cancel"))
     return builder.as_markup()
 
@@ -462,6 +469,14 @@ async def _start_wizard(
     draft.setdefault("qualities", ["fullhd_h264", "480p"])
     draft.setdefault("quality_folders", _default_folders())
     draft.setdefault("release_day", "")
+    initial_days = draft.get("release_days")
+    if not isinstance(initial_days, list):
+        initial_days = [draft.get("release_day")] if draft.get("release_day") else []
+    draft["release_days"] = [
+        str(day).strip().title()
+        for day in initial_days
+        if str(day).strip().title() in {item[0] for item in DAY_OPTIONS if item[0]}
+    ]
 
     await state.clear()
     await state.update_data(
@@ -470,14 +485,24 @@ async def _start_wizard(
         old_show=old_show,
         draft=draft,
         draft_qualities=list(draft.get("qualities", [])),
+        draft_release_days=list(draft["release_days"]),
     )
     await _prompt_title(target, state, mode == "edit")
 
 
-async def _save_wizard(call: CallbackQuery, state: FSMContext, release_day: str):
+async def _save_wizard(call: CallbackQuery, state: FSMContext, release_days: list[str] | str):
     data = await state.get_data()
     draft = dict(data.get("draft", {}))
-    draft["release_day"] = release_day
+    if isinstance(release_days, str):
+        release_days = [release_days] if release_days else []
+    allowed_days = {item[0] for item in DAY_OPTIONS if item[0]}
+    normalized_days = list(dict.fromkeys(
+        str(day).strip().title()
+        for day in release_days
+        if str(day).strip().title() in allowed_days
+    ))
+    draft["release_days"] = normalized_days
+    draft["release_day"] = normalized_days[0] if normalized_days else ""
     draft["qualities"] = list(data.get("draft_qualities", []))
 
     if not draft.get("title", "").strip():
@@ -645,13 +670,29 @@ async def cb_eztv_manager(call: CallbackQuery, state: FSMContext):
         await _prompt_folders(call.message, state)
         return await call.answer()
 
-    if action == "day":
-        value = parts[2] if len(parts) > 2 else "Unknown"
-        if value == "Unknown":
-            value = ""
-        if value not in {item[0] for item in DAY_OPTIONS}:
+    if action == "daytoggle":
+        value = parts[2] if len(parts) > 2 else ""
+        allowed_days = {item[0] for item in DAY_OPTIONS if item[0]}
+        if value not in allowed_days:
             return await call.answer("روز انتخاب‌شده معتبر نیست.", show_alert=True)
-        return await _save_wizard(call, state, value)
+        data = await state.get_data()
+        selected_days = list(data.get("draft_release_days", []))
+        if value in selected_days:
+            selected_days.remove(value)
+        else:
+            selected_days.append(value)
+        await state.update_data(draft_release_days=selected_days)
+        await call.message.edit_reply_markup(reply_markup=_release_day_keyboard(selected_days))
+        return await call.answer("روزهای انتشار به‌روزرسانی شد.")
+
+    if action == "dayclear":
+        await state.update_data(draft_release_days=[])
+        await call.message.edit_reply_markup(reply_markup=_release_day_keyboard([]))
+        return await call.answer("روز انتشار متغیر/نامشخص ثبت شد.")
+
+    if action == "days_done":
+        data = await state.get_data()
+        return await _save_wizard(call, state, list(data.get("draft_release_days", [])))
 
     if action == "cancel":
         await state.clear()
@@ -760,8 +801,8 @@ async def handle_eztv_folders(message: Message, state: FSMContext):
         return await message.answer(f"⚠️ {html.escape(str(exc))}\nدوباره ارسال کنید:", parse_mode="HTML")
     await state.update_data(draft=draft)
     await message.answer(
-        "📅 روز معمول انتشار سریال را انتخاب کنید:",
-        reply_markup=_release_day_keyboard(str(draft.get("release_day", "") or "")),
+        "📅 تمام روزهای معمول انتشار این سریال را انتخاب کنید؛ امکان انتخاب چند روز وجود دارد:",
+        reply_markup=_release_day_keyboard(data.get("draft_release_days", draft.get("release_days", []))),
     )
 
 
