@@ -100,6 +100,7 @@ def _attach_all_routers(dp: Dispatcher):
         subtitle_handlers_mod.router,
         eztv_handlers_mod.router,
         main_handlers_mod.router,
+        subtitle_handlers_mod.incoming_subtitle_router,
     ):
         r._parent_router = None
 
@@ -109,6 +110,8 @@ def _attach_all_routers(dp: Dispatcher):
     dp.include_router(subtitle_handlers_mod.router)
     dp.include_router(eztv_handlers_mod.router)
     dp.include_router(main_handlers_mod.router)
+    # Final fallback: only receives documents not handled by dedicated upload/torrent flows.
+    dp.include_router(subtitle_handlers_mod.incoming_subtitle_router)
 
 
 async def hot_reload_code(dp: Dispatcher, bot: Bot) -> tuple[bool, str]:

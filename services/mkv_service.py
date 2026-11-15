@@ -131,6 +131,108 @@ class MKVService:
         return json.loads(stdout.decode("utf-8", errors="replace"))
 
     @classmethod
+    async def convert_eac3_audio_to_aac(
+        cls,
+        video_path: Path,
+        progress_callback: Callable[[str], None] = None,
+    ) -> Path:
+        """
+        Convert only E-AC-3 audio streams to AAC while copying video and all other streams.
+        The original file is replaced only after FFmpeg has produced a valid non-empty output.
+        """
+        video_path = Path(video_path).resolve()
+        if not video_path.is_file():
+            raise FileNotFoundError(f"فایل ویدئو برای تبدیل صدا پیدا نشد: {video_path}")
+
+        info = await cls.inspect_tracks(video_path)
+        eac3_audio_indices: list[tuple[int, int]] = []
+        audio_index = 0
+
+        for track in info.get("tracks", []):
+            if track.get("type") != "audio":
+                continue
+
+            props = track.get("properties", {}) or {}
+            codec_text = " ".join(
+                str(value or "")
+                for value in (
+                    track.get("codec", ""),
+                    props.get("codec_id", ""),
+                    props.get("codec", ""),
+                )
+            ).casefold()
+            normalized_codec = re.sub(r"[^a-z0-9]+", "", codec_text)
+
+            if "eac3" in normalized_codec:
+                channels = int(props.get("audio_channels", 2) or 2)
+                eac3_audio_indices.append((audio_index, channels))
+            audio_index += 1
+
+        if not eac3_audio_indices:
+            return video_path
+
+        ffmpeg_bin = cls._get_ffmpeg_bin()
+        if not ffmpeg_bin or (not Path(ffmpeg_bin).is_file() and not shutil.which(ffmpeg_bin)):
+            raise FileNotFoundError(
+                "کدک صدای فایل 480p از نوع E-AC-3 است اما FFmpeg پیدا نشد؛ "
+                "مسیر ffmpeg_dir را در config.yaml بررسی کنید."
+            )
+
+        temp_output = video_path.with_name(
+            f"_temp_aac_{uuid.uuid4().hex[:8]}{video_path.suffix}"
+        )
+        cmd = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-y",
+            "-i", str(video_path),
+            "-map", "0",
+            "-map_metadata", "0",
+            "-map_chapters", "0",
+            "-c", "copy",
+        ]
+
+        for stream_index, channels in eac3_audio_indices:
+            bitrate = "384k" if channels >= 6 else "192k"
+            cmd.extend([
+                f"-c:a:{stream_index}", "aac",
+                f"-b:a:{stream_index}", bitrate,
+            ])
+
+        if video_path.suffix.casefold() == ".mp4":
+            cmd.extend(["-movflags", "+faststart"])
+        cmd.append(str(temp_output))
+
+        if progress_callback:
+            progress_callback(
+                f"کدک E-AC-3 در {len(eac3_audio_indices)} ترک صوتی شناسایی شد؛ در حال تبدیل به AAC..."
+            )
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            output, _ = await proc.communicate()
+            if (
+                proc.returncode != 0
+                or not temp_output.is_file()
+                or temp_output.stat().st_size <= 0
+            ):
+                details = output.decode("utf-8", errors="replace")[-2400:]
+                raise RuntimeError(
+                    f"تبدیل صدای E-AC-3 به AAC ناموفق بود (exit={proc.returncode}): {details}"
+                )
+
+            temp_output.replace(video_path)
+            if progress_callback:
+                progress_callback("صدای فایل 480p با موفقیت به AAC تبدیل شد.")
+            return video_path
+        finally:
+            temp_output.unlink(missing_ok=True)
+
+    @classmethod
     async def list_subtitle_tracks(cls, video_path: Path) -> list[dict]:
         info = await cls.inspect_tracks(video_path)
         subs = []

@@ -35,6 +35,7 @@ from bot.keyboards import (
 )
 
 router = Router()
+incoming_subtitle_router = Router()
 
 # نگه‌داشتن reference تسک‌های مانیتور تا زمان پایان آن‌ها.
 _ACTIVE_AUTOMATION_MONITORS: set[asyncio.Task] = set()
@@ -981,7 +982,19 @@ async def cb_sauto_extract_en(call: CallbackQuery, state: FSMContext):
             continue
         if p.embedded_en_source_video and p.embedded_en_track_id is not None:
             std_en_name = AutomationService.build_standard_subtitle_filename(
-                p.series_title, p.season_ep_tag, p.source_type, "EN", ".srt"
+                p.series_title,
+                p.season_ep_tag,
+                p.source_type,
+                "EN",
+                ".srt",
+                year=AutomationService.extract_media_year(
+                    p.series_title,
+                    p.base_dir.name,
+                    p.base_dir.parent.name,
+                    p.fullhd_source_video.name if p.fullhd_source_video else None,
+                    p.embedded_en_source_video.name if p.embedded_en_source_video else None,
+                    *(target.raw_video.name for target in p.softsub_targets),
+                ),
             )
             p.en_sub_dest_dir.mkdir(parents=True, exist_ok=True)
             en_dest = p.en_sub_dest_dir / std_en_name
@@ -1957,7 +1970,7 @@ async def cb_incoming_subtitle_cancel(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("⏭ عملیات زیرنویس لغو شد.", reply_markup=main_menu_kb())
 
 
-@router.message(StateFilter("*"), F.document)
+@incoming_subtitle_router.message(F.document)
 async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSMContext):
     """
     دریافت مستقیم فایل زیرنویس در هر وضعیتی (حتی زمانی که قبلاً داخل منوی فایل‌منیجر، دانلود یا اتوماسیون بوده‌اید).
@@ -1973,7 +1986,19 @@ async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSM
     fname = message.document.file_name or ""
     ext_low = Path(fname).suffix.lower()
     if ext_low not in (".srt", ".ass", ".ssa", ".zip", ".rar", ".7z"):
+        logging.info(
+            "Incoming document ignored by subtitle matcher: user_id=%s file_name=%r mime_type=%r",
+            message.from_user.id if message.from_user else None,
+            fname,
+            message.document.mime_type,
+        )
         return
+
+    logging.info(
+        "Incoming subtitle received for destination matching: user_id=%s file_name=%r state=direct",
+        message.from_user.id,
+        fname,
+    )
 
     wait_msg = await message.answer(
         f"🔎 در حال بررسی فایل <code>{html.escape(fname)}</code> و جستجوی پوشه‌های مرتبط در Workspace و سرور...",
@@ -1983,7 +2008,14 @@ async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSM
     temp_dir = Path(cfg.get("paths", "workspace_dir")) / "_incoming_subs" / uuid.uuid4().hex[:8]
     temp_dir.mkdir(parents=True, exist_ok=True)
     saved_p = temp_dir / fname
-    await message.bot.download(message.document, destination=saved_p)
+    try:
+        await message.bot.download(message.document, destination=saved_p)
+    except Exception as exc:
+        logging.exception("Could not download incoming subtitle document %s", fname)
+        return await wait_msg.edit_text(
+            f"❌ دریافت فایل از تلگرام ناموفق بود: <code>{html.escape(str(exc)[:500])}</code>",
+            parse_mode="HTML",
+        )
 
     sub_files: list[Path] = []
     if ext_low in SubtitleService.ARCHIVE_EXTENSIONS:
@@ -2205,181 +2237,6 @@ async def _start_incoming_subtitle_upload_batch(
     )
     _ACTIVE_AUTOMATION_MONITORS.add(monitor)
     monitor.add_done_callback(_release_automation_monitor)
-
-
-@router.callback_query(F.data.startswith("subfind:auto:"))
-async def cb_incoming_subtitle_auto(call: CallbackQuery, state: FSMContext):
-    token = call.data.split(":")[2]
-    info = PENDING_INCOMING_SUBTITLES.pop(token, None)
-    if not info:
-        return await call.answer("این انتخاب منقضی شده است.", show_alert=True)
-    await state.update_data(sauto_incoming_subs=[])
-
-    target_dir = Path(info["target_dir"])
-    subs = [Path(p) for p in info["sub_files"]]
-    eps = list(info.get("episode_tags", []))
-    await _init_smart_auto_batch(call, state, target_dir, eps, pre_uploaded_subs=subs)
-
-
-@router.callback_query(F.data.startswith("subfind:upload:"))
-async def cb_incoming_subtitle_upload(call: CallbackQuery, state: FSMContext):
-    token = call.data.split(":")[2]
-    info = PENDING_INCOMING_SUBTITLES.pop(token, None)
-    if not info:
-        return await call.answer("این انتخاب منقضی شده است.", show_alert=True)
-    await state.update_data(sauto_incoming_subs=[])
-    await _start_incoming_subtitle_upload_batch(
-        call,
-        Path(info["target_dir"]),
-        [Path(p) for p in info["sub_files"]],
-    )
-
-
-@router.callback_query(F.data.startswith("subfind:manual:"))
-async def cb_incoming_subtitle_manual(call: CallbackQuery, state: FSMContext):
-    token = call.data.split(":")[2]
-    info = PENDING_INCOMING_SUBTITLES.pop(token, None)
-    if not info:
-        return await call.answer("این انتخاب منقضی شده است.", show_alert=True)
-    subs = [Path(p) for p in info["sub_files"]]
-    workspace = Path(cfg.get("paths", "workspace_dir")).resolve()
-    await state.update_data(sauto_incoming_subs=[str(p.resolve()) for p in subs])
-    await _render_smart_auto_browser(call, state, workspace, page=0)
-
-
-@router.callback_query(F.data.startswith("subfind:cancel:"))
-async def cb_incoming_subtitle_cancel(call: CallbackQuery, state: FSMContext):
-    token = call.data.split(":")[2]
-    PENDING_INCOMING_SUBTITLES.pop(token, None)
-    await state.update_data(sauto_incoming_subs=[])
-    await call.message.edit_text("⏭ عملیات زیرنویس لغو شد.", reply_markup=main_menu_kb())
-
-
-@router.message(StateFilter(None), F.document)
-async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    fname = message.document.file_name or ""
-    ext_low = Path(fname).suffix.lower()
-    if ext_low not in (".srt", ".ass", ".ssa", ".zip", ".rar", ".7z"):
-        return
-
-    temp_dir = Path(cfg.get("paths", "workspace_dir")) / "_incoming_subs"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    saved_p = temp_dir / fname
-    await message.bot.download(message.document, destination=saved_p)
-
-    sub_files: list[Path] = []
-    if ext_low in SubtitleService.ARCHIVE_EXTENSIONS:
-        extracted = SubtitleService.extract_archive(saved_p, temp_dir, remove_archive=True)
-        sub_files = [p for p in extracted if p.suffix.lower() in SubtitleService.SUB_EXTENSIONS]
-        if not sub_files:
-            return await message.answer("❌ فایل فشرده اکسترکت شد اما زیرنویسی داخل آن نبود.")
-    else:
-        if ext_low == ".srt":
-            SubtitleService.normalize_srt_utf8(saved_p)
-        sub_files = [saved_p]
-
-    search_references = [fname] + [p.name for p in sub_files[:5]]
-    candidates = []
-    search_errors = []
-    for reference in search_references:
-        try:
-            candidates = await AutomationService.search_media_destination_candidates(reference, limit=7)
-        except Exception as exc:
-            logging.warning("Subtitle destination search failed for %s: %s", reference, exc)
-            search_errors.append(str(exc))
-        if candidates:
-            break
-
-    if candidates:
-        token = uuid.uuid4().hex[:8]
-        PENDING_INCOMING_SUBTITLES[token] = {
-            "sub_files": [str(p.resolve()) for p in sub_files],
-            "candidates": candidates,
-        }
-        kb = InlineKeyboardBuilder()
-        lines = []
-        for idx, candidate in enumerate(candidates):
-            kb.row(
-                InlineKeyboardButton(
-                    text=f"📁 {candidate['label'][:42]}",
-                    callback_data=f"subfind:pick:{token}:{idx}",
-                )
-            )
-            lines.append(
-                f"<b>{idx + 1}.</b> {html.escape(candidate['label'])} "
-                f"— <code>{html.escape(candidate['category'])}</code> "
-                f"({'محلی' if candidate.get('exists_local') else 'فقط در سرور'})"
-            )
-        kb.row(
-            InlineKeyboardButton(
-                text="📂 پیشنهاد مناسب نبود؛ انتخاب دستی مقصد",
-                callback_data=f"subfind:manual:{token}",
-            )
-        )
-        kb.row(InlineKeyboardButton(text="❌ لغو", callback_data=f"subfind:cancel:{token}"))
-        query = AutomationService.extract_media_title_query(fname)
-        if not query and sub_files:
-            query = AutomationService.extract_media_title_query(sub_files[0].name)
-        return await message.answer(
-            f"🔎 عنوان تشخیص‌داده‌شده از زیرنویس: <b>{html.escape(query or 'نامشخص')}</b>\n"
-            f"📄 تعداد فایل‌های زیرنویس: <b>{len(sub_files)}</b>\n\n"
-            "چند مقصد احتمالی از روی نام زیرنویس و پوشه‌های Workspace/سرور پیدا شد. "
-            "عنوان درست را انتخاب کنید:\n\n"
-            + "\n".join(lines),
-            reply_markup=kb.as_markup(),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-
-    token = uuid.uuid4().hex[:8]
-    PENDING_INCOMING_SUBTITLES[token] = {
-        "sub_files": [str(p.resolve()) for p in sub_files],
-        "candidates": [],
-    }
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(
-            text="📂 انتخاب دستی مقصد از Workspace",
-            callback_data=f"subfind:manual:{token}",
-        )
-    )
-    kb.row(InlineKeyboardButton(text="❌ لغو", callback_data=f"subfind:cancel:{token}"))
-    error_note = (
-        f"\nجزئیات بررسی: <code>{html.escape(search_errors[-1][:200])}</code>"
-        if search_errors else ""
-    )
-    await message.answer(
-        f"📥 تعداد <b>{len(sub_files)}</b> فایل زیرنویس دریافت شد، اما مقصد مطمئنی از روی نام پیدا نشد."
-        f"{error_note}\n"
-        "می‌توانید پوشه فیلم یا فصل سریال را دستی انتخاب کنید.",
-        reply_markup=kb.as_markup(),
-        parse_mode="HTML",
-    )
-
-
-@router.callback_query(F.data.startswith("subfind:pick:"))
-async def cb_incoming_subtitle_pick(call: CallbackQuery):
-    parts = call.data.split(":")
-    if len(parts) != 4:
-        return await call.answer("درخواست نامعتبر است.", show_alert=True)
-    token, idx_text = parts[2], parts[3]
-    info = PENDING_INCOMING_SUBTITLES.pop(token, None)
-    if not info:
-        return await call.answer("این پیشنهاد منقضی شده است.", show_alert=True)
-    try:
-        candidate = info.get("candidates", [])[int(idx_text)]
-    except (IndexError, ValueError, TypeError):
-        return await call.answer("پوشهٔ انتخاب‌شده معتبر نیست.", show_alert=True)
-
-    subs = [Path(p) for p in info["sub_files"]]
-    await _show_incoming_subtitle_actions(
-        call,
-        Path(candidate["path"]),
-        subs,
-        [candidate["episode_tag"]] if candidate.get("episode_tag") else None,
-    )
 
 
 # ==============================================================================

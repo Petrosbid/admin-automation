@@ -820,17 +820,32 @@ class AutomationService:
         }
         async def _inspect_category_root(category_name: str, remote_root: str):
             try:
-                return category_name, await CuteFTPService.inspect_remote_dir(remote_root)
+                return category_name, await asyncio.wait_for(
+                    CuteFTPService.inspect_remote_dir(remote_root),
+                    timeout=8.0,
+                )
             except Exception as exc:
                 logging.debug("Destination title search failed for %s: %s", remote_root, exc)
                 return category_name, {}
 
-        root_results = await asyncio.gather(
-            *(
-                _inspect_category_root(category, remote_root)
-                for category, remote_root in remote_roots.items()
+        local_match_scores = [
+            cls._media_title_similarity(query, title_name)
+            for names in names_by_category.values()
+            for title_name in names
+        ]
+        has_strong_local_match = any(score >= 0.62 for score in local_match_scores)
+
+        # A good local match is enough; don't block subtitle suggestions on FTP availability.
+        # Remote discovery is used only when local Workspace folders do not provide a strong hit.
+        if has_strong_local_match:
+            root_results = []
+        else:
+            root_results = await asyncio.gather(
+                *(
+                    _inspect_category_root(category, remote_root)
+                    for category, remote_root in remote_roots.items()
+                )
             )
-        )
         for category, info in root_results:
             if info.get("exists"):
                 names_by_category[category].update(
@@ -876,7 +891,10 @@ class AutomationService:
             ):
                 remote_show = f"{remote_roots[category]}/{title_name}"
                 try:
-                    info = await CuteFTPService.inspect_remote_dir(remote_show)
+                    info = await asyncio.wait_for(
+                        CuteFTPService.inspect_remote_dir(remote_show),
+                        timeout=8.0,
+                    )
                     remote_seasons = [
                         str(name) for name in info.get("dirs", [])
                         if cls.SEASON_DIR_REGEX.match(str(name))
@@ -914,53 +932,83 @@ class AutomationService:
 
     @classmethod
     def find_matching_workspace_folder_for_sub(cls, sub_filename: str) -> tuple[Path | None, list[str]]:
+        """Unicode-aware local fallback for matching an incoming subtitle to a title/season folder."""
         ws = Path(cfg.get("paths", "workspace_dir", "./workspace")).resolve()
-        if not ws.exists():
+        if not ws.is_dir():
+            return None, []
+
+        query = cls.extract_media_title_query(sub_filename)
+        if not query:
             return None, []
 
         ep_tag = cls.extract_episode_tag(sub_filename)
-        clean_sub = re.sub(r"[^a-zA-Z0-9]+", " ", Path(sub_filename).stem).lower().split()
-        title_tokens = [t for t in clean_sub if len(t) > 2 and not cls.EPISODE_REGEX.match(t)]
+        category_roots = cls.ensure_workspace_root_categories()
+        candidate_roots: list[Path] = []
+        seen: set[str] = set()
 
-        candidate_roots = []
-        for d in ws.iterdir():
-            if not d.is_dir() or d.name.startswith("_") or d.name == "browser_profile":
+        for root in category_roots.values():
+            try:
+                children = list(root.iterdir())
+            except OSError:
+                children = []
+            for child in children:
+                if child.is_dir() and not child.name.startswith("_"):
+                    key = str(child.resolve()).casefold()
+                    if key not in seen:
+                        seen.add(key)
+                        candidate_roots.append(child)
+
+        # Keep support for older workspaces where titles live directly under Workspace.
+        for child in ws.iterdir():
+            if (
+                not child.is_dir()
+                or child.name.startswith("_")
+                or child.name.casefold() in {"browser_profile", "movies", "series", "anime"}
+            ):
                 continue
-            if d.name in cls.ROOT_CATEGORIES or d.name.lower() in ("movie", "movies", "serie", "series", "anime"):
-                candidate_roots.extend([sub for sub in d.iterdir() if sub.is_dir()])
-            else:
-                candidate_roots.append(d)
+            key = str(child.resolve()).casefold()
+            if key not in seen:
+                seen.add(key)
+                candidate_roots.append(child)
 
-        best_folder = None
-        best_score = 0
+        best_folder: Path | None = None
+        best_score = 0.0
         matched_eps: list[str] = []
 
-        for top_dir in candidate_roots:
-            top_tokens = set(re.sub(r"[^a-zA-Z0-9]+", " ", top_dir.name).lower().split())
-            overlap = sum(1 for t in title_tokens[:4] if t in top_tokens)
+        for title_dir in candidate_roots:
+            score = cls._media_title_similarity(query, title_dir.name)
+            if score < 0.24:
+                continue
 
             if ep_tag:
-                s_num = int(ep_tag[1:3])
+                season_num = int(ep_tag[1:3])
                 season_candidates = [
-                    top_dir / f"S{s_num:02d}",
-                    top_dir / f"S{s_num}",
-                    top_dir,
+                    title_dir / f"S{season_num:02d}",
+                    title_dir / f"S{season_num}",
                 ]
-                for s_cand in season_candidates:
-                    if s_cand.is_dir():
-                        eps = cls.scan_available_episodes_in_season(s_cand)
-                        if ep_tag in eps:
-                            score = overlap + 10
-                            if score > best_score:
-                                best_score = score
-                                best_folder = s_cand
-                                matched_eps = [ep_tag]
+                season_dir = next((item for item in season_candidates if item.is_dir()), None)
+                candidate = season_dir or title_dir
+                candidate_score = score + (0.08 if season_dir else 0.0)
+                candidate_eps = [ep_tag]
             else:
-                for sub_d in [top_dir] + [d for d in top_dir.iterdir() if d.is_dir() and cls.SEASON_DIR_REGEX.match(d.name)]:
-                    if overlap > best_score:
-                        best_score = overlap
-                        best_folder = sub_d
-                        matched_eps = cls.scan_available_episodes_in_season(sub_d)
+                try:
+                    seasons = sorted(
+                        [
+                            item for item in title_dir.iterdir()
+                            if item.is_dir() and cls.SEASON_DIR_REGEX.match(item.name)
+                        ],
+                        key=lambda item: item.name.casefold(),
+                    )
+                except OSError:
+                    seasons = []
+                candidate = seasons[0] if len(seasons) == 1 else title_dir
+                candidate_score = score + (0.04 if len(seasons) == 1 else 0.0)
+                candidate_eps = cls.scan_available_episodes_in_season(candidate)
+
+            if candidate_score > best_score:
+                best_score = candidate_score
+                best_folder = candidate
+                matched_eps = candidate_eps
 
         return best_folder, matched_eps
 
