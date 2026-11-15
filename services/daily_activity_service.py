@@ -15,7 +15,7 @@ class DailyActivityService:
     """Persistent daily event journal for download, automation, queue and monitor operations."""
 
     _lock = threading.Lock()
-    _episode_re = re.compile(r"(?i)S(\\d{1,2})[ ._-]*E(\\d{1,3})")
+    _episode_re = re.compile(r"(?i)S(\d{1,2})[ ._-]*E(\d{1,3})")
 
     @classmethod
     def timezone(cls):
@@ -65,7 +65,7 @@ class DailyActivityService:
             line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             with cls._lock:
                 with path.open("a", encoding="utf-8") as stream:
-                    stream.write(line + "\\n")
+                    stream.write(line + "\n")
         except Exception:
             logging.exception("Could not write daily activity event %s", event)
 
@@ -83,7 +83,7 @@ class DailyActivityService:
         parts = list(path.parts)
         season_index = next(
             (i for i, part in enumerate(parts)
-             if re.fullmatch(r"(?i)S(?:eason[ ._-]*)?\\d{1,2}", part)),
+             if re.fullmatch(r"(?i)S(?:eason[ ._-]*)?\d{1,2}", part)),
             None,
         )
         category = "Movies"
@@ -239,4 +239,4 @@ class DailyActivityService:
             lines.append("در این تاریخ رویدادی ثبت نشده است.")
         lines.append("")
         lines.append("<i>گزارش از زمان نصب این نسخه، رویدادهای ثبت‌شده در سیستم را جمع‌آوری می‌کند.</i>")
-        return "\\n".join(lines)
+        return "\n".join(lines)

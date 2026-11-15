@@ -325,7 +325,7 @@ async def _smart_download_pipeline_job(
                 quality_folder = dest_dir.name
                 is_quality_folder = bool(
                     re.search(
-                        r"(?i)(?<!\\d)(?:2160p|1080p|720p|480p|360p|240p|fullhd)(?!\\d)",
+                        r"(?i)(?<!\d)(?:2160p|1080p|720p|480p|360p|240p|fullhd)(?!\d)",
                         quality_folder,
                     )
                 )
