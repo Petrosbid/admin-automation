@@ -1319,9 +1319,14 @@ class EZTVTrackerService:
                 )
                 lines.append(f"وضعیت: {headline}")
 
-                configured_day = self.weekday_label(show.get("release_day"))
+                configured_days = show.get("release_days") or (
+                    [show.get("release_day")] if show.get("release_day") else []
+                )
+                configured_day_text = "، ".join(
+                    self.weekday_label(day) for day in configured_days
+                ) or "نامشخص / متغیر"
                 observed_days = self.observed_release_weekdays(show, state)
-                lines.append(f"📅 روز انتشار تنظیم‌شده: <b>{configured_day}</b>")
+                lines.append(f"📅 روزهای انتشار تنظیم‌شده: <b>{configured_day_text}</b>")
                 if observed_days:
                     observed_labels = "، ".join(self.weekday_label(day) for day in observed_days)
                     lines.append(f"📚 روز(های) ثبت‌شده از RSS: <b>{observed_labels}</b>")

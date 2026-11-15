@@ -397,9 +397,10 @@ def _release_day_keyboard(current: list[str] | str | None):
     else:
         selected = {str(item) for item in (current or []) if str(item)}
     builder = InlineKeyboardBuilder()
-    for index in range(0, 7, 2):
+    selectable_days = [item for item in DAY_OPTIONS if item[0]]
+    for index in range(0, len(selectable_days), 2):
         row = []
-        for day, label in DAY_OPTIONS[index:index + 2]:
+        for day, label in selectable_days[index:index + 2]:
             mark = "✅ " if day in selected else "⬜ "
             row.append(
                 InlineKeyboardButton(
@@ -838,7 +839,7 @@ async def cmd_eztv_status(message: Message):
         lines.append(
             f"• <b>{html.escape(show['title'])}</b> "
             f"<code>{tag}</code> — {html.escape(_quality_text(show['qualities']))}\n"
-            f"  روز انتشار: <b>{html.escape(_day_text(show.get('release_day')))}</b> "
+            f"  روزهای انتشار: <b>{html.escape('، '.join(_day_text(day) for day in (show.get('release_days') or ([show.get('release_day')] if show.get('release_day') else []))) or 'نامشخص / متغیر')}</b> "
             f"(سابقه RSS: {html.escape(observed_text)})"
         )
     for chunk in _split_html_lines("\n".join(lines)):
