@@ -4,6 +4,7 @@ import html
 import importlib.util
 import json
 import logging
+import os
 import re
 import time
 import webbrowser
@@ -48,6 +49,7 @@ class SiteMonitorService:
         self._running: bool = False
         self._pw = None
         self._browser_context = None
+        self._active_profile_dir: Path | None = None
         self._pages: dict[str, object] = {}
         self._browser_lock = asyncio.Lock()
         self._check_lock = asyncio.Lock()
@@ -186,8 +188,10 @@ class SiteMonitorService:
     @property
     def profile_dir(self) -> Path:
         ws = Path(cfg.get("paths", "workspace_dir", "./workspace")).resolve()
-        # Keep Playwright isolated from any regular Chrome profile.
-        p_dir = ws / "browser_profile_playwright"
+        # Each bot process gets its own persistent profile. Chromium locks a user-data
+        # directory; sharing one fixed path with another running bot instance causes
+        # "Opening in existing browser session" and leaves the monitor without pages.
+        p_dir = ws / f"browser_profile_playwright_{os.getpid()}"
         p_dir.mkdir(parents=True, exist_ok=True)
         return p_dir
 
@@ -297,6 +301,7 @@ class SiteMonitorService:
 
                 # Use the bundled Chromium installed via the Playwright CLI.
                 # No channel='chrome' fallback: it used to hide the bundled-browser launch error.
+                self._active_profile_dir = Path(launch_kwargs["user_data_dir"])
                 self._browser_context = await self._pw.chromium.launch_persistent_context(
                     **launch_kwargs
                 )
@@ -310,7 +315,7 @@ class SiteMonitorService:
                 self._browser_start_error = ""
                 logging.info(
                     "Playwright headed Chromium started. Profile=%s Executable=%s",
-                    self.profile_dir,
+                    self._active_profile_dir,
                     self._pw.chromium.executable_path,
                 )
                 return True
@@ -322,6 +327,7 @@ class SiteMonitorService:
                     self.profile_dir,
                 )
                 self._browser_context = None
+                self._active_profile_dir = None
                 self._pages.clear()
                 if self._pw is not None:
                     try:
@@ -356,7 +362,13 @@ class SiteMonitorService:
             try:
                 page = self._pages.get(key)
                 if page is None or page.is_closed():
-                    page = await self._browser_context.new_page()
+                    # Reuse the initial control tab for the first site so the browser
+                    # does not remain showing an empty about:blank tab.
+                    control_page = self._pages.pop("__control__", None)
+                    if control_page is not None and not control_page.is_closed():
+                        page = control_page
+                    else:
+                        page = await self._browser_context.new_page()
                     self._pages[key] = page
 
                 _, navigation_error = await self._navigate_page_with_retry(
@@ -1092,16 +1104,12 @@ class SiteMonitorService:
 
     async def _warmup_browser(self) -> None:
         try:
-            ok = await self.ensure_real_browser_open()
-            if ok:
-                logging.info(
-                    "Monitor browser warmup complete; headed Chromium is open and ready for site tabs."
-                )
-            else:
-                logging.error(
-                    "Monitor browser warmup failed. Use /monitor_browser for diagnostics. Cause: %s",
-                    self._browser_start_error or "unknown",
-                )
+            # Open the actual configured monitor URLs during startup. Previously warmup
+            # only created an about:blank control tab, which looked like monitoring had
+            # opened Chromium but never loaded any sites.
+            result = await self.open_captcha_tabs_for_admin()
+            if result:
+                logging.info("Monitor browser startup tabs: %s", result.replace("\n", " | "))
         except Exception:
             logging.exception("Unexpected Playwright browser warmup error")
 
