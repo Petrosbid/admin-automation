@@ -1060,6 +1060,17 @@ class SiteMonitorService:
         self._running = True
         logging.info("⏱ حلقه مانیتورینگ خودکار فعال شد.")
 
+        # Do not let the first automatic scan navigate pages while the startup
+        # task is still opening the visible site tabs in the same browser context.
+        warmup_task = self._browser_warmup_task
+        if warmup_task is not None and warmup_task is not asyncio.current_task():
+            try:
+                await warmup_task
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("Monitor browser warmup failed before the first scan.")
+
         while self._running:
             cycle_started = time.monotonic()
             try:
