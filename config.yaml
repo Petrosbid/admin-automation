@@ -19,6 +19,9 @@ monitor:
   use_real_browser: true
   browser_use_proxy: false   # false: تنظیمات پروکسی ویندوز/Chrome؛ true: استفاده از proxy.url ربات
   captcha_wait_seconds: 300  # مدت انتظار برای حل دستی CAPTCHA در مرورگر Playwright
+  page_load_timeout_ms: 90000  # حداکثر انتظار برای بارگذاری اولیه/DOM هر سایت
+  page_load_retry_delay_seconds: 3  # مکث قبل از تلاش مجدد
+  page_settle_seconds: 3  # فرصت تکمیل محتوای پویا پس از باز شدن صفحه
   sites:
     pahe:
       enabled: true

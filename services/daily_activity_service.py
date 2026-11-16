@@ -147,96 +147,135 @@ class DailyActivityService:
             target_day = report_date
         else:
             target_day = date.fromisoformat(str(report_date))
+
         events = cls._read_day(target_day.isoformat())
-        esc = lambda value: html.escape(str(value or "—"))
+
+        def esc(value: Any) -> str:
+            return html.escape(str(value or "—"))
+
+        def media_key(item: dict[str, Any]) -> tuple[str, str]:
+            title = str(item.get("media_title") or "Media").strip()
+            episode = str(item.get("episode") or "").strip()
+            if not episode:
+                match = cls._episode_re.search(str(item.get("file_name") or ""))
+                episode = (
+                    f"S{int(match.group(1)):02d}E{int(match.group(2)):02d}"
+                    if match else "فیلم"
+                )
+            return title, episode
+
+        def quality_label(item: dict[str, Any]) -> str:
+            folder = str(item.get("quality_folder") or "").strip()
+            ignored = {"softsub", "hardsub", "srt", "sub"}
+            if folder and folder.casefold() not in ignored:
+                if re.search(
+                    r"(?i)(2160p|1080p|720p|480p|360p|fullhd)",
+                    folder,
+                ):
+                    return folder
+
+            source_text = " ".join(
+                str(item.get(key) or "")
+                for key in ("file_name", "source", "path")
+            )
+            match = re.search(
+                r"(?i)(?<!\d)(2160p|1080p|720p|480p|360p|fullhd)(?![a-z0-9])",
+                source_text,
+            )
+            if not match:
+                return ""
+            quality = "FullHD" if match.group(1).lower() == "fullhd" else match.group(1).lower()
+            if re.search(r"(?i)(x265|hevc)", source_text):
+                quality += "-x265"
+            return quality
+
+        def grouped_media(items: list[dict[str, Any]], with_quality: bool) -> dict[tuple[str, str], set[str]]:
+            grouped: dict[tuple[str, str], set[str]] = {}
+            for item in items:
+                key = media_key(item)
+                grouped.setdefault(key, set())
+                if with_quality:
+                    quality = quality_label(item)
+                    if quality:
+                        grouped[key].add(quality)
+            return grouped
+
         lines = [
-            f"📊 <b>گزارش جامع عملکرد روزانه — {target_day.isoformat()}</b>",
-            f"🕘 منطقه زمانی: <code>{esc(cls.timezone())}</code>",
-            f"📌 رویدادهای ثبت‌شده: <b>{len(events)}</b>",
+            f"📊 <b>گزارش روزانه — {target_day.isoformat()}</b>",
+            f"🕘 منطقه زمانی: <code>{esc(str(cls.timezone()))}</code>",
             "",
         ]
+        section_count = 0
 
         qualities = [item for item in events if item.get("event") == "quality_added"]
-        lines.append(f"🎞 <b>کیفیت‌های دانلودشده ({len(qualities)})</b>")
-        for item in qualities[:60]:
-            lines.append(
-                f"• {esc(item.get('media_title'))} — <code>{esc(item.get('episode') or 'فیلم')}</code> "
-                f"— <b>{esc(item.get('quality_folder'))}</b>"
-            )
-            lines.append(f"  <code>{esc(item.get('file_name'))}</code>")
-        if not qualities:
-            lines.append("• موردی ثبت نشده است.")
-        lines.append("")
+        quality_groups = grouped_media(qualities, with_quality=True)
+        if quality_groups:
+            section_count += 1
+            lines.append(f"🎞 <b>کیفیت‌های اضافه‌شده ({sum(len(v) for v in quality_groups.values())})</b>")
+            for (title, episode), names in sorted(
+                quality_groups.items(), key=lambda pair: (pair[0][0].casefold(), pair[0][1])
+            )[:45]:
+                quality_text = "، ".join(sorted(names, key=str.casefold)) or "کیفیت نامشخص"
+                lines.append(
+                    f"• {esc(title)} — <code>{esc(episode)}</code>: <b>{esc(quality_text)}</b>"
+                )
+            lines.append("")
 
         for event_name, label, emoji in (
-            ("softsub_created", "سافت‌ساب‌های تکمیل‌شده", "🎬"),
-            ("hardsub_created", "هاردساب‌ها / انکودهای تکمیل‌شده", "🔥"),
+            ("softsub_created", "سافت‌ساب‌شده", "🎬"),
+            ("hardsub_created", "هاردساب‌شده", "🔥"),
         ):
             selected = [item for item in events if item.get("event") == event_name]
-            lines.append(f"{emoji} <b>{label} ({len(selected)})</b>")
-            for item in selected[:50]:
-                lines.append(
-                    f"• {esc(item.get('media_title'))} — <code>{esc(item.get('episode') or 'فیلم')}</code> "
-                    f"— <code>{esc(item.get('file_name'))}</code>"
-                )
-            if not selected:
-                lines.append("• موردی ثبت نشده است.")
-            lines.append("")
+            groups = grouped_media(selected, with_quality=True)
+            if groups:
+                section_count += 1
+                lines.append(f"{emoji} <b>{label} ({len(groups)})</b>")
+                for (title, episode), names in sorted(
+                    groups.items(), key=lambda pair: (pair[0][0].casefold(), pair[0][1])
+                )[:45]:
+                    suffix = f" — {', '.join(sorted(names, key=str.casefold))}" if names else ""
+                    lines.append(
+                        f"• {esc(title)} — <code>{esc(episode)}</code>{esc(suffix)}"
+                    )
+                lines.append("")
 
-        queued = [item for item in events if item.get("event") == "task_queued"]
-        completed = [item for item in events if item.get("event") == "task_completed"]
-        failed = [item for item in events if item.get("event") == "task_failed"]
-        uploads = [item for item in events if item.get("event") == "upload_completed"]
-        lines.append("⚙️ <b>وضعیت صف عملیات</b>")
-        lines.append(
-            f"• وارد صف: <b>{len(queued)}</b> | تکمیل‌شده: <b>{len(completed)}</b> "
-            f"| ناموفق: <b>{len(failed)}</b> | آپلود موفق: <b>{len(uploads)}</b>"
-        )
-        if completed:
-            counts: dict[str, int] = {}
-            for item in completed:
-                key = str(item.get("queue_type") or "other")
-                counts[key] = counts.get(key, 0) + 1
-            lines.append(
-                "• بر اساس نوع: "
-                + " | ".join(f"{esc(key)}: {value}" for key, value in sorted(counts.items()))
+        folder_events = [
+            item for item in events
+            if item.get("event") == "automation_folder_mirrored"
+        ]
+        folder_groups: dict[tuple[str, str], set[str]] = {}
+        folder_counts: dict[tuple[str, str], int] = {}
+        for item in folder_events:
+            title = str(item.get("media_title") or "Media").strip()
+            season = str(item.get("season") or "فصل").strip()
+            key = (title, season)
+            folder_groups.setdefault(key, set())
+            folder_groups[key].update(
+                str(name).strip()
+                for name in (item.get("folders") or [])
+                if str(name).strip()
             )
-        for item in failed[:15]:
-            lines.append(f"• ❌ {esc(item.get('title'))}: {esc(item.get('error'))}")
-        lines.append("")
+            folder_counts[key] = max(
+                folder_counts.get(key, 0),
+                int(item.get("folder_count") or 0),
+            )
 
-        eztv_items = [item for item in events if item.get("event") == "eztv_release_queued"]
-        if eztv_items:
-            lines.append(f"🧲 <b>انتشارهای EZTV واردشده به صف ({len(eztv_items)})</b>")
-            for item in eztv_items[:40]:
+        if folder_groups:
+            section_count += 1
+            lines.append(f"📁 <b>پوشه‌های اتوماسیون‌شده ({len(folder_groups)})</b>")
+            for (title, season), names in sorted(
+                folder_groups.items(), key=lambda pair: (pair[0][0].casefold(), pair[0][1])
+            )[:35]:
+                details = "، ".join(sorted(names, key=str.casefold))
+                if not details:
+                    details = f"{folder_counts.get((title, season), 0)} پوشه"
                 lines.append(
-                    f"• {esc(item.get('media_title'))} — <code>{esc(item.get('episode'))}</code> "
-                    f"— {esc(item.get('quality'))}"
+                    f"• {esc(title)} — <code>{esc(season)}</code>: {esc(details)}"
                 )
             lines.append("")
 
-        monitor_checks = [item for item in events if item.get("event") == "monitor_checked"]
-        monitor_posts = [item for item in events if item.get("event") == "monitor_post_found"]
-        monitor_errors = [item for item in events if item.get("event") == "monitor_error"]
-        lines.append("📡 <b>مانیتورینگ سایت‌ها</b>")
-        lines.append(
-            f"• چرخه‌ها: <b>{len(monitor_checks)}</b> | پست‌های جدید: <b>{len(monitor_posts)}</b> "
-            f"| خطاها: <b>{len(monitor_errors)}</b>"
-        )
-        for item in monitor_posts[:20]:
-            lines.append(f"• 🆕 {esc(item.get('site'))}: {esc(item.get('title'))}")
-        for item in monitor_errors[:10]:
-            lines.append(f"• ⚠️ {esc(item.get('site'))}: {esc(item.get('error'))}")
-        lines.append("")
+        if not section_count:
+            lines.append("امروز کیفیت، سافت‌ساب، هاردساب یا پوشه اتوماسیون‌شده‌ای ثبت نشده است.")
 
-        other_downloads = [item for item in events if item.get("event") == "download_completed"]
-        if other_downloads:
-            lines.append(f"📥 <b>دانلودهای دیگر ({len(other_downloads)})</b>")
-            for item in other_downloads[:25]:
-                lines.append(f"• {esc(item.get('media_title'))}: <code>{esc(item.get('file_name'))}</code>")
-
-        if not events:
-            lines.append("در این تاریخ رویدادی ثبت نشده است.")
-        lines.append("")
-        lines.append("<i>گزارش از زمان نصب این نسخه، رویدادهای ثبت‌شده در سیستم را جمع‌آوری می‌کند.</i>")
+        # Keep the daily report short and free of raw filenames, queue errors and monitor diagnostics.
         return "\n".join(lines)

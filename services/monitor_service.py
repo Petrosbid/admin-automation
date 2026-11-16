@@ -94,6 +94,57 @@ class SiteMonitorService:
         all_cfg = cls.get_all_sites_config()
         return bool(all_cfg.get(site_key, {}).get("enabled", True))
 
+    @staticmethod
+    def _page_navigation_timeout_ms() -> int:
+        try:
+            configured = int(cfg.get("monitor", "page_load_timeout_ms", 90000) or 90000)
+        except (TypeError, ValueError):
+            configured = 90000
+        return max(30000, min(configured, 240000))
+
+    @staticmethod
+    def _page_retry_delay_seconds() -> float:
+        try:
+            configured = float(cfg.get("monitor", "page_load_retry_delay_seconds", 3) or 3)
+        except (TypeError, ValueError):
+            configured = 3.0
+        return max(1.0, min(configured, 15.0))
+
+    async def _navigate_page_with_retry(self, page, url: str, site_key: str):
+        """Navigate with a generous timeout and retry once via reload on slow/failed loads."""
+        timeout_ms = self._page_navigation_timeout_ms()
+        retry_delay = self._page_retry_delay_seconds()
+        last_error = None
+        response = None
+
+        for attempt in range(2):
+            try:
+                if attempt == 0 or not page.url or page.url == "about:blank":
+                    response = await page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=timeout_ms,
+                    )
+                else:
+                    response = await page.reload(
+                        wait_until="domcontentloaded",
+                        timeout=timeout_ms,
+                    )
+                return response, None
+            except Exception as exc:
+                last_error = exc
+                logging.warning(
+                    "Monitor page load for %s failed on attempt %s/2 (timeout=%sms): %s",
+                    site_key,
+                    attempt + 1,
+                    timeout_ms,
+                    exc,
+                )
+                if attempt == 0:
+                    await asyncio.sleep(retry_delay)
+
+        return response, last_error
+
     @classmethod
     def set_site_url(cls, site_key: str, new_url: str):
         """تغییر آدرس یک سایت و ذخیره دائمی در config.yaml"""
@@ -308,24 +359,22 @@ class SiteMonitorService:
                     page = await self._browser_context.new_page()
                     self._pages[key] = page
 
-                try:
-                    await page.goto(
-                        info["url"],
-                        wait_until="domcontentloaded",
-                        timeout=45000,
-                    )
-                except Exception as nav_exc:
-                    # Keep a partially loaded document open for manual inspection.
+                _, navigation_error = await self._navigate_page_with_retry(
+                    page,
+                    info["url"],
+                    key,
+                )
+                if navigation_error:
+                    # Keep a usable partially loaded document open after the retry.
                     try:
                         page_html = await page.content()
                     except Exception:
                         page_html = ""
                     if not page_html.strip() or page.url == "about:blank":
-                        raise nav_exc
+                        raise navigation_error
                     logging.warning(
-                        "Playwright navigation warning for %s (%s); keeping tab open.",
+                        "Playwright navigation for %s remained slow after retry; keeping the loaded tab open.",
                         key,
-                        nav_exc,
                     )
 
                 await page.bring_to_front()
@@ -484,23 +533,16 @@ class SiteMonitorService:
                     page = await self._browser_context.new_page()
                     self._pages[site_key] = page
 
-                navigation_error = None
-                response = None
+                response, navigation_error = await self._navigate_page_with_retry(
+                    page,
+                    fresh_url,
+                    site_key,
+                )
                 try:
-                    response = await page.goto(
-                        fresh_url,
-                        wait_until="domcontentloaded",
-                        timeout=45000,
-                    )
-                except Exception as exc:
-                    navigation_error = exc
-                    logging.warning(
-                        "Playwright navigation did not reach DOMContentLoaded for %s: %s",
-                        site_key,
-                        exc,
-                    )
-
-                await asyncio.sleep(1.5)
+                    settle_seconds = float(cfg.get("monitor", "page_settle_seconds", 3) or 3)
+                except (TypeError, ValueError):
+                    settle_seconds = 3.0
+                await asyncio.sleep(max(0.5, min(settle_seconds, 15.0)))
                 try:
                     page_html = await page.content()
                 except Exception as exc:
@@ -838,7 +880,15 @@ class SiteMonitorService:
             captcha_wait = int(cfg.get("monitor", "captcha_wait_seconds", 300) or 300)
         except (TypeError, ValueError):
             captcha_wait = 300
-        fetch_timeout = max(60, min(captcha_wait, 1800) + 45)
+        # Allow two full page-load attempts plus the optional manual CAPTCHA wait.
+        navigation_budget = (self._page_navigation_timeout_ms() / 1000) * 2
+        fetch_timeout = max(
+            90,
+            navigation_budget
+            + self._page_retry_delay_seconds()
+            + min(captcha_wait, 1800)
+            + 45,
+        )
         html = await asyncio.wait_for(
             self._get_site_html(site_key, bot=bot),
             timeout=fetch_timeout,

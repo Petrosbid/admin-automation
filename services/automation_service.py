@@ -564,6 +564,28 @@ class AutomationService:
                 remote_dir,
                 season_folder,
             )
+            if quality_dirs:
+                try:
+                    from services.daily_activity_service import DailyActivityService
+                    media_title = (
+                        season_folder.parent.name
+                        if cls.SEASON_DIR_REGEX.match(season_folder.name)
+                        else season_folder.name
+                    )
+                    DailyActivityService.record(
+                        "automation_folder_mirrored",
+                        category=str(category),
+                        media_title=media_title,
+                        season=season_folder.name,
+                        remote_dir=remote_dir,
+                        folder_count=len(quality_dirs),
+                        folders=quality_dirs,
+                    )
+                except Exception:
+                    logging.exception(
+                        "Could not record mirrored automation folders for %s",
+                        remote_dir,
+                    )
 
         return paths
 

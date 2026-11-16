@@ -14,7 +14,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.config_loader import cfg
-from core.queue_manager import queue_engine
+from core.queue_manager import queue_engine, safe_throttled_edit_text
 from services.scraper_service import ScraperService
 from services.downloader_service import DownloaderService
 from services.subtitle_service import SubtitleService
@@ -663,7 +663,8 @@ async def _watch_fullhd_batch(
 ):
     known = {task.task_id: task for task in initial_tasks}
     markup = _fullhd_status_markup()
-    last_text = None
+    # The initial Telegram message already contains this text; avoid an immediate duplicate edit.
+    last_text = _build_fullhd_status_text(title, list(known.values()), notes)
     stable_cycles = 0
 
     while True:
@@ -679,17 +680,16 @@ async def _watch_fullhd_batch(
             title, tasks, notes, final=stable_cycles >= 2
         )
         if report != last_text:
-            try:
-                await status_message.edit_text(
-                    report,
-                    reply_markup=markup,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
+            updated = await safe_throttled_edit_text(
+                status_message,
+                report,
+                min_interval_sec=8.0,
+                reply_markup=markup,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            if updated:
                 last_text = report
-            except Exception as exc:
-                if "message is not modified" not in str(exc).lower():
-                    logging.warning("Could not update FullHD automation status: %s", exc)
 
         if stable_cycles >= 2:
             return
