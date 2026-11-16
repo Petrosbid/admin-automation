@@ -234,9 +234,10 @@ class DailyActivityService:
                     groups.items(), key=lambda pair: (pair[0][0].casefold(), pair[0][1])
                 )[:45]:
                     suffix = f" — {', '.join(sorted(names, key=str.casefold))}" if names else ""
-                    lines.append(
-                        f"• {esc(title)} — <code>{esc(episode)}</code>{esc(suffix)}"
-                    )
+                    entry = f"• {esc(title)} — <code>{esc(episode)}</code>"
+                    if suffix:
+                        entry += esc(suffix)
+                    lines.append(entry)
                 lines.append("")
 
         folder_events = [
