@@ -2149,6 +2149,20 @@ async def cb_incoming_subtitle_pick(call: CallbackQuery, state: FSMContext):
         Path(candidate["path"]),
         subs,
     )
+    # Some archives carry the episode tag in the archive filename while the
+    # extracted subtitle filenames inside are generic (for example, subtitle.srt).
+    candidate_tag = str(candidate.get("episode_tag") or "").strip().upper()
+    candidate_match = re.fullmatch(r"S(\d{1,2})E(\d{1,3})", candidate_tag)
+    if not episode_tags and candidate_match:
+        candidate_tag = (
+            f"S{int(candidate_match.group(1)):02d}E{int(candidate_match.group(2)):02d}"
+        )
+        episode_tags = [candidate_tag]
+        if (
+            candidate.get("category") in ("Series", "Anime")
+            and not AutomationService.SEASON_DIR_REGEX.match(target_dir.name)
+        ):
+            target_dir = target_dir / f"S{int(candidate_match.group(1)):02d}"
 
     # A remote-only series season must be hydrated before the normal automation menu is offered.
     if not target_dir.exists() and candidate.get("category") in ("Series", "Anime"):

@@ -679,6 +679,7 @@ def sync_download_episode_files(
                             raise RuntimeError(
                                 f"خواندن پوشه اصلی FTP ناموفق بود: {retry_listing_error}"
                             ) from first_listing_error
+                        result["failed"] += 1
                         result["errors"].append(
                             f"فهرست {normalized} خوانده نشد: {retry_listing_error}"
                         )
