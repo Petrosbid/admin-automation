@@ -887,8 +887,14 @@ class EZTVTrackerService:
     @staticmethod
     def _series_index_report_lines(shows: list[dict[str, Any]]) -> list[str]:
         """Render highlighted public index links for the series represented in a report."""
-        servers = CuteFTPService.get_servers()
-        if not servers or not shows:
+        if not shows:
+            return []
+        try:
+            servers = CuteFTPService.get_servers()
+        except Exception:
+            logging.exception("Could not load FTP servers for EZTV series index links")
+            return []
+        if not servers:
             return []
 
         lines: list[str] = []
