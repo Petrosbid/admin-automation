@@ -7,6 +7,7 @@ from urllib.parse import quote
 from core.config_loader import cfg
 from services.cuteftp_worker import (
     sync_upload_cuteftp,
+    sync_download_episode_files,
     get_current_cuteftp_remote_dir,
     list_ftp_dir_entries,
 )
@@ -315,6 +316,30 @@ class CuteFTPService:
             if not item.get("checked", False) and not item.get("exists")
         ]
         return response
+
+
+    @classmethod
+    async def download_episode_files(
+        cls,
+        remote_dir: str,
+        local_dir: Path,
+        episode_tags: list[str],
+        server_id: str,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Download one or more episode tags from a specific FTP server into the matching Workspace season."""
+        server = cls.get_server_by_id(server_id)
+        if not server:
+            raise RuntimeError("سرور انتخاب‌شده دیگر در تنظیمات FTP موجود نیست.")
+        target_remote_dir = cls._remote_path_for_server(remote_dir, server)
+        return await asyncio.to_thread(
+            sync_download_episode_files,
+            target_remote_dir,
+            Path(local_dir),
+            list(episode_tags or []),
+            server,
+            progress_callback,
+        )
 
     @classmethod
     async def _resolve_upload_server(cls, remote_subpath: str, server_id: str | None = None) -> dict:

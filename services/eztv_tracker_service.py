@@ -884,6 +884,51 @@ class EZTVTrackerService:
 
         return updates
 
+    @staticmethod
+    def _series_index_report_lines(shows: list[dict[str, Any]]) -> list[str]:
+        """Render highlighted public index links for the series represented in a report."""
+        if not shows:
+            return []
+        try:
+            servers = CuteFTPService.get_servers()
+        except Exception:
+            logging.exception("Could not load FTP servers for EZTV series index links")
+            return []
+        if not servers:
+            return []
+
+        lines: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for show in shows:
+            title = str(show.get("title") or "").strip()
+            category = str(show.get("category") or "Series").strip().title()
+            if not title or category not in ("Series", "Anime"):
+                continue
+            remote_path = f"/English/{category}/{title}"
+            for server in servers:
+                url = CuteFTPService.build_public_url(server, remote_path)
+                if not url:
+                    continue
+                directory_url = url.rstrip("/") + "/"
+                key = (title.casefold(), directory_url.casefold())
+                if key in seen:
+                    continue
+                seen.add(key)
+                lines.append(
+                    f"• <b>{html.escape(title)}</b> — "
+                    f'<a href="{html.escape(directory_url, quote=True)}">📂 باز کردن ایندکس</a> '
+                    f"<i>({html.escape(str(server.get('name') or server.get('id') or 'سرور'))})</i>"
+                )
+                if len(lines) >= 30:
+                    break
+            if len(lines) >= 30:
+                break
+
+        if not lines:
+            return []
+        return ["", "🔗 <b>ایندکس پوشه سریال‌ها و انیمه‌ها:</b>", *lines]
+
+
     async def poll_once(self, bot, send_summary: bool = True) -> dict[str, Any]:
         async with self._poll_lock:
             shows = self.get_shows()
@@ -1068,6 +1113,25 @@ class EZTVTrackerService:
                             )
                 if not queued and not completed_updates and not already_local and not already_remote:
                     lines.append("در این نوبت انتشار منطبق با قسمت‌های مورد انتظار پیدا نشد.")
+                active_titles = {
+                    str(item.get("show") or "").strip()
+                    for item in (queued + completed_updates)
+                    if str(item.get("show") or "").strip()
+                }
+                if already_local or already_remote:
+                    active_titles.update(
+                        str(show.get("title") or "").strip()
+                        for show in shows
+                        if any(
+                            note.startswith(f"{str(show.get('title') or '').strip()} ")
+                            for note in (already_local + already_remote)
+                        )
+                    )
+                active_shows = [
+                    show for show in shows
+                    if str(show.get("title") or "").strip() in active_titles
+                ]
+                lines.extend(self._series_index_report_lines(active_shows))
                 await self._send_admin_message(bot, "\n".join(lines))
             return {
                 "shows": len(shows),
@@ -1288,11 +1352,13 @@ class EZTVTrackerService:
         ]
 
         activity_count = 0
+        active_shows: list[dict[str, Any]] = []
         for show in shows:
             today_episodes = self._today_episodes_for_show(show, state, today)
             if not today_episodes:
                 continue
 
+            active_shows.append(show)
             for episode in today_episodes:
                 activity_count += 1
                 tag = self._episode_tag(show["season"], episode)
@@ -1409,6 +1475,8 @@ class EZTVTrackerService:
 
         if activity_count == 0:
             lines.append("امروز هیچ انتشار، دانلود صف‌شده یا پایان دانلودی برای سریال‌های ردیابی‌شده ثبت نشده است.")
+        else:
+            lines.extend(self._series_index_report_lines(active_shows))
         lines.append(
             "تعریف «کامل»: تمام کیفیت‌های تعریف‌شده برای ردیاب و خروجی‌های موردنیاز سافت‌ساب/هاردساب "
             "در Workspace یا سرور مقصد موجود باشند."
