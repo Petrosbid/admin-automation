@@ -275,6 +275,56 @@ class DailyActivityService:
                 )
             lines.append("")
 
+        # Resolve public series/anime index URLs from the configured FTP servers.
+        # URLs are omitted when a server has no public base URL configured.
+        index_targets: set[tuple[str, str]] = set()
+        for item in events:
+            category = str(item.get("category") or "").strip().casefold()
+            title = str(item.get("media_title") or "").strip()
+            if title and category in ("series", "anime"):
+                canonical_category = "Anime" if category == "anime" else "Series"
+                index_targets.add((canonical_category, title))
+
+        index_lines: list[str] = []
+        seen_index_urls: set[str] = set()
+        if index_targets:
+            try:
+                from services.cuteftp_service import CuteFTPService
+
+                servers = CuteFTPService.get_servers()
+                for category, title in sorted(
+                    index_targets,
+                    key=lambda value: (value[0].casefold(), value[1].casefold()),
+                ):
+                    remote_path = f"/English/{category}/{title}"
+                    for server in servers:
+                        url = CuteFTPService.build_public_url(server, remote_path)
+                        if not url:
+                            continue
+                        directory_url = url.rstrip("/") + "/"
+                        if directory_url in seen_index_urls:
+                            continue
+                        seen_index_urls.add(directory_url)
+                        server_name = esc(server.get("name") or server.get("id") or "سرور")
+                        index_lines.append(
+                            f"• <b>{esc(title)}</b> — "
+                            f'<a href="{html.escape(directory_url, quote=True)}">📂 باز کردن ایندکس ({server_name})</a>'
+                        )
+                        if len(index_lines) >= 24:
+                            break
+                    if len(index_lines) >= 24:
+                        break
+            except Exception:
+                logging.exception("Could not build public series index links for daily report")
+
+        if index_lines:
+            section_count += 1
+            lines.extend([
+                "🔗 <b>ایندکس پوشه سریال‌ها و انیمه‌ها</b>",
+                *index_lines,
+                "",
+            ])
+
         if not section_count:
             lines.append("امروز کیفیت، سافت‌ساب، هاردساب یا پوشه اتوماسیون‌شده‌ای ثبت نشده است.")
 
