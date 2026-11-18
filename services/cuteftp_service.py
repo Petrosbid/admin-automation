@@ -388,6 +388,14 @@ class CuteFTPService:
                 for server, _ in matched_pairs
             ]
 
+        def _selection_display_path(matched_pairs: list[tuple[dict, dict]]) -> str:
+            if not remote_subpath or remote_subpath == "__CURRENT__":
+                return " | ".join(
+                    f"{server['name']}: {target_paths[server['id']]}"
+                    for server, _ in matched_pairs
+                )
+            return str(remote_subpath)
+
         # Prefer an exact existing destination.
         exact_results = await cls.inspect_remote_dir_all(remote_subpath)
         exact_pairs = list(zip(servers, exact_results))
@@ -401,7 +409,7 @@ class CuteFTPService:
         ]
         if len(exact_matches) > 1:
             raise ServerSelectionRequired(
-                remote_subpath,
+                _selection_display_path(exact_matches),
                 _selection_choices(exact_matches),
                 unavailable_servers=list(unavailable_by_id.values()),
             )
@@ -465,7 +473,7 @@ class CuteFTPService:
             ]
             if len(ancestor_matches) > 1:
                 raise ServerSelectionRequired(
-                    remote_subpath,
+                    _selection_display_path(ancestor_matches),
                     _selection_choices(ancestor_matches),
                     unavailable_servers=list(unavailable_by_id.values()),
                 )
