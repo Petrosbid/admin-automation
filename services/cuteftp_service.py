@@ -343,6 +343,15 @@ class CuteFTPService:
 
     @classmethod
     async def _resolve_upload_server(cls, remote_subpath: str, server_id: str | None = None) -> dict:
+        """
+        Resolve one FTP destination without splitting a media automation across drives.
+
+        Exact destination matches always win. When a new quality/SoftSub/HardSub
+        folder does not exist yet, walk upward to the nearest existing media
+        ancestor (season or series/movie root) and keep that server affinity.
+        Only a genuinely new series/movie with no existing ancestor falls back
+        to the first configured server.
+        """
         servers = cls.get_servers()
         if not servers:
             raise RuntimeError(
@@ -355,51 +364,138 @@ class CuteFTPService:
                 raise RuntimeError("سرور انتخاب‌شده دیگر در config.yaml وجود ندارد.")
             return selected
 
-        results = await cls.inspect_remote_dir_all(remote_subpath)
-        pairs = list(zip(servers, results))
-        matches = [
+        target_paths = {
+            server["id"]: cls._remote_path_for_server(remote_subpath, server)
+            for server in servers
+        }
+        unavailable_by_id: dict[str, dict[str, str]] = {}
+
+        def _remember_check(server: dict, result: dict):
+            server_id_value = str(server["id"])
+            if result.get("checked", False):
+                unavailable_by_id.pop(server_id_value, None)
+            else:
+                unavailable_by_id[server_id_value] = {
+                    "id": server_id_value,
+                    "name": str(server.get("name") or server_id_value),
+                    "error": str(result.get("error") or "اتصال برقرار نشد"),
+                }
+
+        def _selection_choices(matched_pairs: list[tuple[dict, dict]]) -> list[dict]:
+            # Choices must target the new folder, not the existing parent folder.
+            return [
+                cls._public_server_info(server, target_paths[server["id"]])
+                for server, _ in matched_pairs
+            ]
+
+        # Prefer an exact existing destination.
+        exact_results = await cls.inspect_remote_dir_all(remote_subpath)
+        exact_pairs = list(zip(servers, exact_results))
+        for server, result in exact_pairs:
+            _remember_check(server, result)
+
+        exact_matches = [
             (server, result)
-            for server, result in pairs
+            for server, result in exact_pairs
             if result.get("exists")
         ]
-        unavailable = [
-            {
-                "id": server["id"],
-                "name": server["name"],
-                "error": str(result.get("error") or "اتصال برقرار نشد"),
-            }
-            for server, result in pairs
-            if not result.get("checked", False) and not result.get("exists")
-        ]
-        if len(matches) > 1:
-            choices = [
-                cls._public_server_info(server, result["remote_dir"])
-                for server, result in matches
-            ]
-            display_path = remote_subpath
-            if not display_path or display_path == "__CURRENT__":
-                display_path = " | ".join(
-                    f"{result['server_name']}: {result['remote_dir']}"
-                    for _, result in matches
+        if len(exact_matches) > 1:
+            raise ServerSelectionRequired(
+                remote_subpath,
+                _selection_choices(exact_matches),
+                unavailable_servers=list(unavailable_by_id.values()),
+            )
+        if exact_matches:
+            return exact_matches[0][0]
+
+        # A newly-created quality folder may not exist on any server yet,
+        # while its season/series root already belongs to the backup server.
+        ancestor_paths = dict(target_paths)
+        while ancestor_paths:
+            next_ancestor_paths: dict[str, str] = {}
+            for server in servers:
+                current_path = ancestor_paths.get(server["id"])
+                if not current_path:
+                    continue
+                parts = [part for part in current_path.split("/") if part]
+                is_english_media_tree = (
+                    len(parts) >= 2
+                    and parts[0].casefold() == "english"
+                    and parts[1].casefold() in {"movies", "series", "anime"}
                 )
-            raise ServerSelectionRequired(display_path, choices, unavailable_servers=unavailable)
-        if matches:
-            return matches[0][0]
+                minimum_parts = 3 if is_english_media_tree else 2
+                if len(parts) > minimum_parts:
+                    next_ancestor_paths[server["id"]] = "/" + "/".join(parts[:-1])
 
-        reachable = [
-            server for server, result in pairs
-            if result.get("checked", False)
-        ]
-        if reachable:
-            return reachable[0]
+            if not next_ancestor_paths:
+                break
 
-        errors = "; ".join(
-            f"{item['name']}: {item['error'][:120]}" for item in unavailable
-        )
-        raise RuntimeError(
-            "هیچ‌یک از سرورهای FTP قابل بررسی نبودند؛ برای جلوگیری از آپلود اشتباه عملیات متوقف شد. "
-            + errors
-        )
+            async def _inspect_ancestor(server: dict) -> dict:
+                ancestor = next_ancestor_paths.get(server["id"])
+                if not ancestor:
+                    return {"exists": False, "checked": True, "remote_dir": ""}
+                try:
+                    info = await asyncio.to_thread(list_ftp_dir_entries, ancestor, server)
+                except Exception as exc:
+                    return {
+                        "exists": False,
+                        "checked": False,
+                        "error": str(exc),
+                        "remote_dir": ancestor,
+                    }
+                result = dict(info)
+                result["remote_dir"] = ancestor
+                return result
+
+            ancestor_results = await asyncio.gather(
+                *(_inspect_ancestor(server) for server in servers)
+            )
+            ancestor_pairs = [
+                (server, result)
+                for server, result in zip(servers, ancestor_results)
+                if server["id"] in next_ancestor_paths
+            ]
+            for server, result in ancestor_pairs:
+                _remember_check(server, result)
+
+            ancestor_matches = [
+                (server, result)
+                for server, result in ancestor_pairs
+                if result.get("exists")
+            ]
+            if len(ancestor_matches) > 1:
+                raise ServerSelectionRequired(
+                    remote_subpath,
+                    _selection_choices(ancestor_matches),
+                    unavailable_servers=list(unavailable_by_id.values()),
+                )
+            if ancestor_matches:
+                selected = ancestor_matches[0][0]
+                logging.info(
+                    "FTP destination routed to server %s using existing ancestor %s (new target: %s)",
+                    selected["name"],
+                    ancestor_matches[0][1].get("remote_dir"),
+                    target_paths[selected["id"]],
+                )
+                return selected
+
+            ancestor_paths = next_ancestor_paths
+
+        # Fail closed when not all servers could be checked; do not silently
+        # route a new folder to the primary drive while backup may own its parent.
+        if unavailable_by_id:
+            errors = "; ".join(
+                f"{item['name']}: {item['error'][:120]}"
+                for item in unavailable_by_id.values()
+            )
+            raise RuntimeError(
+                "هیچ مقصد یا پوشه والد قابل‌شناسایی پیدا نشد و بررسی همه سرورها کامل نبود؛ "
+                "برای جلوگیری از آپلود روی درایو اشتباه، عملیات متوقف شد. "
+                + errors
+            )
+
+        # All servers were reachable and no matching media root exists.
+        return servers[0]
 
     @classmethod
     async def upload_path(

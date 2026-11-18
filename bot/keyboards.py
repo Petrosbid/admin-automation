@@ -233,15 +233,10 @@ def smart_auto_sub_name_kb(suggested_name: str, original_name: str) -> InlineKey
     return builder.as_markup()
 
 
-def smart_auto_missing_en_kb(has_embedded_en: bool) -> InlineKeyboardMarkup:
+def smart_auto_missing_en_kb(has_embedded_en: bool = False) -> InlineKeyboardMarkup:
+    # Embedded EN extraction is handled only by the post-FullHD-download pipeline.
+    # Keep the argument for compatibility with existing callers.
     builder = InlineKeyboardBuilder()
-    if has_embedded_en:
-        builder.row(
-            InlineKeyboardButton(
-                text="✅ بله، خودکار از فیلم استخراج و در پوشه srt قرار بده",
-                callback_data="sauto_en:extract"
-            )
-        )
     builder.row(
         InlineKeyboardButton(
             text="📤 آپلود دستی فایل زیرنویس انگلیسی (.srt / .zip)",
@@ -261,7 +256,6 @@ def smart_auto_missing_en_kb(has_embedded_en: bool) -> InlineKeyboardMarkup:
         )
     )
     return builder.as_markup()
-
 
 def smart_auto_final_selection_kb(
     available_softsub_qualities: list[str],

@@ -897,128 +897,116 @@ async def _check_english_sub_batch_step(call_or_msg: CallbackQuery | Message, st
     data = await state.get_data()
     target_dir = Path(data["sauto_target_dir"])
     ep_tags = data.get("sauto_ep_tags", [])
-    final_fa_map: dict[str, str] = data.get("sauto_final_fa_map", {})
     plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
 
-    # اگر انیمه است:
-    # ۱. در صورتی که زیرنویس .ass است، نسخه تبدیل‌شده .srt آن را هم در پوشه srt بساز
-    # ۲. نیازی به ساخت یا استخراج زیرنویس انگلیسی نیست -> مستقیم برو به مرحله انتخاب کیفیت‌ها!
     if plans and plans[0].category == "Anime":
-        _ensure_anime_dual_ass_and_srt_in_folder(plans, final_fa_map)
+        _ensure_anime_dual_ass_and_srt_in_folder(
+            plans,
+            data.get("sauto_final_fa_map", {}),
+        )
         await state.update_data(sauto_final_en_map={})
         return await _prompt_final_automation_choices_step(
             call_or_msg,
             state,
             plans,
-            en_note="🎌 **حالت انیمه:** زیرنویس در پوشه `srt` (همراه با تبدیل خودکار `.ass` به `.srt`) آماده شد (بدون نیاز به زیرنویس انگلیسی)."
+            en_note=(
+                "🎌 **حالت انیمه:** زیرنویس در پوشه srt آماده است؛ "
+                "در این مرحله استخراج زیرنویس انگلیسی انجام نمی‌شود."
+            ),
         )
 
     en_map: dict[str, str] = {}
-    missing_extractable: list[str] = []
-    missing_no_source: list[str] = []
+    missing_with_embedded: list[str] = []
+    missing_without_source: list[str] = []
 
-    for p in plans:
-        key = p.season_ep_tag if (p.is_series and p.season_ep_tag) else "MOVIE"
-        if p.existing_en_sub and p.existing_en_sub.exists():
-            en_map[key] = str(p.existing_en_sub.resolve())
-        elif p.embedded_en_source_video and p.embedded_en_track_id is not None:
-            missing_extractable.append(key)
+    for plan in plans:
+        key = plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
+        if plan.existing_en_sub and plan.existing_en_sub.is_file():
+            en_map[key] = str(plan.existing_en_sub.resolve())
+        elif plan.embedded_en_source_video and plan.embedded_en_track_id is not None:
+            missing_with_embedded.append(key)
         else:
-            missing_no_source.append(key)
+            missing_without_source.append(key)
 
     await state.update_data(sauto_final_en_map=en_map)
 
-    if not missing_extractable and not missing_no_source:
+    if not missing_with_embedded and not missing_without_source:
         return await _prompt_final_automation_choices_step(
-            call_or_msg, state, plans,
-            en_note=f"✅ زیرنویس انگلیسی برای هر `{len(en_map)}` مورد در پوشه موجود است."
+            call_or_msg,
+            state,
+            plans,
+            en_note=f"✅ زیرنویس انگلیسی برای هر {len(en_map)} مورد از قبل در پوشه موجود است.",
         )
 
     await state.set_state(SubtitleStates.sauto_waiting_en_decision)
-    has_embedded = len(missing_extractable) > 0
-
-    lines = ["🇬🇧 **بررسی وضعیت زیرنویس انگلیسی:**\n"]
+    lines = ["🇬🇧 **وضعیت زیرنویس انگلیسی:**\n"]
     if en_map:
-        lines.append(f"✅ موجود در پوشه (`{len(en_map)}` مورد): `{', '.join(en_map.keys())}`")
-    if missing_extractable:
+        lines.append(f"✅ فایل انگلیسی موجود: {', '.join(en_map.keys())}")
+    if missing_with_embedded:
         lines.append(
-            f"🔍 **قابل استخراج خودکار از داخل فیلم (`{len(missing_extractable)}` مورد):** `{', '.join(missing_extractable)}`"
+            "ℹ️ ترک انگلیسی داخل فایل ویدئو برای این موارد شناسایی شده است: "
+            f"{', '.join(missing_with_embedded)}"
         )
-    if missing_no_source:
-        lines.append(f"⚠️ بدون زیرنویس انگلیسی (`{len(missing_no_source)}` مورد): `{', '.join(missing_no_source)}`")
-
-    if has_embedded:
         lines.append(
-            "\nآیا می‌خواهید ربات زیرنویس انگلیسی قسمت‌های کسری را **به طور خودکار از فایل فیلم استخراج کرده و در پوشه `srt` قرار دهد**؟")
-    else:
-        lines.append("\nمی‌توانید فایل زیرنویس انگلیسی (`.srt` / `.zip` / `.rar`) آپلود کنید یا ادامه دهید:")
+            "استخراج این ترک در مرحله Smart Automation انجام نمی‌شود؛ "
+            "استخراج و آپلود خودکار فقط پس از دانلود فایل FullHD انجام خواهد شد."
+        )
+    if missing_without_source:
+        lines.append(
+            "⚠️ برای این موارد فایل یا ترک انگلیسی قابل‌شناسایی وجود ندارد: "
+            f"{', '.join(missing_without_source)}"
+        )
+    lines.append(
+        "\nمی‌توانید زیرنویس انگلیسی آماده را دستی ارسال کنید یا بدون آن ادامه دهید:"
+    )
 
-    kb = smart_auto_missing_en_kb(has_embedded)
-    text = "\n".join(lines)
+    keyboard = smart_auto_missing_en_kb(False)
+    text_value = "\n".join(lines)
     if isinstance(call_or_msg, CallbackQuery):
-        await call_or_msg.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+        await call_or_msg.message.edit_text(
+            text_value,
+            reply_markup=keyboard,
+            parse_mode="Markdown",
+        )
     else:
-        await call_or_msg.answer(text, reply_markup=kb, parse_mode="Markdown")
+        await call_or_msg.answer(
+            text_value,
+            reply_markup=keyboard,
+            parse_mode="Markdown",
+        )
 
 
 @router.callback_query(SubtitleStates.sauto_waiting_en_decision, F.data == "sauto_en:auto_extract")
 @router.callback_query(SubtitleStates.sauto_waiting_en_decision, F.data == "sauto_en:extract")
 async def cb_sauto_extract_en(call: CallbackQuery, state: FSMContext):
-    # نمایش اعلان بالای صفحه بدون مصرف سهمیه EditMessageText
+    # Compatibility for older Telegram messages: do not extract in Smart Automation.
     try:
-        await call.answer("⏳ در حال استخراج خودکار زیرنویس انگلیسی در پوشه srt...")
+        await call.answer(
+            "استخراج EN از Smart Automation حذف شده و فقط بعد از دانلود FullHD انجام می‌شود.",
+            show_alert=True,
+        )
     except Exception:
         pass
 
     data = await state.get_data()
-    target_dir = Path(data["sauto_target_dir"])
+    target_dir_value = data.get("sauto_target_dir")
+    if not target_dir_value:
+        return
+    target_dir = Path(target_dir_value)
     ep_tags = data.get("sauto_ep_tags", [])
-    en_map: dict[str, str] = data.get("sauto_final_en_map", {})
     plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
-
-    extracted_count = 0
-    for p in plans:
-        key = p.season_ep_tag if (p.is_series and p.season_ep_tag) else "MOVIE"
-        if key in en_map:
-            continue
-        if p.embedded_en_source_video and p.embedded_en_track_id is not None:
-            std_en_name = AutomationService.build_standard_subtitle_filename(
-                p.series_title,
-                p.season_ep_tag,
-                p.source_type,
-                "EN",
-                ".srt",
-                year=AutomationService.extract_media_year(
-                    p.series_title,
-                    p.base_dir.name,
-                    p.base_dir.parent.name,
-                    p.fullhd_source_video.name if p.fullhd_source_video else None,
-                    p.embedded_en_source_video.name if p.embedded_en_source_video else None,
-                    *(target.raw_video.name for target in p.softsub_targets),
-                ),
-            )
-            p.en_sub_dest_dir.mkdir(parents=True, exist_ok=True)
-            en_dest = p.en_sub_dest_dir / std_en_name
-            try:
-                await MKVService.extract_subtitle_track(
-                    video_path=p.embedded_en_source_video,
-                    track_id=p.embedded_en_track_id,
-                    output_sub_path=en_dest,
-                    track_codec=p.embedded_en_codec
-                )
-                SubtitleService.normalize_subtitle_file(en_dest)
-                en_map[key] = str(en_dest.resolve())
-                extracted_count += 1
-            except Exception as e:
-                logging.error(f"Error extracting EN subtitle for {key}: {e}")
-
+    en_map = dict(data.get("sauto_final_en_map", {}) or {})
     await state.update_data(sauto_final_en_map=en_map)
     await _prompt_final_automation_choices_step(
         call,
         state,
         plans,
-        en_note=f"✅ تعداد `{extracted_count}` زیرنویس انگلیسی با موفقیت استخراج و در پوشه `srt` ذخیره شد."
+        en_note=(
+            "⏭ استخراج زیرنویس انگلیسی در اتوماسیون انجام نشد؛ "
+            "در صورت دانلود FullHD، استخراج و آپلود EN در مرحله پسادانلود انجام می‌شود."
+        ),
     )
+
 
 @router.callback_query(SubtitleStates.sauto_waiting_en_decision, F.data == "sauto_en:upload")
 async def cb_sauto_upload_en_ask(call: CallbackQuery, state: FSMContext):

@@ -46,19 +46,25 @@ class HandBrakeService:
         temp_en_out: Path
     ) -> Path | None:
         """
-        پیدا کردن یا استخراج خودکار زیرنویس انگلیسی و تبدیل تضمینی آن به فرمت .srt استاندارد
-        تا در خروجی MP4 به صورت سافت‌ساب (mov_text) قرار بگیرد:
-        ۱. اگر فایل زیرنویس انگلیسی داده شده باشد، از همان استفاده می‌کند.
-        ۲. اگر داده نشده باشد، پوشه‌های srt/EN و srt کنار فیلم را می‌گردد.
-        ۳. اگر در پوشه‌ها نبود، مستقیماً ترک زیرنویس انگلیسی داخل خودِ فایل ویدئو را استخراج می‌کند!
+        Resolve an already-extracted English subtitle for the final SoftSub mux.
+
+        Embedded subtitle extraction is intentionally not performed here.
+        English tracks are extracted only by the post-FullHD-download pipeline,
+        then passed to HandBrake as an external subtitle file.
         """
-        cand_en: Path | None = None
-        if secondary_en_srt_path and Path(secondary_en_srt_path).exists():
-            cand_en = Path(secondary_en_srt_path)
+        candidate: Path | None = None
+        if secondary_en_srt_path and Path(secondary_en_srt_path).is_file():
+            candidate = Path(secondary_en_srt_path)
         else:
-            # جستجو در پوشه srt/EN یا srt فصل/فیلم
-            ep_tag_match = re.search(r"[Ss](\d{1,2})[\s._\-]*[Ee](\d{1,3})", video_path.name)
-            ep_tag = f"S{int(ep_tag_match.group(1)):02d}E{int(ep_tag_match.group(2)):02d}" if ep_tag_match else ""
+            episode_match = re.search(
+                r"[Ss](\d{1,2})[\s._\-]*[Ee](\d{1,3})",
+                video_path.name,
+            )
+            episode_tag = (
+                f"S{int(episode_match.group(1)):02d}E{int(episode_match.group(2)):02d}"
+                if episode_match
+                else ""
+            )
             search_dirs = [
                 video_path.parent.parent / "srt" / "EN",
                 video_path.parent.parent / "srt",
@@ -66,53 +72,41 @@ class HandBrakeService:
                 video_path.parent / "srt",
                 video_path.parent,
             ]
-            for d in search_dirs:
-                if not d.is_dir():
+            for directory in search_dirs:
+                if not directory.is_dir():
                     continue
-                for f in sorted(d.iterdir(), key=lambda x: x.name.lower()):
-                    if f.is_file() and f.suffix.lower() in (".srt", ".ass", ".ssa"):
-                        if ep_tag and ep_tag.lower() not in f.name.lower():
-                            continue
-                        if d.name.upper() == "EN" or ".en." in f.name.lower() or f.name.lower().startswith("en_"):
-                            cand_en = f
-                            break
-                if cand_en:
+                for item in sorted(directory.iterdir(), key=lambda p: p.name.casefold()):
+                    if not item.is_file() or item.suffix.casefold() not in (".srt", ".ass", ".ssa"):
+                        continue
+                    if episode_tag and episode_tag.casefold() not in item.name.casefold():
+                        continue
+                    if (
+                        directory.name.casefold() == "en"
+                        or ".en." in item.name.casefold()
+                        or item.name.casefold().startswith("en_")
+                    ):
+                        candidate = item
+                        break
+                if candidate:
                     break
 
-        if cand_en and cand_en.exists():
-            if cand_en.suffix.lower() in (".ass", ".ssa"):
-                MKVService._ass_to_clean_srt(cand_en, temp_en_out)
-            else:
-                temp_en_out.write_text(SubtitleService.read_subtitle_safe(cand_en), encoding="utf-8-sig")
-            return temp_en_out if temp_en_out.exists() else None
+        if not candidate or not candidate.is_file():
+            return None
 
-        # اگر فایل زیرنویس انگلیسی بیرونی نبود، ترک انگلیسی داخل خود ویدئوی سورس را استخراج کن
-        try:
-            tracks = await MKVService.list_subtitle_tracks(video_path)
-            en_tracks = [
-                t for t in tracks
-                if MKVService._is_english_track(t)
-                and any(k in t["codec"].lower() for k in ("subrip", "srt", "ass", "ssa", "utf8", "text", "tx3g"))
-            ]
-            if en_tracks:
-                tid = en_tracks[0]["id"]
-                codec_low = en_tracks[0]["codec"].lower()
-                if "ass" in codec_low or "ssa" in codec_low:
-                    tmp_ass = temp_en_out.with_suffix(".ass")
-                    await MKVService.extract_subtitle_track(video_path, tid, tmp_ass)
-                    if tmp_ass.exists():
-                        MKVService._ass_to_clean_srt(tmp_ass, temp_en_out)
-                        tmp_ass.unlink(missing_ok=True)
-                else:
-                    await MKVService.extract_subtitle_track(video_path, tid, temp_en_out)
+        if candidate.suffix.casefold() in (".ass", ".ssa"):
+            MKVService._ass_to_clean_srt(candidate, temp_en_out)
+        else:
+            temp_en_out.write_text(
+                SubtitleService.read_subtitle_safe(candidate),
+                encoding="utf-8-sig",
+            )
+            SubtitleService.normalize_srt_utf8(temp_en_out)
 
-                if temp_en_out.exists() and temp_en_out.stat().st_size > 10:
-                    SubtitleService.normalize_srt_utf8(temp_en_out)
-                    return temp_en_out
-        except Exception:
-            pass
-
-        return None
+        return (
+            temp_en_out
+            if temp_en_out.is_file() and temp_en_out.stat().st_size > 0
+            else None
+        )
 
     @staticmethod
     async def _build_all_audio_cli_flags(
