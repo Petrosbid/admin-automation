@@ -8,6 +8,7 @@ from core.config_loader import cfg
 from services.cuteftp_worker import (
     sync_upload_cuteftp,
     sync_download_episode_files,
+    sync_download_movie_files,
     get_current_cuteftp_remote_dir,
     list_ftp_dir_entries,
 )
@@ -337,6 +338,27 @@ class CuteFTPService:
             target_remote_dir,
             Path(local_dir),
             list(episode_tags or []),
+            server,
+            progress_callback,
+        )
+
+    @classmethod
+    async def download_movie_files(
+        cls,
+        remote_dir: str,
+        local_dir: Path,
+        server_id: str,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Download all raw movie videos from one selected FTP server, excluding SoftSub filenames."""
+        server = cls.get_server_by_id(server_id)
+        if not server:
+            raise RuntimeError("سرور انتخاب‌شده دیگر در تنظیمات FTP موجود نیست.")
+        target_remote_dir = cls._remote_path_for_server(remote_dir, server)
+        return await asyncio.to_thread(
+            sync_download_movie_files,
+            target_remote_dir,
+            Path(local_dir),
             server,
             progress_callback,
         )

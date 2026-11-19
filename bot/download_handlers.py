@@ -93,6 +93,13 @@ def _resolve_series_or_movie_context(dest_dir: Path) -> tuple[bool, Path, str]:
         media_quality_dir = (
             dest_dir.name.casefold() in ("fullhd", "softsub", "hardsub", "srt", "sub")
             or bool(re.search(r"(?i)(1080p|720p|480p).*EBTV", dest_dir.name))
+            or bool(re.search(
+                r"(?i)full[ ._-]*hd|(?<![a-z0-9])fhd(?![a-z0-9])|"
+                r"(?<![a-z0-9])h[ ._-]*264(?![a-z0-9])|(?<![a-z0-9])x264(?![a-z0-9])|"
+                r"(?<![a-z0-9])avc(?![a-z0-9])|(?<![a-z0-9])1080p(?![a-z0-9])|"
+                r"1920[ ._x-]+1080",
+                dest_dir.name,
+            ))
         )
         if media_quality_dir and dest_dir.parent != dest_dir:
             movie_root = dest_dir.parent
@@ -207,172 +214,51 @@ async def _extract_and_queue_fullhd_english_subtitle(
     is_series: bool,
     episode_tag: str,
 ) -> Path | None:
-    """Extract an English text subtitle from a newly downloaded FullHD video and queue its upload."""
+    """
+    Reuse an existing EN sidecar or extract one from the downloaded FullHD file.
+    If that source has no English track, AutomationService checks the other local
+    quality files for the same movie/episode before reporting that EN is missing.
+    """
     video_path = Path(video_path).resolve()
     season_or_movie_dir = Path(season_or_movie_dir).resolve()
     if not video_path.is_file():
         return None
 
-    category = AutomationService.detect_category_from_path(season_or_movie_dir)
-    subtitle_dir = (
-        season_or_movie_dir / "srt" / "EN"
-        if is_series and category != "Anime"
-        else season_or_movie_dir / "srt"
-    )
-    subtitle_dir.mkdir(parents=True, exist_ok=True)
-
-    fallback_season = AutomationService.extract_season_num_from_dir(season_or_movie_dir)
-    if is_series and not episode_tag:
-        episode_tag = AutomationService.extract_episode_tag(
-            video_path.name, fallback_season=fallback_season
-        ) or ""
-    if is_series and not episode_tag:
+    try:
+        plan = await AutomationService.analyze_and_build_plan(
+            season_or_movie_dir,
+            episode_tag if is_series and episode_tag else None,
+        )
+        if plan.category == "Anime":
+            logging.info("Skipping separate EN subtitle extraction for Anime: %s", video_path.name)
+            return None
+        existing_en = await AutomationService.extract_english_subtitle_for_plan(
+            plan,
+            preferred_video=video_path,
+        )
+    except Exception as exc:
+        logging.exception("Could not extract English subtitle for %s", video_path)
         await bot.send_message(
             chat_id,
-            "⚠️ <b>استخراج زیرنویس انگلیسی انجام نشد.</b>\n"
-            "شماره قسمت از نام فایل FullHD قابل‌تشخیص نبود؛ برای جلوگیری از نام‌گذاری اشتباه، "
-            "فایل زیرنویس استخراج نشد.\n"
-            f"📄 فایل: <code>{html.escape(video_path.name)}</code>",
+            "❌ <b>استخراج زیرنویس انگلیسی با خطا مواجه شد.</b>\n"
+            f"📄 فایل FullHD: <code>{html.escape(video_path.name)}</code>\n"
+            f"خطا: <code>{html.escape(str(exc)[:350])}</code>",
             parse_mode="HTML",
         )
         return None
 
-    # Reuse a valid EN file for this episode if it is already present locally.
-    existing_en: Path | None = None
-    for candidate in sorted(subtitle_dir.iterdir(), key=lambda item: item.name.casefold()):
-        if (
-            not candidate.is_file()
-            or candidate.suffix.casefold() not in (".srt", ".ass", ".ssa")
-            or not (".en." in candidate.name.casefold() or candidate.name.casefold().startswith("en_"))
-            or candidate.stat().st_size <= 0
-        ):
-            continue
-        candidate_ep = AutomationService.extract_episode_tag(
-            candidate.name, fallback_season=fallback_season
-        )
-        if (is_series and candidate_ep and candidate_ep.upper() == episode_tag.upper()) or not is_series:
-            existing_en = candidate.resolve()
-            break
-
-    if existing_en is None:
-        try:
-            subtitle_tracks = await MKVService.list_subtitle_tracks(video_path)
-        except Exception as exc:
-            logging.exception("Could not inspect FullHD subtitle tracks in %s", video_path)
-            await bot.send_message(
-                chat_id,
-                "⚠️ <b>بررسی زیرنویس انگلیسی FullHD ناموفق بود.</b>\n"
-                f"📄 فایل: <code>{html.escape(video_path.name)}</code>\n"
-                f"خطا: <code>{html.escape(str(exc)[:300])}</code>",
-                parse_mode="HTML",
-            )
-            return None
-
-        english_tracks = [
-            track for track in subtitle_tracks
-            if track.get("id") is not None and MKVService._is_english_track(track)
-        ]
-
-        # Match the plan analyzer's conservative fallback: only one text track
-        # may be treated as EN when it has no language tag and is not labelled FA.
-        if not english_tracks:
-            all_text_tracks = [
-                track for track in subtitle_tracks
-                if MKVService.subtitle_extension_for_codec(track.get("codec", ""))
-                in (".srt", ".ass", ".ssa")
-            ]
-            if len(all_text_tracks) == 1:
-                only_track = all_text_tracks[0]
-                lang = str(only_track.get("language", "und") or "und").casefold()
-                lang_ietf = str(only_track.get("language_ietf", "") or "").casefold()
-                track_name = str(only_track.get("track_name", "") or "").casefold()
-                unknown_language = lang in ("", "und", "unknown") and lang_ietf in ("", "und", "unknown")
-                explicitly_persian = bool(re.search(
-                    r"(?<![a-z0-9])(?:persian|farsi|فارسی|fa|per|fas)(?![a-z0-9])",
-                    track_name,
-                ))
-                if unknown_language and not explicitly_persian:
-                    english_tracks = [only_track]
-
-        text_tracks = []
-        for track in english_tracks:
-            extension = MKVService.subtitle_extension_for_codec(track.get("codec", ""))
-            if extension in (".srt", ".ass", ".ssa"):
-                text_tracks.append((track, extension))
-
-        if not text_tracks:
-            reason = (
-                "ترک انگلیسی وجود دارد، اما فرمت آن تصویری/غیرمتنی است و برای اتوماسیون قابل‌استفاده نیست."
-                if english_tracks
-                else "هیچ ترک زیرنویس انگلیسی داخل فایل FullHD پیدا نشد."
-            )
-            await bot.send_message(
-                chat_id,
-                "⚠️ <b>زیرنویس انگلیسی در فایل FullHD پیدا نشد.</b>\n"
-                f"📄 فایل: <code>{html.escape(video_path.name)}</code>\n"
-                f"ℹ️ {html.escape(reason)}",
-                parse_mode="HTML",
-            )
-            return None
-
-        text_tracks.sort(key=lambda item: (
-            not bool(item[0].get("default_track")),
-            {".srt": 0, ".ass": 1, ".ssa": 2}.get(item[1], 9),
-            int(item[0].get("id", 0)),
-        ))
-        selected_track, extension = text_tracks[0]
-        media_title = (
+    if not existing_en or not existing_en.is_file() or existing_en.stat().st_size <= 0:
+        title = (
             season_or_movie_dir.parent.name
             if is_series and AutomationService.SEASON_DIR_REGEX.match(season_or_movie_dir.name)
             else season_or_movie_dir.name
         )
-        source_type = AutomationService.detect_source_type(video_path.name)
-        year = AutomationService.extract_media_year(
-            media_title, video_path.name, season_or_movie_dir.name, season_or_movie_dir.parent.name
-        )
-        filename = AutomationService.build_standard_subtitle_filename(
-            media_title,
-            episode_tag if is_series else "",
-            source_type,
-            "EN",
-            extension,
-            year=year,
-        )
-        existing_en = (subtitle_dir / filename).resolve()
-        temp_path = subtitle_dir / f"_temp_en_extract_{uuid.uuid4().hex[:8]}{extension}"
-
-        try:
-            await MKVService.extract_subtitle_track(
-                video_path=video_path,
-                track_id=selected_track["id"],
-                output_sub_path=temp_path,
-                track_codec=selected_track.get("codec"),
-            )
-            if not temp_path.is_file() or temp_path.stat().st_size <= 0:
-                raise RuntimeError("فایل خروجی زیرنویس انگلیسی خالی است.")
-            SubtitleService.normalize_subtitle_file(temp_path)
-            temp_path.replace(existing_en)
-        except Exception as exc:
-            temp_path.unlink(missing_ok=True)
-            logging.exception(
-                "Could not extract FullHD English subtitle: video=%s track=%s",
-                video_path, selected_track.get("id"),
-            )
-            await bot.send_message(
-                chat_id,
-                "❌ <b>ترک انگلیسی پیدا شد، اما استخراج آن از FullHD ناموفق بود.</b>\n"
-                f"📄 فایل: <code>{html.escape(video_path.name)}</code>\n"
-                f"خطا: <code>{html.escape(str(exc)[:300])}</code>",
-                parse_mode="HTML",
-            )
-            return None
-        finally:
-            temp_path.unlink(missing_ok=True)
-
-    if not existing_en.is_file() or existing_en.stat().st_size <= 0:
+        item_label = f"{title} {episode_tag}".strip()
         await bot.send_message(
             chat_id,
-            "⚠️ زیرنویس انگلیسی معتبر نیست و برای آپلود به صف اضافه نشد.",
+            "⚠️ <b>زیرنویس انگلیسی پیدا نشد.</b>\n"
+            f"🎬 عنوان: <code>{html.escape(item_label)}</code>\n"
+            "فایل FullHD و تمام فایل‌های کیفیت موجود بررسی شدند، اما ترک انگلیسیِ متنی پیدا نشد.",
             parse_mode="HTML",
         )
         return None
@@ -391,7 +277,7 @@ async def _extract_and_queue_fullhd_english_subtitle(
         logging.exception("Could not enqueue FullHD EN subtitle upload: %s", existing_en)
         await bot.send_message(
             chat_id,
-            "⚠️ زیرنویس انگلیسی ذخیره شد، اما صف آپلود آن ساخته نشد.\n"
+            "⚠️ زیرنویس انگلیسی استخراج و ذخیره شد، اما صف آپلود آن ساخته نشد.\n"
             f"📄 فایل: <code>{html.escape(existing_en.name)}</code>\n"
             f"مقصد: <code>{html.escape(remote_dir)}</code>\n"
             f"خطا: <code>{html.escape(str(exc)[:250])}</code>",
@@ -401,14 +287,121 @@ async def _extract_and_queue_fullhd_english_subtitle(
 
     await bot.send_message(
         chat_id,
-        "🇬🇧 <b>زیرنویس انگلیسی FullHD آماده شد و آپلود آن در صف قرار گرفت.</b>\n"
+        "🇬🇧 <b>زیرنویس انگلیسی آماده شد و آپلود آن در صف قرار گرفت.</b>\n"
         f"📄 فایل: <code>{html.escape(existing_en.name)}</code>\n"
-        f"📂 پوشه محلی: <code>{html.escape(str(subtitle_dir))}</code>\n"
+        f"📂 پوشه محلی: <code>{html.escape(str(existing_en.parent))}</code>\n"
         f"☁️ مقصد FTP: <code>{html.escape(remote_dir)}</code>\n"
         f"🆔 تسک آپلود: <code>#{html.escape(upload_task.task_id)}</code>",
         parse_mode="HTML",
     )
     return existing_en
+
+
+async def _process_selected_fullhd_source(
+    bot: Bot,
+    chat_id: int,
+    source_path: Path,
+    season_or_movie_dir: Path,
+    is_series: bool,
+    episode_tag: str,
+    automated_background: bool = False,
+):
+    source_path = Path(source_path).resolve()
+    if not source_path.is_file():
+        await bot.send_message(chat_id, "⚠️ فایل سورس FullHD انتخاب‌شده دیگر وجود ندارد.")
+        return
+
+    await _extract_and_queue_fullhd_english_subtitle(
+        bot,
+        chat_id,
+        source_path,
+        season_or_movie_dir,
+        is_series,
+        episode_tag,
+    )
+    await _schedule_fullhd_destination_automation(
+        bot,
+        chat_id,
+        source_path,
+        season_or_movie_dir,
+        is_series,
+        episode_tag,
+        automated_background=automated_background,
+    )
+
+    remote_dir = AutomationService.compute_server_remote_dir_for_local_path(source_path)
+    try:
+        remote_info = await CuteFTPService.inspect_remote_dir(remote_dir)
+    except Exception:
+        logging.exception("Could not inspect selected FullHD source upload destination %s", remote_dir)
+        remote_info = {"exists": False}
+
+    if bool(cfg.get("cuteftp", "auto_upload_after_download", True)) and remote_info.get("exists"):
+        await queue_engine.add_task(
+            "upload",
+            f"AutoUpload FullHD Source [{remote_dir}]: {source_path.name}",
+            CuteFTPService.upload_path,
+            source_path,
+            remote_dir,
+            notify_completion=not automated_background,
+        )
+    elif not automated_background and not remote_info.get("exists"):
+        await _send_missing_remote_folder_upload_prompt(
+            bot,
+            chat_id,
+            source_path,
+            remote_dir,
+        )
+
+
+async def _ask_movie_fullhd_source_selection(
+    bot: Bot,
+    chat_id: int,
+    candidates: list[Path],
+    season_or_movie_dir: Path,
+    episode_tag: str,
+    automated_background: bool,
+):
+    candidates = [Path(item).resolve() for item in candidates if Path(item).is_file()]
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = str(item).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    if len(unique) <= 1:
+        return unique[0] if unique else None
+
+    token = uuid.uuid4().hex[:8]
+    PENDING_POST_DL_ITEMS[token] = {
+        "type": "movie_fullhd_source_selection",
+        "candidates": [str(item) for item in unique],
+        "season_or_movie_dir": str(Path(season_or_movie_dir).resolve()),
+        "episode_tag": episode_tag,
+        "automated_background": automated_background,
+    }
+    kb = InlineKeyboardBuilder()
+    lines = []
+    for index, item in enumerate(unique[:20]):
+        size_mb = item.stat().st_size / (1024 * 1024)
+        label = f"{item.parent.name}: {item.name}"
+        kb.row(
+            InlineKeyboardButton(
+                text=f"🎬 {label[:54]}",
+                callback_data=f"pdl:fhdsrc:{token}:{index}",
+            )
+        )
+        lines.append(f"• {item.name} ({item.parent.name}) — {size_mb:.1f} MB")
+    await bot.send_message(
+        chat_id,
+        "🎬 <b>چند فایل مناسب برای سورس FullHD فیلم پیدا شد.</b>\n"
+        "برای جلوگیری از هاردساب روی فایل اشتباه، یکی را انتخاب کنید:\n\n"
+        + html.escape("\n".join(lines[:20])),
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML",
+    )
+    return None
 
 
 async def _smart_download_pipeline_job(
@@ -583,6 +576,7 @@ async def _smart_download_pipeline_job(
     server_files_in_folder = remote_folder_info.get("files", [])
     remote_folder_exists = bool(remote_folder_info.get("exists", False))
     auto_upload_cfg = bool(cfg.get("cuteftp", "auto_upload_after_download", True))
+    movie_source_selection_requested = False
 
     for vid in new_videos:
         if _is_480p_download(dest_dir, vid):
@@ -600,89 +594,62 @@ async def _smart_download_pipeline_job(
         if automated_background and expected_episode_tag:
             ep_tag = expected_episode_tag
 
-        # FullHD فقط سورس انکود است؛ کیفیت‌های خروجی از پوشه فصل تشخیص داده می‌شوند.
-        if dest_dir.name.casefold() == "fullhd":
-            copied_fullhd_name = None
+        # FullHD sources may live in a folder named FullHD/H264/1080p or
+        # be identified by the filename itself (FullHD, H.264, x264, AVC...).
+        is_fullhd_source = (
+            dest_dir.name.casefold() == "fullhd"
+            or (not is_series and AutomationService.fullhd_source_score(vid) > 0)
+        )
+        if is_fullhd_source:
+            if not is_series:
+                all_movie_videos = AutomationService._find_raw_videos_in_dir(
+                    season_or_movie_dir,
+                    recursive=True,
+                )
+                movie_candidates = AutomationService.find_fullhd_source_candidates(
+                    all_movie_videos
+                )
+                if not movie_candidates:
+                    movie_candidates = all_movie_videos
+
+                if len(movie_candidates) > 1:
+                    if not movie_source_selection_requested:
+                        await _ask_movie_fullhd_source_selection(
+                            bot,
+                            chat_id,
+                            movie_candidates,
+                            season_or_movie_dir,
+                            ep_tag,
+                            automated_background,
+                        )
+                        movie_source_selection_requested = True
+                    continue
+                selected_source = movie_candidates[0] if movie_candidates else vid
+            else:
+                selected_source = vid
+
+            # Use the chosen source, not a different incidental file from the download loop.
             if is_series and ep_tag and server_files_in_folder:
                 copied_fullhd_name = AutomationService.match_filename_from_server_siblings(
                     server_files_in_folder, ep_tag
                 )
+                if copied_fullhd_name:
+                    final_path = selected_source.with_name(copied_fullhd_name)
+                    if selected_source.resolve() != final_path.resolve():
+                        if final_path.exists():
+                            final_path.unlink(missing_ok=True)
+                        selected_source.rename(final_path)
+                        selected_source = final_path
 
-            if copied_fullhd_name:
-                final_path = vid.with_name(copied_fullhd_name)
-                if vid.resolve() != final_path.resolve():
-                    if final_path.exists():
-                        final_path.unlink(missing_ok=True)
-                    vid.rename(final_path)
-                    vid = final_path
-
-                await _extract_and_queue_fullhd_english_subtitle(
-                    bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag
-                )
-                await _schedule_fullhd_destination_automation(
-                    bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag,
-                    automated_background=automated_background,
-                )
-                if remote_folder_exists:
-                    if auto_upload_cfg:
-                        await queue_engine.add_task(
-                            "upload",
-                            f"AutoUpload [{remote_folder_path}]: {vid.name}",
-                            CuteFTPService.upload_path,
-                            vid,
-                            remote_folder_path,
-                        )
-                elif not automated_background:
-                    await _send_missing_remote_folder_upload_prompt(
-                        bot, chat_id, vid, remote_folder_path
-                    )
-            else:
-                suggested_std_name = await AutomationService.build_standard_raw_filename_for_folder(
-                    video_path=vid,
-                    folder_name=dest_dir.name,
-                    series_or_movie_title=series_or_movie_title,
-                    season_ep_tag=ep_tag,
-                    is_series=is_series,
-                )
-                if automated_background:
-                    final_path = vid.with_name(suggested_std_name)
-                    if final_path.exists() and final_path.resolve() != vid.resolve():
-                        final_path = vid.with_name(
-                            f"{Path(suggested_std_name).stem}__{uuid.uuid4().hex[:6]}{Path(suggested_std_name).suffix}"
-                        )
-                    if final_path.resolve() != vid.resolve():
-                        vid.rename(final_path)
-                        vid = final_path
-                    await _extract_and_queue_fullhd_english_subtitle(
-                        bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag
-                    )
-                    await _schedule_fullhd_destination_automation(
-                        bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag,
-                        automated_background=automated_background,
-                    )
-                    if remote_folder_exists and auto_upload_cfg:
-                        await queue_engine.add_task(
-                            "upload",
-                            f"AutoUpload [{remote_folder_path}]: {vid.name}",
-                            CuteFTPService.upload_path,
-                            vid,
-                            remote_folder_path,
-                            notify_completion=False,
-                        )
-                else:
-                    await _extract_and_queue_fullhd_english_subtitle(
-                        bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag
-                    )
-                    await _send_standard_name_confirmation_prompt(
-                        bot=bot,
-                        chat_id=chat_id,
-                        vid_path=vid,
-                        suggested_name=suggested_std_name,
-                        remote_folder_path=remote_folder_path,
-                        should_auto_upload=(auto_upload_cfg and remote_folder_exists),
-                        ask_fullhd_e01_question=(not remote_folder_exists),
-                        fullhd_auto_encode=True,
-                    )
+            await _process_selected_fullhd_source(
+                bot,
+                chat_id,
+                selected_source,
+                season_or_movie_dir,
+                is_series,
+                ep_tag,
+                automated_background=automated_background,
+            )
             continue
 
         ask_missing_folder_question = not remote_folder_exists
@@ -1502,6 +1469,42 @@ async def cb_pdl_create_missing_local_dirs(call: CallbackQuery):
     )
 
 
+@router.callback_query(F.data.startswith("pdl:fhdsrc:"))
+async def cb_pdl_movie_fullhd_source_selected(call: CallbackQuery):
+    parts = call.data.split(":")
+    if len(parts) != 4:
+        return await call.answer("درخواست انتخاب سورس معتبر نیست.", show_alert=True)
+
+    token, index_text = parts[2], parts[3]
+    info = PENDING_POST_DL_ITEMS.get(token)
+    if not info or info.get("type") != "movie_fullhd_source_selection":
+        return await call.answer("این انتخاب منقضی شده است.", show_alert=True)
+
+    try:
+        selected = Path(info.get("candidates", [])[int(index_text)]).resolve()
+    except (ValueError, IndexError, TypeError):
+        return await call.answer("فایل انتخاب‌شده معتبر نیست.", show_alert=True)
+    if not selected.is_file():
+        return await call.answer("فایل انتخاب‌شده دیگر وجود ندارد.", show_alert=True)
+
+    PENDING_POST_DL_ITEMS.pop(token, None)
+    await call.answer("سورس FullHD انتخاب شد.")
+    await call.message.edit_text(
+        "✅ سورس فیلم انتخاب شد؛ استخراج زیرنویس انگلیسی و اتوماسیون انکود در حال آماده‌سازی است.\n"
+        f"📄 <code>{html.escape(selected.name)}</code>",
+        parse_mode="HTML",
+    )
+    await _process_selected_fullhd_source(
+        call.bot,
+        call.message.chat.id,
+        selected,
+        Path(info["season_or_movie_dir"]),
+        False,
+        str(info.get("episode_tag") or ""),
+        automated_background=bool(info.get("automated_background", False)),
+    )
+
+
 @router.callback_query(F.data.startswith("pdl:fhdyes:"))
 async def cb_pdl_fullhd_upload_yes(call: CallbackQuery):
     token = call.data.split(":")[2]
@@ -1572,6 +1575,14 @@ async def _finalize_post_dl_rename_and_upload(
             vid_path.name,
             fallback_season=AutomationService.extract_season_num_from_dir(season_or_movie_dir),
         ) or ""
+        await _extract_and_queue_fullhd_english_subtitle(
+            bot,
+            chat_id,
+            vid_path,
+            season_or_movie_dir,
+            is_ser,
+            ep_tag,
+        )
         await _schedule_fullhd_destination_automation(
             bot, chat_id, vid_path, season_or_movie_dir, is_ser, ep_tag
         )

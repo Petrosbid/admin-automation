@@ -803,6 +803,219 @@ def sync_download_episode_files(
             _close_ftp_quietly(ftp_holder[0])
 
 
+def sync_download_movie_files(
+    remote_movie_dir: str,
+    local_movie_dir: Path,
+    server_config: dict,
+    progress_callback: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """
+    Download raw movie video files recursively from one FTP movie folder.
+    Keep the relative directory layout and skip any filename/path containing
+    SoftSub. Existing complete files are kept and incomplete transfers use
+    isolated .part files.
+    """
+    remote_root = _normalize_remote_path(remote_movie_dir)
+    local_root = Path(local_movie_dir).resolve()
+    ftp_cfg = dict(server_config or {})
+    host = str(ftp_cfg.get("host", "")).strip()
+    username = str(ftp_cfg.get("username", "")).strip()
+    password = str(ftp_cfg.get("password", "")).strip()
+    if not host or not username or not password:
+        raise RuntimeError("اطلاعات اتصال FTP برای دانلود فیلم کامل نیست.")
+
+    try:
+        port = int(ftp_cfg.get("port", 21) or 21)
+        timeout = max(30, int(ftp_cfg.get("timeout", 120) or 120))
+    except (TypeError, ValueError):
+        port, timeout = 21, 120
+
+    conn_params = {
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "protocol": str(ftp_cfg.get("protocol", "FTP")).strip().upper(),
+        "timeout": timeout,
+        "passive_mode": bool(ftp_cfg.get("passive_mode", True)),
+    }
+    ftp_holder: list[FTP | None] = [None]
+
+    def connect() -> FTP:
+        return _create_ftp_connection(**conn_params)
+
+    result: dict[str, Any] = {
+        "downloaded": 0,
+        "skipped": 0,
+        "failed": 0,
+        "bytes": 0,
+        "files": [],
+        "skipped_files": [],
+        "errors": [],
+    }
+
+    with _DOWNLOAD_LOCK:
+        try:
+            ftp_holder[0] = connect()
+            candidates: list[tuple[str, tuple[str, ...], str, int | None]] = []
+            visited: set[str] = set()
+
+            def walk(remote_dir: str, relative_parts: tuple[str, ...], depth: int):
+                normalized = _normalize_remote_path(remote_dir)
+                key = normalized.casefold()
+                if key in visited:
+                    return
+                visited.add(key)
+
+                ftp = ftp_holder[0]
+                if ftp is None:
+                    ftp_holder[0] = connect()
+                    ftp = ftp_holder[0]
+                try:
+                    remote_files, remote_dirs = _list_ftp_directory_for_download(ftp, normalized)
+                except Exception as first_error:
+                    _close_ftp_quietly(ftp_holder[0])
+                    ftp_holder[0] = None
+                    try:
+                        ftp_holder[0] = connect()
+                        remote_files, remote_dirs = _list_ftp_directory_for_download(
+                            ftp_holder[0], normalized
+                        )
+                    except Exception as retry_error:
+                        _close_ftp_quietly(ftp_holder[0])
+                        ftp_holder[0] = None
+                        if not relative_parts:
+                            raise RuntimeError(
+                                f"خواندن پوشه اصلی فیلم از FTP ناموفق بود: {retry_error}"
+                            ) from first_error
+                        result["failed"] += 1
+                        result["errors"].append(
+                            f"فهرست {normalized} خوانده نشد: {retry_error}"
+                        )
+                        return
+
+                for filename, size in remote_files:
+                    if Path(filename).suffix.casefold() not in _DOWNLOAD_MEDIA_EXTENSIONS:
+                        continue
+                    if "softsub" in filename.casefold():
+                        continue
+                    candidates.append((normalized, relative_parts, filename, size))
+
+                if depth >= 6:
+                    return
+
+                for dirname in sorted(remote_dirs, key=str.casefold):
+                    low_dir = dirname.casefold()
+                    if (
+                        "softsub" in low_dir
+                        or low_dir in {"srt", "sub", "subs", "subtitle", "subtitles"}
+                        or low_dir.startswith("_")
+                        or not _safe_ftp_entry_name(dirname)
+                    ):
+                        continue
+                    child_remote = _normalize_remote_path(f"{normalized}/{dirname}")
+                    walk(child_remote, relative_parts + (dirname,), depth + 1)
+
+            walk(remote_root, (), 0)
+            candidates.sort(
+                key=lambda item: ("/".join(item[1]).casefold(), item[2].casefold())
+            )
+            if not candidates:
+                raise FileNotFoundError(
+                    f"در پوشه فیلم {remote_root} هیچ فایل ویدئویی بدون SoftSub پیدا نشد."
+                )
+
+            local_root.mkdir(parents=True, exist_ok=True)
+            total = len(candidates)
+            for index, (remote_dir, relative_parts, filename, expected_size) in enumerate(
+                candidates,
+                start=1,
+            ):
+                target_dir = local_root.joinpath(*relative_parts)
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target_path = (target_dir / filename).resolve()
+                try:
+                    target_path.relative_to(local_root)
+                except ValueError:
+                    result["failed"] += 1
+                    result["errors"].append(f"مسیر ناامن رد شد: {filename}")
+                    continue
+
+                if target_path.exists():
+                    try:
+                        current_size = target_path.stat().st_size
+                    except OSError:
+                        current_size = -1
+                    if expected_size is None or current_size == expected_size:
+                        result["skipped"] += 1
+                        result["skipped_files"].append(str(target_path))
+                    else:
+                        result["failed"] += 1
+                        result["errors"].append(
+                            f"فایل محلی هم‌نام با اندازه متفاوت وجود دارد؛ بازنویسی نشد: {target_path}"
+                        )
+                    continue
+
+                part_path = target_path.with_name(
+                    target_path.name + ".part-" + uuid.uuid4().hex[:8]
+                )
+                last_error: Exception | None = None
+                for attempt in range(1, 4):
+                    try:
+                        ftp = ftp_holder[0]
+                        if ftp is None:
+                            ftp_holder[0] = connect()
+                            ftp = ftp_holder[0]
+                        ftp.cwd(remote_dir)
+                        with part_path.open("wb") as output:
+                            ftp.retrbinary(
+                                f"RETR {filename}",
+                                output.write,
+                                blocksize=UPLOAD_BLOCK_SIZE,
+                            )
+                        received_size = part_path.stat().st_size
+                        if expected_size is not None and received_size != expected_size:
+                            raise IOError(
+                                f"اندازه فایل دریافتی ({received_size}) با اندازه سرور "
+                                f"({expected_size}) برابر نیست."
+                            )
+                        os.replace(part_path, target_path)
+                        result["downloaded"] += 1
+                        result["bytes"] += received_size
+                        result["files"].append(str(target_path))
+                        last_error = None
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        try:
+                            part_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        _close_ftp_quietly(ftp_holder[0])
+                        ftp_holder[0] = None
+                        if attempt < 3:
+                            time.sleep(attempt * 2)
+
+                if last_error is not None:
+                    result["failed"] += 1
+                    result["errors"].append(f"{filename}: {last_error}")
+
+                if progress_callback:
+                    progress_callback(
+                        f"دریافت فیلم از سرور {index}/{total} | دانلود: {result['downloaded']} | "
+                        f"موجود: {result['skipped']} | خطا: {result['failed']} | {filename[:90]}"
+                    )
+
+            if result["failed"] and not result["downloaded"] and not result["skipped"]:
+                raise RuntimeError(
+                    "هیچ فایل فیلمی با موفقیت دریافت نشد: "
+                    + "; ".join(result["errors"][:3])
+                )
+            return result
+        finally:
+            _close_ftp_quietly(ftp_holder[0])
+
+
 def sync_upload_cuteftp(
     local_target: Path,
     remote_subpath: str = "__CURRENT__",
