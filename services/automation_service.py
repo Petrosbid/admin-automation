@@ -2,6 +2,7 @@ import asyncio
 import difflib
 import logging
 import re
+import shutil
 import time
 from urllib.parse import parse_qs, unquote, urlparse
 from dataclasses import dataclass, field
@@ -50,6 +51,7 @@ class AutomationPlan:
     embedded_en_track_id: int | None = None
     embedded_en_codec: str = "srt"
     fullhd_source_video: Path | None = None
+    fullhd_source_candidates: list[Path] = field(default_factory=list)
     softsub_targets: list[SoftSubTarget] = field(default_factory=list)
     available_episodes: list[str] = field(default_factory=list)
 
@@ -236,13 +238,68 @@ class AutomationService:
                 continue
             # اگر در حالت recursive زیرپوشه‌ای از نوع SoftSub یا HardSub بود رد کن
             if recursive and f.parent != directory:
-                parent_low = f.parent.name.lower()
-                if parent_low in ("softsub", "hardsub", "srt", "sub") or parent_low.endswith(("-softsub", "-hardsub")):
+                try:
+                    relative_parent_parts = f.relative_to(directory).parts[:-1]
+                except ValueError:
+                    relative_parent_parts = (f.parent.name,)
+                excluded_parent = any(
+                    part.casefold() in ("softsub", "hardsub", "srt", "sub", "subs")
+                    or "softsub" in part.casefold()
+                    or "hardsub" in part.casefold()
+                    for part in relative_parent_parts
+                )
+                if excluded_parent:
                     continue
 
             videos.append(f.resolve())
 
         return sorted(videos, key=lambda x: x.name.lower())
+
+    @classmethod
+    def fullhd_source_score(cls, video_path: Path) -> int:
+        """Score a raw video as a likely FullHD/encode source using its name and folder."""
+        video_path = Path(video_path)
+        filename = video_path.name.casefold()
+        parent = video_path.parent.name.casefold()
+        ancestor_names = [item.name.casefold() for item in list(video_path.parents)[:5]]
+        combined = " ".join([filename, *ancestor_names])
+
+        if (
+            "softsub" in combined
+            or "hardsub" in combined
+            or re.search(r"(?i)(?:^|[._-])ebtv(?:[._-]|$)", filename)
+        ):
+            return 0
+
+        score = 0
+        if "fullhd" in ancestor_names:
+            score += 150
+        if re.search(r"(?i)full[ ._-]*hd|(?<![a-z0-9])fhd(?![a-z0-9])", combined):
+            score += 120
+        if re.search(r"(?i)(?<![a-z0-9])h[ ._-]*264(?![a-z0-9])|(?<![a-z0-9])x264(?![a-z0-9])|(?<![a-z0-9])avc(?![a-z0-9])", combined):
+            score += 90
+        if re.search(r"(?i)(?<![a-z0-9])1080p(?![a-z0-9])|1920[ ._x-]+1080", combined):
+            score += 70
+        return score
+
+    @classmethod
+    def find_fullhd_source_candidates(cls, videos: list[Path]) -> list[Path]:
+        """Return likely FullHD sources, ordered by strongest filename/folder evidence."""
+        scored: dict[str, tuple[int, Path]] = {}
+        for raw_path in videos or []:
+            path = Path(raw_path).resolve()
+            if not path.is_file():
+                continue
+            score = cls.fullhd_source_score(path)
+            if score > 0:
+                scored[str(path).casefold()] = (score, path)
+        return [
+            item[1]
+            for item in sorted(
+                scored.values(),
+                key=lambda item: (-item[0], item[1].name.casefold(), str(item[1]).casefold()),
+            )
+        ]
 
     @classmethod
     async def detect_audio_channels_tag(cls, video_path: Path) -> str:
@@ -1072,7 +1129,16 @@ class AutomationService:
                 for f in paths["srt_en"].iterdir():
                     if f.is_file() and f.suffix.lower() in (".srt", ".ass"):
                         f_ep = cls.extract_episode_tag(f.name, fallback_season=fallback_s)
-                        if (f_ep and f_ep == plan.season_ep_tag) or plan.season_ep_tag.lower() in f.name.lower():
+                        low_name = f.name.casefold()
+                        is_named_english = (
+                            ".en." in low_name
+                            or low_name.startswith("en_")
+                            or low_name.endswith(("_en.srt", "_en.ass", "_en.ssa"))
+                        )
+                        if is_named_english and (
+                            (f_ep and f_ep == plan.season_ep_tag)
+                            or plan.season_ep_tag.lower() in low_name
+                        ):
                             plan.existing_en_sub = f.resolve()
                             break
 
@@ -1109,9 +1175,32 @@ class AutomationService:
                         )
                     )
 
-                    if low_name == "fullhd":
-                        plan.fullhd_source_video = vid.resolve()
-                        plan.source_type = cls.detect_source_type(vid.name)
+            # FullHD source identification is filename-aware. Prefer an explicit FullHD
+            # folder, then H.264/x264/AVC/1080p names; never silently take the first
+            # quality file when several plausible sources exist.
+            explicit_fullhd = [
+                target.raw_video
+                for target in plan.softsub_targets
+                if target.raw_video.parent.name.casefold() == "fullhd"
+            ]
+            candidates = list(dict.fromkeys(
+                [
+                    Path(item).resolve()
+                    for item in explicit_fullhd
+                ] + cls.find_fullhd_source_candidates(
+                    [target.raw_video for target in plan.softsub_targets]
+                )
+            ))
+            if not candidates and len(plan.softsub_targets) == 1:
+                candidates = [plan.softsub_targets[0].raw_video]
+            plan.fullhd_source_candidates = list(dict.fromkeys(
+                Path(item).resolve() for item in candidates
+            ))
+            if len(plan.fullhd_source_candidates) == 1:
+                plan.fullhd_source_video = plan.fullhd_source_candidates[0]
+                plan.source_type = cls.detect_source_type(plan.fullhd_source_video.name)
+            elif plan.fullhd_source_candidates:
+                plan.fullhd_source_video = None
 
             # ۲. اگر کاربر به جای پوشه فصل، مستقیماً یک زیرپوشه کیفیت یا پوشه حاوی ویدئو را انتخاب کرده بود:
             if not plan.softsub_targets:
@@ -1131,13 +1220,16 @@ class AutomationService:
                         )
                     )
 
-            if not plan.fullhd_source_video and plan.softsub_targets:
-                ten_eighty = [
-                    t.raw_video for t in plan.softsub_targets
-                    if "1080" in t.quality_folder_name.lower() or "1080" in t.raw_video.name.lower()
-                ]
-                plan.fullhd_source_video = ten_eighty[0] if ten_eighty else plan.softsub_targets[0].raw_video
-                plan.source_type = cls.detect_source_type(plan.fullhd_source_video.name)
+            if not plan.fullhd_source_candidates and plan.softsub_targets:
+                candidate_videos = cls.find_fullhd_source_candidates(
+                    [target.raw_video for target in plan.softsub_targets]
+                )
+                if not candidate_videos and len(plan.softsub_targets) == 1:
+                    candidate_videos = [plan.softsub_targets[0].raw_video]
+                plan.fullhd_source_candidates = candidate_videos
+                if len(candidate_videos) == 1:
+                    plan.fullhd_source_video = candidate_videos[0]
+                    plan.source_type = cls.detect_source_type(plan.fullhd_source_video.name)
 
         else:
             paths = cls.create_movie_structure(target_dir)
@@ -1153,7 +1245,12 @@ class AutomationService:
 
             for f in paths["srt"].iterdir():
                 if f.is_file() and f.suffix.lower() in (".srt", ".ass"):
-                    if ".en." in f.name.lower() or f.name.lower().startswith("en_"):
+                    low_name = f.name.casefold()
+                    if (
+                        ".en." in low_name
+                        or low_name.startswith("en_")
+                        or low_name.endswith(("_en.srt", "_en.ass", "_en.ssa"))
+                    ):
                         plan.existing_en_sub = f.resolve()
                         break
 
@@ -1170,14 +1267,21 @@ class AutomationService:
                 )
 
             if raw_videos:
-                plan.fullhd_source_video = raw_videos[0].resolve()
-                plan.source_type = cls.detect_source_type(plan.fullhd_source_video.name)
+                candidates = cls.find_fullhd_source_candidates(raw_videos)
+                # If no filename advertises FullHD/H.264, keep all movie videos
+                # as explicit choices instead of guessing the first one.
+                if not candidates:
+                    candidates = [Path(item).resolve() for item in raw_videos]
+                plan.fullhd_source_candidates = list(dict.fromkeys(candidates))
+                if len(plan.fullhd_source_candidates) == 1:
+                    plan.fullhd_source_video = plan.fullhd_source_candidates[0]
+                    plan.source_type = cls.detect_source_type(plan.fullhd_source_video.name)
 
         if plan.category != "Anime" and not plan.existing_en_sub and plan.softsub_targets:
             search_vids = (
-                [plan.fullhd_source_video] + [t.raw_video for t in plan.softsub_targets]
-                if plan.fullhd_source_video
-                else [t.raw_video for t in plan.softsub_targets]
+                list(plan.fullhd_source_candidates)
+                + ([plan.fullhd_source_video] if plan.fullhd_source_video else [])
+                + [t.raw_video for t in plan.softsub_targets]
             )
             seen_v = set()
             for candidate_vid in search_vids:
@@ -1241,6 +1345,240 @@ class AutomationService:
             if p.softsub_targets:
                 plans.append(p)
         return plans
+
+    @classmethod
+    async def extract_english_subtitle_for_plan(
+        cls,
+        plan: AutomationPlan,
+        preferred_video: Path | None = None,
+    ) -> Path | None:
+        """
+        Find and extract one English text subtitle for this movie/episode.
+        Search order: preferred FullHD file, identified FullHD candidates, then
+        every other raw quality file belonging to the same automation plan.
+        """
+        if plan.existing_en_sub and plan.existing_en_sub.is_file():
+            try:
+                if plan.existing_en_sub.stat().st_size > 0:
+                    return plan.existing_en_sub.resolve()
+            except OSError:
+                pass
+
+        from services.subtitle_service import SubtitleService
+
+        # Also search for a separate EN sidecar beside any other quality
+        # (for example 720p/movie_en.srt or H264/English.srt), not only srt/EN.
+        fallback_season = cls.extract_season_num_from_dir(plan.base_dir)
+        sidecar_candidates: list[tuple[int, Path]] = []
+        untagged_sidecars: list[tuple[int, Path]] = []
+        allow_untagged_series_sidecar = (
+            not plan.is_series
+            or len(cls.scan_available_episodes_in_season(plan.base_dir)) <= 1
+        )
+        for sidecar in plan.base_dir.rglob("*"):
+            if not sidecar.is_file() or sidecar.suffix.casefold() not in (".srt", ".ass", ".ssa"):
+                continue
+            try:
+                relative_parts = sidecar.relative_to(plan.base_dir).parts[:-1]
+            except ValueError:
+                relative_parts = sidecar.parent.parts
+            parent_parts = [part.casefold() for part in relative_parts]
+            if any(
+                part in {
+                    "fa", "fas", "farsi", "persian", "softsub", "hardsub",
+                    "sub", "subs", "_incoming_downloads", "_rejected_downloads",
+                }
+                or part.startswith("_")
+                or "softsub" in part
+                or "hardsub" in part
+                for part in parent_parts
+            ):
+                continue
+
+            low_name = sidecar.name.casefold()
+            explicit_en_name = (
+                ".en." in low_name
+                or ".eng." in low_name
+                or ".english." in low_name
+                or low_name.startswith(("en_", "eng_", "english_"))
+                or low_name.endswith((
+                    "_en.srt", "_en.ass", "_en.ssa",
+                    "_eng.srt", "_eng.ass", "_eng.ssa",
+                    "_english.srt", "_english.ass", "_english.ssa",
+                ))
+            )
+            in_en_folder = any(part in {"en", "eng", "english"} for part in parent_parts)
+            if not explicit_en_name and not in_en_folder:
+                continue
+
+            try:
+                if sidecar.stat().st_size <= 0:
+                    continue
+            except OSError:
+                continue
+
+            en_tag = cls.extract_episode_tag(sidecar.name, fallback_season=fallback_season)
+            score = (100 if explicit_en_name else 50) + (20 if in_en_folder else 0)
+            if plan.is_series:
+                expected_tag = str(plan.season_ep_tag or "").upper()
+                if en_tag and en_tag.upper() != expected_tag:
+                    continue
+                if en_tag:
+                    sidecar_candidates.append((score + 40, sidecar.resolve()))
+                elif allow_untagged_series_sidecar:
+                    # An untagged EN sidecar is only safe when the season contains
+                    # one discoverable episode; never reuse it across a multi-episode season.
+                    untagged_sidecars.append((score, sidecar.resolve()))
+            else:
+                sidecar_candidates.append((score, sidecar.resolve()))
+
+        if not sidecar_candidates and plan.is_series and len(untagged_sidecars) == 1:
+            sidecar_candidates = untagged_sidecars
+
+        if sidecar_candidates:
+            sidecar_candidates.sort(
+                key=lambda item: (-item[0], item[1].name.casefold(), str(item[1]).casefold())
+            )
+            sidecar_source = sidecar_candidates[0][1]
+            extension = sidecar_source.suffix.lower()
+            standard_name = cls.build_standard_subtitle_filename(
+                plan.series_title,
+                plan.season_ep_tag if plan.is_series else "",
+                cls.detect_source_type(sidecar_source.name),
+                "EN",
+                extension,
+                year=cls.extract_media_year(
+                    plan.series_title,
+                    plan.base_dir.name,
+                    plan.base_dir.parent.name,
+                    sidecar_source.name,
+                ),
+            )
+            plan.en_sub_dest_dir.mkdir(parents=True, exist_ok=True)
+            sidecar_destination = plan.en_sub_dest_dir / standard_name
+            if sidecar_source.resolve() != sidecar_destination.resolve():
+                shutil.copy2(sidecar_source, sidecar_destination)
+            if sidecar_destination.suffix.casefold() == ".srt":
+                SubtitleService.normalize_srt_utf8(sidecar_destination)
+            plan.existing_en_sub = sidecar_destination.resolve()
+            return plan.existing_en_sub
+
+        ordered: list[Path] = []
+        for item in (
+            [preferred_video] if preferred_video else []
+        ) + list(plan.fullhd_source_candidates or []) + (
+            [plan.fullhd_source_video] if plan.fullhd_source_video else []
+        ) + [target.raw_video for target in plan.softsub_targets]:
+            if not item:
+                continue
+            candidate = Path(item).resolve()
+            if candidate.is_file() and candidate not in ordered:
+                ordered.append(candidate)
+
+        if not ordered:
+            ordered = cls._find_raw_videos_in_dir(plan.base_dir, recursive=True)
+
+        for video_path in ordered:
+            try:
+                tracks = await MKVService.list_subtitle_tracks(video_path)
+            except Exception as exc:
+                logging.debug("Could not inspect subtitle tracks in %s: %s", video_path, exc)
+                continue
+
+            text_tracks = []
+            for track in tracks:
+                extension = MKVService.subtitle_extension_for_codec(track.get("codec", ""))
+                if track.get("id") is not None and extension in (".srt", ".ass", ".ssa"):
+                    text_tracks.append((track, extension))
+
+            english_tracks = [
+                item for item in text_tracks
+                if MKVService._is_english_track(item[0])
+            ]
+            if not english_tracks and len(text_tracks) == 1:
+                only_track, _ = text_tracks[0]
+                lang = str(only_track.get("language", "und") or "und").casefold()
+                lang_ietf = str(only_track.get("language_ietf", "") or "").casefold()
+                track_name = str(only_track.get("track_name", "") or "").casefold()
+                unknown_language = (
+                    lang in ("", "und", "unknown")
+                    and lang_ietf in ("", "und", "unknown")
+                )
+                explicitly_persian = bool(re.search(
+                    r"(?<![a-z0-9])(?:persian|farsi|فارسی|fa|per|fas)(?![a-z0-9])",
+                    track_name,
+                ))
+                if unknown_language and not explicitly_persian:
+                    english_tracks = [text_tracks[0]]
+
+            if not english_tracks:
+                continue
+
+            english_tracks.sort(key=lambda item: (
+                not bool(item[0].get("default_track")),
+                {".srt": 0, ".ass": 1, ".ssa": 2}.get(item[1], 9),
+                int(item[0].get("id", 0)),
+            ))
+            track, extension = english_tracks[0]
+            episode = plan.season_ep_tag if plan.is_series else ""
+            year = cls.extract_media_year(
+                plan.series_title,
+                plan.base_dir.name,
+                plan.base_dir.parent.name,
+                video_path.name,
+            )
+            filename = cls.build_standard_subtitle_filename(
+                plan.series_title,
+                episode,
+                cls.detect_source_type(video_path.name),
+                "EN",
+                extension,
+                year=year,
+            )
+            plan.en_sub_dest_dir.mkdir(parents=True, exist_ok=True)
+            destination = plan.en_sub_dest_dir / filename
+            if destination.is_file():
+                try:
+                    if destination.stat().st_size > 0:
+                        plan.existing_en_sub = destination.resolve()
+                        return plan.existing_en_sub
+                except OSError:
+                    pass
+
+            temp_path = destination.with_name(
+                f"_temp_en_extract_{time.time_ns()}{extension}"
+            )
+            try:
+                await MKVService.extract_subtitle_track(
+                    video_path=video_path,
+                    track_id=track.get("id"),
+                    output_sub_path=temp_path,
+                    track_codec=track.get("codec"),
+                )
+                if not temp_path.is_file() or temp_path.stat().st_size <= 0:
+                    raise RuntimeError("استخراج زیرنویس خروجی خالی تولید کرد.")
+                SubtitleService.normalize_subtitle_file(temp_path)
+                temp_path.replace(destination)
+                plan.existing_en_sub = destination.resolve()
+                plan.embedded_en_source_video = video_path
+                plan.embedded_en_track_id = int(track["id"])
+                plan.embedded_en_codec = str(track.get("codec") or "")
+                logging.info(
+                    "Extracted EN subtitle for %s from quality source %s",
+                    plan.season_ep_tag or plan.series_title,
+                    video_path,
+                )
+                return plan.existing_en_sub
+            except Exception:
+                temp_path.unlink(missing_ok=True)
+                logging.exception(
+                    "Could not extract EN subtitle from %s (track %s)",
+                    video_path,
+                    track.get("id"),
+                )
+                continue
+
+        return None
 
     @classmethod
     def collect_all_local_fa_subtitles_in_dir(cls, base_dir: Path, fa_dest_dir: Path) -> list[Path]:
@@ -1468,7 +1806,8 @@ class AutomationService:
         en_sub: Path | None,
         brand: str,
         auto_upload: bool = False,
-        progress_callback: Callable[[str], None] = None
+        progress_callback: Callable[[str], None] = None,
+        server_id: str | None = None,
     ) -> Path:
         output_file.parent.mkdir(parents=True, exist_ok=True)
         res_path = await MKVService.merge_softsub(
@@ -1499,7 +1838,8 @@ class AutomationService:
                 f"AutoUpload [{remote_dir}]: {res_path.name}",
                 CuteFTPService.upload_path,
                 res_path,
-                remote_dir
+                remote_dir,
+                server_id=server_id,
             )
         return res_path
 
@@ -1511,7 +1851,8 @@ class AutomationService:
         en_sub: Path | None,
         brand: str,
         auto_upload: bool = False,
-        progress_callback: Callable[[str], None] = None
+        progress_callback: Callable[[str], None] = None,
+        server_id: str | None = None,
     ) -> Path:
         ht.output_dir.mkdir(parents=True, exist_ok=True)
         if ht.mode == "encode_ass":
@@ -1566,6 +1907,7 @@ class AutomationService:
                 f"AutoUpload [{remote_dir}]: {res_path.name}",
                 CuteFTPService.upload_path,
                 res_path,
-                remote_dir
+                remote_dir,
+                server_id=server_id,
             )
         return res_path
