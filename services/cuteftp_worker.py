@@ -135,6 +135,7 @@ def _auto_align_filename_with_server_siblings(ftp: FTP, local_file: Path) -> Pat
     اگر قسمت‌های قبلی در همین پوشه روی سرور وجود داشته باشند و فرمول نامشان متفاوت باشد،
     فرمول نام سرور را کپی کرده، فقط بخش Eyy را به قسمت فعلی تغییر می‌دهد و فایل لوکال را هم تغییر نام می‌دهد.
     """
+    import logging
     m_cur = _EP_TAG_RE.search(local_file.name)
     if not m_cur:
         return local_file
@@ -206,6 +207,7 @@ def _upload_single_file_with_retry(
     آپلود یک فایل منفرد با قابلیت Auto-Retry و تطبیق خودکار نام با سرور.
     در پایان، مسیر نهایی فایل (که ممکن است هم‌نام با فرمول سرور تغییر نام یافته باشد) را برمی‌گرداند.
     """
+    import logging
     if not local_file.exists() or not local_file.is_file():
         raise FileNotFoundError(f"فایل محلی برای آپلود یافت نشد: {local_file}")
 
@@ -1022,6 +1024,7 @@ def sync_upload_cuteftp(
     progress_callback: Callable[[str], None] | None = None,
     server_config: dict | None = None,
 ) -> list[str]:
+    import logging
     local_target = Path(local_target).resolve()
     if not local_target.exists():
         raise FileNotFoundError(f"فایل یا پوشه مورد نظر برای آپلود وجود ندارد: {local_target}")

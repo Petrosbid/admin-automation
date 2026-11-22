@@ -2,7 +2,7 @@ import asyncio
 import re
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 from core.config_loader import cfg
 from services.cuteftp_worker import (
@@ -215,6 +215,162 @@ class CuteFTPService:
             "remote_dir": remote_path,
             "public_url": cls.build_public_url(server, remote_path),
         }
+
+
+    @classmethod
+    def _public_path_from_remote_path(cls, remote_path: str) -> str:
+        clean_path = cls._normalize_remote_path(remote_path)
+        for prefix in ("/public_html", "/www", "/htdocs"):
+            if clean_path.casefold() == prefix or clean_path.casefold().startswith(prefix.casefold() + "/"):
+                clean_path = clean_path[len(prefix):] or "/"
+                break
+        return clean_path if clean_path.startswith("/") else "/" + clean_path
+
+    @classmethod
+    def _folder_reference_candidates(cls, reference: str) -> list[tuple[dict, str]]:
+        raw = str(reference or "").strip()
+        if not raw:
+            raise ValueError("لینک یا مسیر پوشه خالی است.")
+
+        servers = cls.get_servers()
+        if not servers:
+            raise RuntimeError("هیچ سرور FTP معتبری در تنظیمات وجود ندارد.")
+
+        parsed = urlsplit(raw)
+        candidates: list[tuple[dict, str]] = []
+
+        def add_candidate(server: dict, remote_path: str):
+            decoded = unquote(str(remote_path or "")).replace("\\", "/")
+            parts = [part for part in decoded.split("/") if part]
+            if not parts or any(part in (".", "..") for part in parts):
+                return
+            normalized = cls._normalize_remote_path("/" + "/".join(parts))
+            low_parts = [part.casefold() for part in parts]
+            try:
+                english_index = low_parts.index("english")
+            except ValueError:
+                return
+            if english_index + 2 >= len(parts):
+                return
+            if low_parts[english_index + 1] not in ("movies", "series", "anime"):
+                return
+            if parts[-1].casefold() in {"index.html", "index.htm", "index.php", "default.htm"}:
+                normalized = cls._normalize_remote_path(str(Path(normalized).parent).replace("\\", "/"))
+            key = (str(server.get("id") or ""), normalized.casefold())
+            if not any((str(s.get("id") or ""), p.casefold()) == key for s, p in candidates):
+                candidates.append((server, normalized))
+
+        if parsed.scheme.casefold() in ("ftp", "ftps"):
+            try:
+                incoming_port = parsed.port or 21
+            except ValueError:
+                incoming_port = 21
+            for server in servers:
+                try:
+                    server_port = int(server.get("port", 21) or 21)
+                except (TypeError, ValueError):
+                    server_port = 21
+                if (
+                    str(server.get("host") or "").casefold() == str(parsed.hostname or "").casefold()
+                    and server_port == incoming_port
+                ):
+                    add_candidate(server, parsed.path)
+        elif parsed.scheme.casefold() in ("http", "https"):
+            incoming_host = str(parsed.hostname or "").casefold()
+            try:
+                incoming_port = parsed.port or (443 if parsed.scheme.casefold() == "https" else 80)
+            except ValueError:
+                incoming_port = 443 if parsed.scheme.casefold() == "https" else 80
+            incoming_path = unquote(parsed.path or "/").rstrip("/") or "/"
+
+            for server in servers:
+                base_url = str(
+                    server.get("base_download_url")
+                    or server.get("public_base_url")
+                    or ""
+                ).strip().rstrip("/")
+                if ("dl.example.com" in base_url or not base_url) and str(server.get("username") or "").startswith("@"):
+                    base_url = f"https://{str(server['username']).lstrip('@')}"
+                if not base_url:
+                    continue
+                if "://" not in base_url:
+                    base_url = "https://" + base_url
+
+                base = urlsplit(base_url)
+                try:
+                    base_port = base.port or (443 if base.scheme.casefold() == "https" else 80)
+                except ValueError:
+                    continue
+                if str(base.hostname or "").casefold() != incoming_host or base_port != incoming_port:
+                    continue
+
+                base_path = unquote(base.path or "").rstrip("/")
+                if base_path and incoming_path != base_path and not incoming_path.startswith(base_path + "/"):
+                    continue
+                public_path = incoming_path[len(base_path):] if base_path else incoming_path
+                public_path = public_path or "/"
+
+                remote_root = cls._normalize_remote_path(
+                    str(server.get("remote_base_dir") or "/English/Movies")
+                )
+                public_root = cls._public_path_from_remote_path(remote_root).rstrip("/") or "/"
+                if public_root == "/":
+                    if not public_path.startswith("/"):
+                        continue
+                    suffix = public_path
+                elif public_path == public_root:
+                    suffix = ""
+                elif public_path.startswith(public_root + "/"):
+                    suffix = public_path[len(public_root):]
+                else:
+                    continue
+
+                add_candidate(server, remote_root.rstrip("/") + suffix)
+        elif not parsed.scheme and raw.startswith("/"):
+            for server in servers:
+                add_candidate(server, raw)
+        else:
+            raise ValueError(
+                "فرمت ورودی پشتیبانی نمی‌شود. لینک عمومی HTTP(S)، لینک FTP(S) یا مسیر مطلقی مثل "
+                "/English/Series/Show/S01 ارسال کنید."
+            )
+
+        if not candidates:
+            raise ValueError(
+                "این لینک با آدرس عمومی یا مسیر ریشه هیچ‌یک از سرورهای تنظیم‌شده تطبیق ندارد. "
+                "لینک پوشهٔ قابل دسترس را بفرستید یا مسیر FTP را به شکل /English/Series/... وارد کنید."
+            )
+        return candidates
+
+    @classmethod
+    async def inspect_remote_folder_reference(cls, reference: str) -> list[dict]:
+        """Resolve a user-supplied folder URL/path and return only configured servers where it exists."""
+        candidates = cls._folder_reference_candidates(reference)
+
+        async def inspect_one(server: dict, remote_path: str) -> dict:
+            try:
+                result = await asyncio.to_thread(list_ftp_dir_entries, remote_path, server)
+            except Exception as exc:
+                result = {
+                    "files": [],
+                    "dirs": [],
+                    "exists": False,
+                    "checked": False,
+                    "error": str(exc),
+                }
+            item = dict(result)
+            item.update({
+                "server_id": str(server.get("id") or ""),
+                "server_name": str(server.get("name") or server.get("id") or "سرور"),
+                "remote_dir": remote_path,
+                "public_url": cls.build_public_url(server, remote_path),
+            })
+            return item
+
+        inspected = await asyncio.gather(
+            *(inspect_one(server, remote_path) for server, remote_path in candidates)
+        )
+        return [item for item in inspected if item.get("exists")]
 
     @classmethod
     def get_saved_destinations(cls) -> list[dict[str, str]]:

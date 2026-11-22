@@ -253,6 +253,8 @@ class SubtitleStates(StatesGroup):
     waiting_output_dest_choice = State()
     browsing_output_dest_dir = State()
     waiting_new_dest_subfolder_name = State()
+    waiting_incoming_subtitle_search = State()
+    waiting_incoming_subtitle_folder_reference = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -1993,6 +1995,66 @@ def _resolve_incoming_subtitle_target(target_dir: Path, sub_files: list[Path]) -
     return target_dir.resolve(), ep_tags
 
 
+
+
+def _incoming_manual_options_kb(token: str):
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(
+        text="🔎 جستجوی دوباره با نام دلخواه",
+        callback_data=f"subfind:search:{token}",
+    ))
+    kb.row(InlineKeyboardButton(
+        text="🔗 ارسال لینک یا مسیر پوشه سرور",
+        callback_data=f"subfind:folder:{token}",
+    ))
+    kb.row(InlineKeyboardButton(
+        text="📂 انتخاب دستی مقصد از Workspace",
+        callback_data=f"subfind:manual:{token}",
+    ))
+    kb.row(InlineKeyboardButton(text="❌ لغو", callback_data=f"subfind:cancel:{token}"))
+    return kb.as_markup()
+
+
+def _local_target_from_remote_folder(remote_path: str) -> tuple[Path, str]:
+    parts = [part for part in str(remote_path or "").replace("\\", "/").split("/") if part]
+    lowered = [part.casefold() for part in parts]
+    try:
+        english_index = lowered.index("english")
+    except ValueError as exc:
+        raise ValueError("مسیر انتخاب‌شده داخل ریشه /English نیست.") from exc
+    if english_index + 2 >= len(parts):
+        raise ValueError("لینک باید به پوشهٔ یک فیلم یا عنوان سریال اشاره کند.")
+
+    category_key = lowered[english_index + 1]
+    categories = {"movies": "Movies", "series": "Series", "anime": "Anime"}
+    category = categories.get(category_key)
+    if not category:
+        raise ValueError("فقط پوشه‌های Movies، Series و Anime پشتیبانی می‌شوند.")
+
+    title_parts = parts[english_index + 2:]
+    if not title_parts:
+        raise ValueError("نام پوشهٔ فیلم یا سریال در لینک مشخص نیست.")
+    workspace = Path(cfg.get("paths", "workspace_dir", "./workspace")).resolve()
+    return (workspace / category / Path(*title_parts)).resolve(), category
+
+
+def _incoming_episode_tags_with_fallback(
+    info: dict,
+    sub_files: list[Path],
+    target_dir: Path,
+    explicit_episode: str = "",
+) -> list[str]:
+    tags = _incoming_subtitle_episode_tags(sub_files, target_dir)
+    if tags:
+        return tags
+
+    reference = str(explicit_episode or info.get("reference") or "")
+    tag = AutomationService.extract_episode_tag(reference)
+    if tag:
+        return [tag]
+    return []
+
+
 async def _show_incoming_subtitle_actions(
         call_or_msg: CallbackQuery | Message,
         target_dir: Path,
@@ -2295,6 +2357,7 @@ async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSM
         PENDING_INCOMING_SUBTITLES[token] = {
             "sub_files": [str(p.resolve()) for p in sub_files],
             "candidates": candidates,
+            "reference": fname,
         }
         kb = InlineKeyboardBuilder()
         lines = []
@@ -2311,9 +2374,11 @@ async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSM
                 f"— <code>{html.escape(candidate['category'])}</code> "
                 f"({'موجود در Workspace' if candidate.get('exists_local') else 'موجود در سرور'})"
             )
+        kb.row(InlineKeyboardButton(text="🔎 پیشنهادها مناسب نیست؛ جستجوی دستی عنوان", callback_data=f"subfind:search:{token}"))
+        kb.row(InlineKeyboardButton(text="🔗 ارسال لینک یا مسیر پوشه سرور", callback_data=f"subfind:folder:{token}"))
         kb.row(
             InlineKeyboardButton(
-                text="📂 پیشنهاد مناسب نبود؛ انتخاب دستی مقصد",
+                text="📂 انتخاب دستی مقصد از Workspace",
                 callback_data=f"subfind:manual:{token}",
             )
         )
@@ -2336,8 +2401,11 @@ async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSM
     PENDING_INCOMING_SUBTITLES[token] = {
         "sub_files": [str(p.resolve()) for p in sub_files],
         "candidates": [],
+        "reference": fname,
     }
     kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔎 جستجوی دستی نام فیلم/سریال", callback_data=f"subfind:search:{token}"))
+    kb.row(InlineKeyboardButton(text="🔗 ارسال لینک یا مسیر پوشه سرور", callback_data=f"subfind:folder:{token}"))
     kb.row(
         InlineKeyboardButton(
             text="📂 انتخاب دستی مقصد از Workspace",
@@ -2355,6 +2423,253 @@ async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSM
         "می‌توانید پوشه فیلم یا فصل سریال را دستی انتخاب کنید:",
         reply_markup=kb.as_markup(),
         parse_mode="HTML",
+    )
+
+
+
+@router.callback_query(F.data.startswith("subfind:search:"))
+async def cb_incoming_subtitle_manual_search(call: CallbackQuery, state: FSMContext):
+    token = call.data.split(":")[2]
+    if token not in PENDING_INCOMING_SUBTITLES:
+        return await call.answer("این درخواست منقضی شده است؛ دوباره زیرنویس را ارسال کنید.", show_alert=True)
+    await state.update_data(incoming_subtitle_token=token)
+    await state.set_state(SubtitleStates.waiting_incoming_subtitle_search)
+    await call.message.edit_text(
+        "🔎 <b>جستجوی دستی مقصد</b>\n"
+        "نام فیلم یا سریال را وارد کنید. برای سریال می‌توانید شماره قسمت را هم بنویسید؛ "
+        "مثلاً <code>Miraculous S07E05</code>.\n\n"
+        "نام اصلی زیرنویس نیز برای تشخیص قسمت حفظ می‌شود.",
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.message(SubtitleStates.waiting_incoming_subtitle_search)
+async def handle_incoming_subtitle_manual_search(message: Message, state: FSMContext):
+    query = str(message.text or "").strip()
+    if len(query) < 2:
+        return await message.answer("⚠️ لطفاً نام فیلم یا سریال را وارد کنید.")
+
+    data = await state.get_data()
+    token = str(data.get("incoming_subtitle_token") or "")
+    info = PENDING_INCOMING_SUBTITLES.get(token)
+    if not info:
+        await state.clear()
+        return await message.answer("این درخواست منقضی شده است؛ لطفاً زیرنویس را دوباره ارسال کنید.")
+
+    original_tag = AutomationService.extract_episode_tag(str(info.get("reference") or ""))
+    search_reference = query
+    if original_tag and not AutomationService.extract_episode_tag(query):
+        search_reference = f"{query} {original_tag}"
+
+    candidates = []
+    try:
+        candidates = await AutomationService.search_media_destination_candidates(search_reference, limit=8)
+    except Exception as exc:
+        logging.exception("Manual subtitle destination search failed for %s", query)
+
+    if not candidates:
+        try:
+            local_dir, local_eps = AutomationService.find_matching_workspace_folder_for_sub(search_reference)
+            if local_dir and local_dir.exists():
+                category = AutomationService.detect_category_from_path(local_dir)
+                candidates = [{
+                    "name": local_dir.name,
+                    "label": (
+                        f"{local_dir.parent.name} · {local_dir.name}"
+                        if AutomationService.SEASON_DIR_REGEX.match(local_dir.name)
+                        else local_dir.name
+                    ),
+                    "category": category,
+                    "path": str(local_dir.resolve()),
+                    "remote_path": AutomationService.compute_server_remote_dir_for_local_path(local_dir),
+                    "score": 1.0,
+                    "exists_local": True,
+                    "episode_tag": (local_eps or [original_tag or ""])[0],
+                }]
+        except Exception:
+            logging.exception("Manual local subtitle destination fallback failed for %s", query)
+
+    await state.clear()
+    if not candidates:
+        return await message.answer(
+            f"❌ برای عبارت <b>{html.escape(query)}</b> مقصد مناسبی پیدا نشد.\n"
+            "می‌توانید عبارت دیگری جستجو کنید، لینک/مسیر پوشه را بفرستید یا مقصد را از Workspace انتخاب کنید:",
+            reply_markup=_incoming_manual_options_kb(token),
+            parse_mode="HTML",
+        )
+
+    info["candidates"] = candidates
+    info["reference"] = search_reference
+    kb = InlineKeyboardBuilder()
+    lines = []
+    for idx, candidate in enumerate(candidates):
+        loc_icon = "📂" if candidate.get("exists_local") else "☁️"
+        kb.row(InlineKeyboardButton(
+            text=f"{loc_icon} {str(candidate.get('label') or candidate.get('name') or 'مقصد')[:42]}",
+            callback_data=f"subfind:pick:{token}:{idx}",
+        ))
+        lines.append(
+            f"<b>{idx + 1}.</b> {html.escape(str(candidate.get('label') or candidate.get('name') or 'مقصد'))} "
+            f"— <code>{html.escape(str(candidate.get('category') or ''))}</code> "
+            f"({'موجود در Workspace' if candidate.get('exists_local') else 'موجود در سرور'})"
+        )
+    kb.row(InlineKeyboardButton(text="🔎 جستجوی عبارت دیگر", callback_data=f"subfind:search:{token}"))
+    kb.row(InlineKeyboardButton(text="🔗 ارسال لینک یا مسیر پوشه سرور", callback_data=f"subfind:folder:{token}"))
+    kb.row(InlineKeyboardButton(text="📂 انتخاب دستی از Workspace", callback_data=f"subfind:manual:{token}"))
+    kb.row(InlineKeyboardButton(text="❌ لغو", callback_data=f"subfind:cancel:{token}"))
+    await message.answer(
+        f"🔎 نتایج جستجوی دستی برای <b>{html.escape(query)}</b>:\n\n"
+        + "\n".join(lines)
+        + "\n\nپوشه درست را انتخاب کنید:",
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data.startswith("subfind:folder:"))
+async def cb_incoming_subtitle_folder_reference(call: CallbackQuery, state: FSMContext):
+    token = call.data.split(":")[2]
+    if token not in PENDING_INCOMING_SUBTITLES:
+        return await call.answer("این درخواست منقضی شده است؛ دوباره زیرنویس را ارسال کنید.", show_alert=True)
+    await state.update_data(incoming_subtitle_token=token)
+    await state.set_state(SubtitleStates.waiting_incoming_subtitle_folder_reference)
+    await call.message.edit_text(
+        "🔗 <b>لینک یا مسیر پوشهٔ سرور را ارسال کنید</b>\n"
+        "لینک عمومی HTTP(S)، لینک FTP(S) یا مسیر مطلق FTP قابل قبول است.\n\n"
+        "نمونه مسیر:\n<code>/English/Series/Show.Name/S07</code>\n\n"
+        "اگر نام زیرنویس شماره قسمت را ندارد، بعد از لینک بنویسید:\n"
+        "<code>https://example.com/English/Series/Show.Name/S07/ | S07E05</code>",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await call.answer()
+
+
+@router.message(SubtitleStates.waiting_incoming_subtitle_folder_reference)
+async def handle_incoming_subtitle_folder_reference(message: Message, state: FSMContext):
+    raw = str(message.text or "").strip()
+    if not raw:
+        return await message.answer("⚠️ لینک یا مسیر پوشه را ارسال کنید.")
+
+    if "|" in raw:
+        folder_reference, explicit_episode_text = [part.strip() for part in raw.split("|", 1)]
+    else:
+        folder_reference, explicit_episode_text = raw, ""
+
+    data = await state.get_data()
+    token = str(data.get("incoming_subtitle_token") or "")
+    info = PENDING_INCOMING_SUBTITLES.get(token)
+    if not info:
+        await state.clear()
+        return await message.answer("این درخواست منقضی شده است؛ لطفاً زیرنویس را دوباره ارسال کنید.")
+
+    try:
+        matches = await CuteFTPService.inspect_remote_folder_reference(folder_reference)
+    except Exception as exc:
+        logging.warning("Could not resolve incoming subtitle folder reference %r: %s", folder_reference, exc)
+        return await message.answer(
+            f"❌ لینک/مسیر پوشه قابل تبدیل به مسیر سرور نیست:\n<code>{html.escape(str(exc)[:700])}</code>\n\n"
+            "لطفاً لینک پوشهٔ اصلی را بفرستید یا مسیر FTP را با /English/... وارد کنید.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+    if not matches:
+        return await message.answer(
+            "❌ پوشه در سرورهای منطبق پیدا نشد یا دسترسی FTP به آن برقرار نیست.\n"
+            "لینک دیگری بفرستید یا از جستجوی دستی استفاده کنید:",
+            reply_markup=_incoming_manual_options_kb(token),
+            parse_mode="HTML",
+        )
+
+    sub_files = [Path(path) for path in info.get("sub_files", []) if Path(path).exists()]
+    first_path = str(matches[0].get("remote_dir") or "")
+    try:
+        target_dir, media_category = _local_target_from_remote_folder(first_path)
+        target_dir, inferred_tags = _resolve_incoming_subtitle_target(target_dir, sub_files)
+    except Exception as exc:
+        return await message.answer(
+            f"❌ مسیر مقصد نامعتبر است: <code>{html.escape(str(exc)[:500])}</code>",
+            parse_mode="HTML",
+        )
+
+    episode_tags = list(inferred_tags)
+    if not episode_tags:
+        explicit_tag = AutomationService.extract_episode_tag(explicit_episode_text)
+        if not explicit_tag:
+            explicit_tag = AutomationService.extract_episode_tag(str(info.get("reference") or ""))
+        if explicit_tag:
+            episode_tags = [explicit_tag]
+            if media_category in ("Series", "Anime") and not AutomationService.SEASON_DIR_REGEX.match(target_dir.name):
+                target_dir = target_dir / f"S{int(explicit_tag[1:3]):02d}"
+
+    if media_category in ("Series", "Anime") and not episode_tags:
+        return await message.answer(
+            "⚠️ پوشه پیدا شد، اما شماره قسمت مشخص نیست؛ برای جلوگیری از دانلود کل فصل، قسمت را هم ارسال کنید.\n"
+            "فرمت: <code>لینک پوشه | S07E05</code>",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+    server_choices = [
+        {
+            "server_id": str(item.get("server_id") or ""),
+            "server_name": str(item.get("server_name") or item.get("server_id") or "سرور"),
+            "public_url": str(item.get("public_url") or ""),
+            "remote_dir": str(item.get("remote_dir") or first_path),
+        }
+        for item in matches
+        if item.get("server_id")
+    ]
+    if not server_choices:
+        return await message.answer("❌ سرور منبع معتبر برای این پوشه پیدا نشد.")
+
+    PENDING_INCOMING_SUBTITLES.pop(token, None)
+    await state.clear()
+
+    if len(server_choices) > 1:
+        remote_token = uuid.uuid4().hex[:8]
+        PENDING_REMOTE_SUBTITLE_DOWNLOADS[remote_token] = {
+            "target_dir": str(target_dir),
+            "sub_files": [str(path.resolve()) for path in sub_files],
+            "episode_tags": episode_tags,
+            "media_category": media_category,
+            "remote_path": str(server_choices[0]["remote_dir"]),
+            "servers": server_choices,
+        }
+        kb = InlineKeyboardBuilder()
+        for item in server_choices:
+            label = f"☁️ {item['server_name']}"
+            if item.get("public_url"):
+                label += " · دارای ایندکس"
+            kb.row(InlineKeyboardButton(
+                text=label[:60],
+                callback_data=f"subfind:remote:{remote_token}:{item['server_id']}",
+            ))
+        kb.row(InlineKeyboardButton(
+            text="❌ لغو",
+            callback_data=f"subfind:cancel_remote:{remote_token}",
+        ))
+        await message.answer(
+            "📂 این پوشه روی چند سرور پیدا شد؛ سرور منبع را انتخاب کنید:\n"
+            f"📁 مسیر محلی: <code>{html.escape(str(target_dir))}</code>\n"
+            f"🎞 قسمت‌ها: <code>{html.escape(', '.join(episode_tags) or 'همه فایل‌های فیلم')}</code>",
+            reply_markup=kb.as_markup(),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    await _start_remote_subtitle_media_sync(
+        message,
+        target_dir,
+        sub_files,
+        episode_tags,
+        str(server_choices[0]["remote_dir"]),
+        server_choices[0],
+        media_category,
     )
 
 
@@ -2487,6 +2802,7 @@ async def cb_incoming_subtitle_pick(call: CallbackQuery, state: FSMContext):
                         "server_id": str(item.get("server_id") or ""),
                         "server_name": str(item.get("server_name") or item.get("server_id") or "سرور"),
                         "public_url": str(item.get("public_url") or ""),
+                        "remote_dir": str(item.get("remote_dir") or remote_path),
                     }
                     for item in existing_servers
                     if item.get("server_id")
@@ -2566,7 +2882,7 @@ async def cb_incoming_subtitle_remote_server(call: CallbackQuery):
         Path(info["target_dir"]),
         [Path(p) for p in info.get("sub_files", []) if Path(p).exists()],
         list(info.get("episode_tags", [])),
-        str(info["remote_path"]),
+        str(server.get("remote_dir") or info["remote_path"]),
         server,
         str(info.get("media_category") or "Series"),
     )
@@ -2677,7 +2993,7 @@ async def _watch_remote_subtitle_media_sync(
 
 
 async def _start_remote_subtitle_media_sync(
-    call: CallbackQuery,
+    call: CallbackQuery | Message,
     target_dir: Path,
     sub_files: list[Path],
     episode_tags: list[str],
@@ -2720,15 +3036,25 @@ async def _start_remote_subtitle_media_sync(
         if is_movie
         else f"🎞 قسمت‌ها: <code>{html.escape(', '.join(episode_tags))}</code>"
     )
-    status_message = await call.message.edit_text(
+    status_text = (
         "📥 <b>درخواست دریافت فایل‌ها از سرور در صف دانلود قرار گرفت.</b>\n"
         f"{title_line}\n"
         f"📁 مقصد: <code>{html.escape(str(target_dir))}</code>\n"
         f"☁️ سرور: <b>{html.escape(str(server_info.get('server_name') or server_id))}</b>\n"
-        f"🆔 شناسه عملیات: <code>{html.escape(task.task_id)}</code>",
-        parse_mode="HTML",
-        disable_web_page_preview=True,
+        f"🆔 شناسه عملیات: <code>{html.escape(task.task_id)}</code>"
     )
+    if isinstance(call, CallbackQuery):
+        status_message = await call.message.edit_text(
+            status_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    else:
+        status_message = await call.answer(
+            status_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
     monitor = asyncio.create_task(
         _watch_remote_subtitle_media_sync(
             status_message,
@@ -2744,11 +3070,12 @@ async def _start_remote_subtitle_media_sync(
     )
     _ACTIVE_AUTOMATION_MONITORS.add(monitor)
     monitor.add_done_callback(_release_automation_monitor)
-    await call.answer(
-        "درخواست دریافت فایل‌های فیلم ثبت شد."
-        if is_movie
-        else "درخواست دریافت فایل‌های همین قسمت ثبت شد."
-    )
+    if isinstance(call, CallbackQuery):
+        await call.answer(
+            "درخواست دریافت فایل‌های فیلم ثبت شد."
+            if is_movie
+            else "درخواست دریافت فایل‌های همین قسمت ثبت شد."
+        )
 
 
 async def _start_incoming_subtitle_upload_batch(
