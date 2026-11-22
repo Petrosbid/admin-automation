@@ -1348,14 +1348,13 @@ class AutomationService:
 
     @classmethod
     async def extract_english_subtitle_for_plan(
-        cls,
-        plan: AutomationPlan,
-        preferred_video: Path | None = None,
+            cls,
+            plan: AutomationPlan,
+            preferred_video: Path | None = None,
     ) -> Path | None:
         """
-        Find and extract one English text subtitle for this movie/episode.
-        Search order: preferred FullHD file, identified FullHD candidates, then
-        every other raw quality file belonging to the same automation plan.
+        Find and extract one explicit English text subtitle for this movie/episode.
+        Tracks with unknown (und) or non-English languages are NOT auto-assumed as English.
         """
         if plan.existing_en_sub and plan.existing_en_sub.is_file():
             try:
@@ -1366,14 +1365,12 @@ class AutomationService:
 
         from services.subtitle_service import SubtitleService
 
-        # Also search for a separate EN sidecar beside any other quality
-        # (for example 720p/movie_en.srt or H264/English.srt), not only srt/EN.
         fallback_season = cls.extract_season_num_from_dir(plan.base_dir)
         sidecar_candidates: list[tuple[int, Path]] = []
         untagged_sidecars: list[tuple[int, Path]] = []
         allow_untagged_series_sidecar = (
-            not plan.is_series
-            or len(cls.scan_available_episodes_in_season(plan.base_dir)) <= 1
+                not plan.is_series
+                or len(cls.scan_available_episodes_in_season(plan.base_dir)) <= 1
         )
         for sidecar in plan.base_dir.rglob("*"):
             if not sidecar.is_file() or sidecar.suffix.casefold() not in (".srt", ".ass", ".ssa"):
@@ -1384,28 +1381,28 @@ class AutomationService:
                 relative_parts = sidecar.parent.parts
             parent_parts = [part.casefold() for part in relative_parts]
             if any(
-                part in {
-                    "fa", "fas", "farsi", "persian", "softsub", "hardsub",
-                    "sub", "subs", "_incoming_downloads", "_rejected_downloads",
-                }
-                or part.startswith("_")
-                or "softsub" in part
-                or "hardsub" in part
-                for part in parent_parts
+                    part in {
+                        "fa", "fas", "farsi", "persian", "softsub", "hardsub",
+                        "sub", "subs", "_incoming_downloads", "_rejected_downloads",
+                    }
+                    or part.startswith("_")
+                    or "softsub" in part
+                    or "hardsub" in part
+                    for part in parent_parts
             ):
                 continue
 
             low_name = sidecar.name.casefold()
             explicit_en_name = (
-                ".en." in low_name
-                or ".eng." in low_name
-                or ".english." in low_name
-                or low_name.startswith(("en_", "eng_", "english_"))
-                or low_name.endswith((
-                    "_en.srt", "_en.ass", "_en.ssa",
-                    "_eng.srt", "_eng.ass", "_eng.ssa",
-                    "_english.srt", "_english.ass", "_english.ssa",
-                ))
+                    ".en." in low_name
+                    or ".eng." in low_name
+                    or ".english." in low_name
+                    or low_name.startswith(("en_", "eng_", "english_"))
+                    or low_name.endswith((
+                "_en.srt", "_en.ass", "_en.ssa",
+                "_eng.srt", "_eng.ass", "_eng.ssa",
+                "_english.srt", "_english.ass", "_english.ssa",
+            ))
             )
             in_en_folder = any(part in {"en", "eng", "english"} for part in parent_parts)
             if not explicit_en_name and not in_en_folder:
@@ -1426,8 +1423,6 @@ class AutomationService:
                 if en_tag:
                     sidecar_candidates.append((score + 40, sidecar.resolve()))
                 elif allow_untagged_series_sidecar:
-                    # An untagged EN sidecar is only safe when the season contains
-                    # one discoverable episode; never reuse it across a multi-episode season.
                     untagged_sidecars.append((score, sidecar.resolve()))
             else:
                 sidecar_candidates.append((score, sidecar.resolve()))
@@ -1465,10 +1460,10 @@ class AutomationService:
 
         ordered: list[Path] = []
         for item in (
-            [preferred_video] if preferred_video else []
-        ) + list(plan.fullhd_source_candidates or []) + (
-            [plan.fullhd_source_video] if plan.fullhd_source_video else []
-        ) + [target.raw_video for target in plan.softsub_targets]:
+                            [preferred_video] if preferred_video else []
+                    ) + list(plan.fullhd_source_candidates or []) + (
+                            [plan.fullhd_source_video] if plan.fullhd_source_video else []
+                    ) + [target.raw_video for target in plan.softsub_targets]:
             if not item:
                 continue
             candidate = Path(item).resolve()
@@ -1495,22 +1490,6 @@ class AutomationService:
                 item for item in text_tracks
                 if MKVService._is_english_track(item[0])
             ]
-            if not english_tracks and len(text_tracks) == 1:
-                only_track, _ = text_tracks[0]
-                lang = str(only_track.get("language", "und") or "und").casefold()
-                lang_ietf = str(only_track.get("language_ietf", "") or "").casefold()
-                track_name = str(only_track.get("track_name", "") or "").casefold()
-                unknown_language = (
-                    lang in ("", "und", "unknown")
-                    and lang_ietf in ("", "und", "unknown")
-                )
-                explicitly_persian = bool(re.search(
-                    r"(?<![a-z0-9])(?:persian|farsi|فارسی|fa|per|fas)(?![a-z0-9])",
-                    track_name,
-                ))
-                if unknown_language and not explicitly_persian:
-                    english_tracks = [text_tracks[0]]
-
             if not english_tracks:
                 continue
 
@@ -1520,57 +1499,14 @@ class AutomationService:
                 int(item[0].get("id", 0)),
             ))
             track, extension = english_tracks[0]
-            episode = plan.season_ep_tag if plan.is_series else ""
-            year = cls.extract_media_year(
-                plan.series_title,
-                plan.base_dir.name,
-                plan.base_dir.parent.name,
-                video_path.name,
-            )
-            filename = cls.build_standard_subtitle_filename(
-                plan.series_title,
-                episode,
-                cls.detect_source_type(video_path.name),
-                "EN",
-                extension,
-                year=year,
-            )
-            plan.en_sub_dest_dir.mkdir(parents=True, exist_ok=True)
-            destination = plan.en_sub_dest_dir / filename
-            if destination.is_file():
-                try:
-                    if destination.stat().st_size > 0:
-                        plan.existing_en_sub = destination.resolve()
-                        return plan.existing_en_sub
-                except OSError:
-                    pass
-
-            temp_path = destination.with_name(
-                f"_temp_en_extract_{time.time_ns()}{extension}"
-            )
             try:
-                await MKVService.extract_subtitle_track(
+                return await cls.extract_specific_track_as_english_for_plan(
+                    plan=plan,
                     video_path=video_path,
-                    track_id=track.get("id"),
-                    output_sub_path=temp_path,
-                    track_codec=track.get("codec"),
+                    track_id=int(track["id"]),
+                    track_codec=str(track.get("codec") or ""),
                 )
-                if not temp_path.is_file() or temp_path.stat().st_size <= 0:
-                    raise RuntimeError("استخراج زیرنویس خروجی خالی تولید کرد.")
-                SubtitleService.normalize_subtitle_file(temp_path)
-                temp_path.replace(destination)
-                plan.existing_en_sub = destination.resolve()
-                plan.embedded_en_source_video = video_path
-                plan.embedded_en_track_id = int(track["id"])
-                plan.embedded_en_codec = str(track.get("codec") or "")
-                logging.info(
-                    "Extracted EN subtitle for %s from quality source %s",
-                    plan.season_ep_tag or plan.series_title,
-                    video_path,
-                )
-                return plan.existing_en_sub
             except Exception:
-                temp_path.unlink(missing_ok=True)
                 logging.exception(
                     "Could not extract EN subtitle from %s (track %s)",
                     video_path,
@@ -1579,6 +1515,178 @@ class AutomationService:
                 continue
 
         return None
+
+    @classmethod
+    async def find_non_english_or_und_subtitle_tracks_for_plan(
+            cls,
+            plan: AutomationPlan,
+    ) -> list[dict]:
+        """
+        پیدا کردن ترک‌های زیرنویس متنی که زبانشان انگلیسی نیست یا نامشخص (und) است
+        تا در زمان اتوماسیون به کاربر اطلاع داده شود و در صورت تایید به عنوان EN اضافه شوند.
+        """
+        ordered: list[Path] = []
+        for item in (
+                list(plan.fullhd_source_candidates or [])
+                + ([plan.fullhd_source_video] if plan.fullhd_source_video else [])
+                + [target.raw_video for target in plan.softsub_targets]
+        ):
+            if not item:
+                continue
+            candidate = Path(item).resolve()
+            if candidate.is_file() and candidate not in ordered:
+                ordered.append(candidate)
+
+        if not ordered:
+            ordered = cls._find_raw_videos_in_dir(plan.base_dir, recursive=True)
+
+        plan_key = plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
+        found: list[dict] = []
+
+        for video_path in ordered:
+            try:
+                tracks = await MKVService.list_subtitle_tracks(video_path)
+            except Exception as exc:
+                logging.debug("Could not inspect subtitle tracks in %s: %s", video_path, exc)
+                continue
+
+            for track in tracks:
+                extension = MKVService.subtitle_extension_for_codec(track.get("codec", ""))
+                if track.get("id") is None or extension not in (".srt", ".ass", ".ssa"):
+                    continue
+                if MKVService._is_english_track(track):
+                    continue
+
+                lang = str(track.get("language", "und") or "und").strip()
+                track_name = str(track.get("track_name", "") or "").strip()
+                # رد کردن ترک‌های صراحتاً فارسی
+                if lang.casefold() in ("per", "fas", "fa", "persian", "farsi") or re.search(
+                        r"(?<![a-z0-9])(?:persian|farsi|فارسی|fa|per|fas)(?![a-z0-9])",
+                        track_name.casefold(),
+                ):
+                    continue
+
+                found.append({
+                    "plan_key": plan_key,
+                    "video_path": str(video_path),
+                    "video_name": video_path.name,
+                    "track_id": int(track["id"]),
+                    "language": lang or "und",
+                    "track_name": track_name,
+                    "codec": str(track.get("codec") or ""),
+                    "extension": extension,
+                })
+
+            # اگر از اولین فایل دارای ترک، کاندیدا پیدا شد، برای جلوگیری از تکرار کیفیت‌ها کافی است
+            if found:
+                break
+
+        return found
+
+    @classmethod
+    async def extract_specific_track_as_english_for_plan(
+            cls,
+            plan: AutomationPlan,
+            video_path: Path,
+            track_id: int,
+            track_codec: str = "",
+    ) -> Path:
+        """استخراج یک ترک مشخص از ویدئو و ذخیره آن با نام استاندارد زیرنویس انگلیسی (EN)."""
+        from services.subtitle_service import SubtitleService
+
+        video_path = Path(video_path).resolve()
+        extension = MKVService.subtitle_extension_for_codec(track_codec)
+        if extension not in (".srt", ".ass", ".ssa"):
+            extension = ".srt"
+
+        episode = plan.season_ep_tag if plan.is_series else ""
+        year = cls.extract_media_year(
+            plan.series_title,
+            plan.base_dir.name,
+            plan.base_dir.parent.name,
+            video_path.name,
+        )
+        filename = cls.build_standard_subtitle_filename(
+            plan.series_title,
+            episode,
+            cls.detect_source_type(video_path.name),
+            "EN",
+            extension,
+            year=year,
+        )
+        plan.en_sub_dest_dir.mkdir(parents=True, exist_ok=True)
+        destination = plan.en_sub_dest_dir / filename
+
+        temp_path = destination.with_name(
+            f"_temp_en_extract_{time.time_ns()}{extension}"
+        )
+        try:
+            await MKVService.extract_subtitle_track(
+                video_path=video_path,
+                track_id=int(track_id),
+                output_sub_path=temp_path,
+                track_codec=track_codec,
+            )
+            if not temp_path.is_file() or temp_path.stat().st_size <= 0:
+                raise RuntimeError("استخراج زیرنویس خروجی خالی تولید کرد.")
+            SubtitleService.normalize_subtitle_file(temp_path)
+            temp_path.replace(destination)
+            plan.existing_en_sub = destination.resolve()
+            plan.embedded_en_source_video = video_path
+            plan.embedded_en_track_id = int(track_id)
+            plan.embedded_en_codec = str(track_codec or "")
+            return plan.existing_en_sub
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+    @classmethod
+    async def run_softsub_and_optional_upload(
+            cls,
+            raw_video: Path,
+            output_file: Path,
+            fa_sub: Path | None,
+            en_sub: Path | None,
+            brand: str,
+            auto_upload: bool = False,
+            progress_callback: Callable[[str], None] = None,
+            server_id: str | None = None,
+            keep_old_subs: bool = True,
+    ) -> Path:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        res_path = await MKVService.merge_softsub(
+            video_path=raw_video,
+            output_path=output_file,
+            fa_sub_path=fa_sub,
+            en_sub_path=en_sub,
+            keep_old_subs=keep_old_subs,
+            custom_brand=brand,
+            sync_mode="none",
+            sync_offset_ms=0,
+            progress_callback=progress_callback
+        )
+        if res_path.exists():
+            try:
+                from services.daily_activity_service import DailyActivityService
+                DailyActivityService.record_media_file(
+                    "softsub_created",
+                    res_path,
+                    source=raw_video.name,
+                )
+            except Exception:
+                logging.exception("Could not record SoftSub output")
+        if auto_upload and res_path.exists():
+            remote_dir = cls.compute_server_remote_dir_for_local_path(res_path)
+            await queue_engine.add_task(
+                "upload",
+                f"AutoUpload [{remote_dir}]: {res_path.name}",
+                CuteFTPService.upload_path,
+                res_path,
+                remote_dir,
+                server_id=server_id,
+            )
+        return res_path
+
 
     @classmethod
     def collect_all_local_fa_subtitles_in_dir(cls, base_dir: Path, fa_dest_dir: Path) -> list[Path]:
@@ -1797,51 +1905,6 @@ class AutomationService:
                 )
         return targets
 
-    @classmethod
-    async def run_softsub_and_optional_upload(
-        cls,
-        raw_video: Path,
-        output_file: Path,
-        fa_sub: Path | None,
-        en_sub: Path | None,
-        brand: str,
-        auto_upload: bool = False,
-        progress_callback: Callable[[str], None] = None,
-        server_id: str | None = None,
-    ) -> Path:
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        res_path = await MKVService.merge_softsub(
-            video_path=raw_video,
-            output_path=output_file,
-            fa_sub_path=fa_sub,
-            en_sub_path=en_sub,
-            keep_old_subs=True,
-            custom_brand=brand,
-            sync_mode="none",
-            sync_offset_ms=0,
-            progress_callback=progress_callback
-        )
-        if res_path.exists():
-            try:
-                from services.daily_activity_service import DailyActivityService
-                DailyActivityService.record_media_file(
-                    "softsub_created",
-                    res_path,
-                    source=raw_video.name,
-                )
-            except Exception:
-                logging.exception("Could not record SoftSub output")
-        if auto_upload and res_path.exists():
-            remote_dir = cls.compute_server_remote_dir_for_local_path(res_path)
-            await queue_engine.add_task(
-                "upload",
-                f"AutoUpload [{remote_dir}]: {res_path.name}",
-                CuteFTPService.upload_path,
-                res_path,
-                remote_dir,
-                server_id=server_id,
-            )
-        return res_path
 
     @classmethod
     async def run_hardsub_or_encode_and_optional_upload(

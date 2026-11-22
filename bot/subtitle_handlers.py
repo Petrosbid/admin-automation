@@ -907,7 +907,7 @@ async def _check_english_sub_batch_step(call_or_msg: CallbackQuery | Message, st
             plans,
             data.get("sauto_final_fa_map", {}),
         )
-        await state.update_data(sauto_final_en_map={})
+        await state.update_data(sauto_final_en_map={}, sauto_non_en_candidates=[])
         return await _prompt_final_automation_choices_step(
             call_or_msg,
             state,
@@ -918,18 +918,21 @@ async def _check_english_sub_batch_step(call_or_msg: CallbackQuery | Message, st
             ),
         )
 
-    en_map: dict[str, str] = {}
+    en_map: dict[str, str] = dict(data.get("sauto_final_en_map", {}) or {})
     missing: list[str] = []
     extracted: list[str] = []
+    non_en_candidates: list[dict] = []
 
     for plan in plans:
         key = plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
+        if key in en_map and Path(en_map[key]).is_file():
+            continue
+
         existing = plan.existing_en_sub
         if existing and existing.is_file() and existing.stat().st_size > 0:
             en_map[key] = str(existing.resolve())
             continue
 
-        # Search FullHD first, then every other quality file in this movie/episode.
         try:
             extracted_path = await AutomationService.extract_english_subtitle_for_plan(plan)
         except Exception:
@@ -941,18 +944,26 @@ async def _check_english_sub_batch_step(call_or_msg: CallbackQuery | Message, st
             extracted.append(key)
         else:
             missing.append(key)
+            try:
+                cands = await AutomationService.find_non_english_or_und_subtitle_tracks_for_plan(plan)
+                non_en_candidates.extend(cands)
+            except Exception:
+                logging.exception("Could not inspect non-EN/und subtitle tracks for %s", key)
 
-    await state.update_data(sauto_final_en_map=en_map)
+    await state.update_data(
+        sauto_final_en_map=en_map,
+        sauto_non_en_candidates=non_en_candidates,
+    )
 
     en_note_parts = []
     if en_map:
         en_note_parts.append(
-            f"✅ زیرنویس انگلیسی آماده است: {', '.join(sorted(en_map))}"
+            f"✅ زیرنویس انگلیسی آماده است: `{', '.join(sorted(en_map))}`"
         )
     if extracted:
         en_note_parts.append(
             "📤 زیرنویس EN در اتوماسیون از FullHD یا یکی از کیفیت‌های دیگر استخراج شد: "
-            f"{', '.join(extracted)}"
+            f"`{', '.join(extracted)}`"
         )
 
     if not missing:
@@ -964,28 +975,480 @@ async def _check_english_sub_batch_step(call_or_msg: CallbackQuery | Message, st
         )
 
     en_note_parts.append(
-        "⚠️ پس از بررسی FullHD و تمام فایل‌های کیفیت موجود، ترک انگلیسیِ قابل‌استخراج "
-        f"برای این موارد پیدا نشد: {', '.join(missing)}."
+        "⚠️ پس از بررسی FullHD و تمام فایل‌های کیفیت موجود، ترک انگلیسیِ صریح "
+        f"برای این موارد پیدا نشد: `{', '.join(missing)}`."
     )
-    en_note_parts.append(
-        "می‌توانید زیرنویس انگلیسی آماده را دستی ارسال کنید یا بدون آن ادامه دهید."
-    )
+
+    if non_en_candidates:
+        cand_lines = []
+        for idx, cand in enumerate(non_en_candidates[:8], start=1):
+            t_name = f" | نام: `{cand['track_name']}`" if cand.get("track_name") else ""
+            cand_lines.append(
+                f"{idx}. `{cand['plan_key']}` — فایل `{cand['video_name']}`\n"
+                f"   🔹 Track `#{cand['track_id']}` | زبان: `{cand['language']}`{t_name}"
+            )
+        en_note_parts.append(
+            "🔎 **زیرنویس غیرانگلیسی یا با زبان نامشخص (`und`) روی فایل‌های خام پیدا شد:**\n"
+            + "\n".join(cand_lines)
+            + "\n\n❓ آیا می‌خواهید یکی از این زیرنویس‌ها به عنوان **زیرنویس انگلیسی (EN)** اضافه شود؟"
+        )
+    else:
+        en_note_parts.append(
+            "می‌توانید زیرنویس انگلیسی آماده را دستی ارسال کنید یا بدون آن ادامه دهید."
+        )
+
     await state.set_state(SubtitleStates.sauto_waiting_en_decision)
-    keyboard = smart_auto_missing_en_kb(False)
+    keyboard = smart_auto_missing_en_kb(False, non_en_candidates=non_en_candidates)
     text_value = "\n\n".join(en_note_parts)
     if isinstance(call_or_msg, CallbackQuery):
         await call_or_msg.message.edit_text(
-            text_value,
+            text_value[:4000],
             reply_markup=keyboard,
             parse_mode="Markdown",
         )
     else:
         await call_or_msg.answer(
-            text_value,
+            text_value[:4000],
             reply_markup=keyboard,
             parse_mode="Markdown",
         )
 
+
+@router.callback_query(SubtitleStates.sauto_waiting_en_decision, F.data.startswith("sauto_en:use_track:"))
+async def cb_sauto_use_non_en_track(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    candidates = data.get("sauto_non_en_candidates", [])
+    try:
+        idx = int(call.data.rsplit(":", 1)[1])
+        chosen = candidates[idx]
+    except (ValueError, IndexError, TypeError):
+        return await call.answer("⚠️ ترک انتخاب‌شده معتبر نیست.", show_alert=True)
+
+    target_dir = Path(data["sauto_target_dir"])
+    ep_tags = data.get("sauto_ep_tags", [])
+    plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
+
+    plan_key = chosen["plan_key"]
+    target_plan = next(
+        (
+            p for p in plans
+            if (p.season_ep_tag if (p.is_series and p.season_ep_tag) else "MOVIE") == plan_key
+        ),
+        None,
+    )
+    if not target_plan:
+        return await call.answer("⚠️ پلن مربوط به این قسمت پیدا نشد.", show_alert=True)
+
+    await call.answer("⏳ در حال استخراج ترک انتخابی به عنوان زیرنویس انگلیسی...")
+    try:
+        extracted_en = await AutomationService.extract_specific_track_as_english_for_plan(
+            plan=target_plan,
+            video_path=Path(chosen["video_path"]),
+            track_id=int(chosen["track_id"]),
+            track_codec=str(chosen.get("codec") or ""),
+        )
+    except Exception as exc:
+        logging.exception("Failed to extract non-EN/und track as EN")
+        return await call.message.answer(
+            f"❌ استخراج ترک `#{chosen['track_id']}` ناموفق بود:\n`{str(exc)[:300]}`",
+            parse_mode="Markdown",
+        )
+
+    en_map = dict(data.get("sauto_final_en_map", {}) or {})
+    en_map[plan_key] = str(extracted_en.resolve())
+    await state.update_data(sauto_final_en_map=en_map)
+
+    # بررسی مجدد؛ اگر همه قسمت‌ها تکمیل شده باشند خودکار به مرحله نهایی می‌رود
+    await _check_english_sub_batch_step(call, state)
+
+
+async def _prompt_final_automation_choices_step(
+        call_or_msg: CallbackQuery | Message,
+        state: FSMContext,
+        plans: list[AutomationPlan],
+        en_note: str = ""
+):
+    data = await state.get_data()
+    selected_sources = dict(data.get("sauto_fullhd_source_map", {}) or {})
+    for plan in plans:
+        plan_key = plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
+        selected_path = selected_sources.get(plan_key)
+        if selected_path:
+            selected_path = Path(selected_path)
+            if selected_path.is_file():
+                plan.fullhd_source_video = selected_path.resolve()
+                plan.source_type = AutomationService.detect_source_type(plan.fullhd_source_video.name)
+
+    ambiguous_plan = next(
+        (
+            plan for plan in plans
+            if not plan.fullhd_source_video
+            and len(plan.fullhd_source_candidates or []) > 1
+            and not selected_sources.get(
+                plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
+            )
+        ),
+        None,
+    )
+    if ambiguous_plan:
+        plan_key = (
+            ambiguous_plan.season_ep_tag
+            if (ambiguous_plan.is_series and ambiguous_plan.season_ep_tag)
+            else "MOVIE"
+        )
+        candidates = [
+            str(Path(item).resolve())
+            for item in ambiguous_plan.fullhd_source_candidates
+            if Path(item).is_file()
+        ]
+        await state.set_state(SubtitleStates.sauto_waiting_fullhd_source)
+        await state.update_data(
+            sauto_fhd_pending_key=plan_key,
+            sauto_fhd_pending_candidates=candidates,
+            sauto_fhd_en_note=en_note,
+        )
+        kb = InlineKeyboardBuilder()
+        for index, candidate in enumerate(candidates[:20]):
+            file_path = Path(candidate)
+            label = f"🎬 {file_path.parent.name}: {file_path.name}"
+            kb.row(
+                InlineKeyboardButton(
+                    text=label[:58],
+                    callback_data=f"sauto_fhd:pick:{index}",
+                )
+            )
+        kb.row(InlineKeyboardButton(text="❌ لغو", callback_data="menu:home"))
+        candidate_lines = "\n".join(
+            f"• <code>{html.escape(Path(item).name)}</code> — "
+            f"<code>{html.escape(Path(item).parent.name)}</code>"
+            for item in candidates[:20]
+        )
+        prompt = (
+            "🎬 <b>چند فایل مناسب برای سورس FullHD هاردساب پیدا شد.</b>\n\n"
+            f"عنوان/قسمت: <code>{html.escape(plan_key)}</code>\n"
+            "لطفاً فایل اصلی موردنظر برای انکود و هاردساب را انتخاب کنید. "
+            "ربات هیچ‌کدام را به‌صورت تصادفی انتخاب نمی‌کند.\n\n"
+            + candidate_lines
+        )
+        if isinstance(call_or_msg, CallbackQuery):
+            await call_or_msg.message.edit_text(
+                prompt[:3900],
+                reply_markup=kb.as_markup(),
+                parse_mode="HTML",
+            )
+        else:
+            await call_or_msg.answer(
+                prompt[:3900],
+                reply_markup=kb.as_markup(),
+                parse_mode="HTML",
+            )
+        return
+
+    avail_soft_quals = []
+    for p in plans:
+        for st in p.softsub_targets:
+            if st.quality_folder_name not in avail_soft_quals:
+                avail_soft_quals.append(st.quality_folder_name)
+
+    server_defaults = await _detect_existing_automation_quality_defaults(plans)
+    default_selected_soft = sorted(
+        set(avail_soft_quals) & set(server_defaults["soft"]),
+        key=str.casefold,
+    )
+    default_srt_hb = sorted(
+        set(server_defaults["hard"]),
+        key=lambda q: {"1080p": 1, "720p": 2, "480p": 3}.get(q, 9),
+    )
+    default_auto_upload = True
+    default_include_en = bool(data.get("sauto_include_en", True))
+
+    checked_roots = server_defaults["checked_roots"]
+    unavailable_roots = server_defaults["unavailable_roots"]
+    if checked_roots:
+        remote_check_note = (
+            "☁️ تیک‌های اولیه بر اساس پوشه‌ها/فایل‌های موجود در سرور مقصد تنظیم شده‌اند.\n"
+        )
+    else:
+        remote_check_note = (
+            "⚠️ پوشه مقصد در سرور قابل بررسی نبود؛ هیچ کیفیتی به‌صورت پیش‌فرض تیک نخورده است. "
+            "می‌توانید کیفیت‌ها را دستی انتخاب کنید.\n"
+        )
+    if unavailable_roots and checked_roots:
+        remote_check_note += (
+            f"⚠️ دسترسی به {len(unavailable_roots)} مسیر مقصد برقرار نشد؛ "
+            "برای آن مسیرها انتخاب پیش‌فرضی انجام نشد.\n"
+        )
+
+    await state.set_state(SubtitleStates.sauto_waiting_hb_qualities)
+    await state.update_data(
+        sauto_avail_soft_quals=avail_soft_quals,
+        sauto_selected_soft_quals=default_selected_soft,
+        sauto_hb_srt_qualities=default_srt_hb,
+        sauto_auto_upload=default_auto_upload,
+        sauto_include_en=default_include_en,
+    )
+
+    fhd_list = [f"• `{p.season_ep_tag or 'فیلم'}`: `{p.fullhd_source_video.name}`" for p in plans if
+                p.fullhd_source_video]
+    fhd_block = "\n".join(fhd_list[:8]) if fhd_list else "_(فایل FullHD یافت نشد)_"
+
+    text = (
+        f"{en_note}\n\n"
+        f"🎯 **مرحله نهایی اتوماسیون: انتخاب کیفیت‌های سافت‌ساب و هاردساب**\n\n"
+        f"🎞 تعداد قسمت‌های آماده: **`{len(plans)}` مورد**\n"
+        f"📂 پوشه‌های کیفیت خام موجود: `{', '.join(avail_soft_quals) or 'موردی یافت نشد'}`\n"
+        f"🔥 **سورس هاردساب (`FullHD`):**\n{fhd_block}\n\n"
+        f"{remote_check_note}\n"
+        f"✅ پیش‌فرض SoftSub: `{', '.join(default_selected_soft) or 'هیچ‌کدام'}`\n"
+        f"✅ پیش‌فرض HardSub: `{', '.join(default_srt_hb) or 'هیچ‌کدام'}`\n\n"
+        "👇 در پنل زیر می‌توانید:\n"
+        "1️⃣ مشخص کنید کدام **پوشه‌های کیفیت خام** سافت‌ساب شوند (`✅`).\n"
+        "2️⃣ مشخص کنید کدام یک از **۳ کیفیت اصلی (`1080p`, `720p`, `480p`)** از روی فایل `FullHD` هاردساب شوند.\n"
+        "3️⃣ مشخص کنید آیا **زیرنویس انگلیسی** به فایل‌های خروجی اضافه شود یا خیر:"
+    )
+    kb = smart_auto_final_selection_kb(
+        available_softsub_qualities=avail_soft_quals,
+        selected_softsub_qualities=set(default_selected_soft),
+        selected_hardsub_srt=set(default_srt_hb),
+        auto_upload=default_auto_upload,
+        include_en=default_include_en,
+    )
+
+    if isinstance(call_or_msg, CallbackQuery):
+        await call_or_msg.message.edit_text(text[:4000], reply_markup=kb, parse_mode="Markdown")
+    else:
+        await call_or_msg.answer(text[:4000], reply_markup=kb, parse_mode="Markdown")
+
+
+@router.callback_query(SubtitleStates.sauto_waiting_hb_qualities, F.data.startswith("sauto_hbq:"))
+async def cb_sauto_hb_quality_action(call: CallbackQuery, state: FSMContext):
+    action = call.data.split(":", 1)[1]
+    data = await state.get_data()
+    avail_soft: list[str] = data.get("sauto_avail_soft_quals", [])
+    sel_soft = set(data.get("sauto_selected_soft_quals", avail_soft))
+    srt_set = set(data.get("sauto_hb_srt_qualities", []))
+    auto_up = bool(data.get("sauto_auto_upload", True))
+    include_en = bool(data.get("sauto_include_en", True))
+
+    if action.startswith("toggle_soft:"):
+        idx = int(action.split(":")[1])
+        if idx < len(avail_soft):
+            q_name = avail_soft[idx]
+            sel_soft.remove(q_name) if q_name in sel_soft else sel_soft.add(q_name)
+    elif action == "all_soft":
+        if len(sel_soft) == len(avail_soft):
+            sel_soft.clear()
+        else:
+            sel_soft = set(avail_soft)
+    elif action.startswith("toggle_srt:"):
+        q = action.split(":")[1]
+        srt_set.remove(q) if q in srt_set else srt_set.add(q)
+    elif action == "all_srt":
+        srt_set = {"1080p", "720p", "480p"}
+    elif action == "no_srt":
+        srt_set.clear()
+    elif action == "toggle_en":
+        include_en = not include_en
+    elif action == "toggle_upload":
+        auto_up = not auto_up
+    elif action == "launch":
+        return await _execute_smart_automation_batch(
+            call, state, list(sel_soft), list(srt_set), auto_up, include_en=include_en
+        )
+
+    await state.update_data(
+        sauto_selected_soft_quals=list(sel_soft),
+        sauto_hb_srt_qualities=list(srt_set),
+        sauto_auto_upload=auto_up,
+        sauto_include_en=include_en,
+    )
+    await call.message.edit_reply_markup(
+        reply_markup=smart_auto_final_selection_kb(
+            available_softsub_qualities=avail_soft,
+            selected_softsub_qualities=sel_soft,
+            selected_hardsub_srt=srt_set,
+            auto_upload=auto_up,
+            include_en=include_en,
+        )
+    )
+
+
+async def _execute_smart_automation_batch(
+        call: CallbackQuery,
+        state: FSMContext,
+        selected_soft_qualities: list[str],
+        selected_hb_srt: list[str],
+        auto_upload: bool,
+        include_en: bool = True,
+):
+    data = await state.get_data()
+    target_dir = Path(data["sauto_target_dir"])
+    ep_tags = data.get("sauto_ep_tags", [])
+    fa_map: dict[str, str] = data.get("sauto_final_fa_map", {})
+    en_map: dict[str, str] = data.get("sauto_final_en_map", {})
+    server_id = str(data.get("sauto_server_id") or "").strip() or None
+    brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
+
+    plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
+    selected_sources = dict(data.get("sauto_fullhd_source_map", {}) or {})
+    for plan in plans:
+        plan_key = plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
+        source_path = selected_sources.get(plan_key)
+        if source_path and Path(source_path).is_file():
+            plan.fullhd_source_video = Path(source_path).resolve()
+            plan.source_type = AutomationService.detect_source_type(plan.fullhd_source_video.name)
+    selected_soft_set = set(selected_soft_qualities)
+    batch_id = uuid.uuid4().hex[:10]
+    batch_tasks = []
+    skipped_items: list[str] = []
+
+    for plan in plans:
+        key = plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
+        fa_sub = Path(fa_map[key]) if key in fa_map else None
+        en_sub = (
+            (Path(en_map[key]) if key in en_map else plan.existing_en_sub)
+            if include_en
+            else None
+        )
+
+        if not fa_sub or not fa_sub.exists():
+            skipped_items.append(
+                f"{key}: زیرنویس فارسی معتبر پیدا نشد؛ SoftSub/HardSub این مورد اجرا نشد."
+            )
+            continue
+
+        if auto_upload:
+            if fa_sub.exists():
+                r_dir_fa = AutomationService.compute_server_remote_dir_for_local_path(fa_sub)
+                subtitle_task = await queue_engine.add_task(
+                    "upload",
+                    f"AutoUpload Sub [{r_dir_fa}]: {fa_sub.name}",
+                    CuteFTPService.upload_path,
+                    fa_sub,
+                    r_dir_fa,
+                    server_id=server_id,
+                    batch_id=batch_id,
+                    notify_completion=False,
+                )
+                batch_tasks.append(subtitle_task)
+
+                if plan.category == "Anime" and fa_sub.suffix.lower() in (".ass", ".ssa"):
+                    converted_srt = fa_sub.with_suffix(".srt")
+                    if converted_srt.exists():
+                        converted_task = await queue_engine.add_task(
+                            "upload",
+                            f"AutoUpload Sub [{r_dir_fa}]: {converted_srt.name}",
+                            CuteFTPService.upload_path,
+                            converted_srt,
+                            r_dir_fa,
+                            server_id=server_id,
+                            batch_id=batch_id,
+                            notify_completion=False,
+                        )
+                        batch_tasks.append(converted_task)
+
+            if include_en and en_sub and en_sub.exists() and plan.category != "Anime":
+                r_dir_en = AutomationService.compute_server_remote_dir_for_local_path(en_sub)
+                en_task = await queue_engine.add_task(
+                    "upload",
+                    f"AutoUpload Sub [{r_dir_en}]: {en_sub.name}",
+                    CuteFTPService.upload_path,
+                    en_sub,
+                    r_dir_en,
+                    server_id=server_id,
+                    batch_id=batch_id,
+                    notify_completion=False,
+                )
+                batch_tasks.append(en_task)
+
+        for st in plan.softsub_targets:
+            if st.quality_folder_name not in selected_soft_set:
+                continue
+            st.output_dir.mkdir(parents=True, exist_ok=True)
+            soft_task = await queue_engine.add_task(
+                "mkvtoolnix",
+                f"SoftSub [{st.quality_folder_name}]: {st.output_file.name}",
+                AutomationService.run_softsub_and_optional_upload,
+                st.raw_video,
+                st.output_file,
+                fa_sub,
+                en_sub,
+                brand,
+                auto_upload,
+                server_id=server_id,
+                keep_old_subs=include_en,
+                batch_id=batch_id,
+                notify_completion=False,
+            )
+            batch_tasks.append(soft_task)
+
+        hardsub_targets = AutomationService.build_hardsub_targets(plan, selected_hb_srt)
+        if selected_hb_srt and not plan.fullhd_source_video:
+            skipped_items.append(
+                f"{key}: سورس FullHD موجود نیست؛ HardSub انتخاب‌شده اجرا نشد."
+            )
+
+        for ht in hardsub_targets:
+            ht.output_dir.mkdir(parents=True, exist_ok=True)
+            hard_task = await queue_engine.add_task(
+                "handbrake",
+                f"HardSub [{ht.quality_tag}]: {ht.output_file.name}",
+                AutomationService.run_hardsub_or_encode_and_optional_upload,
+                ht,
+                fa_sub,
+                en_sub,
+                brand,
+                auto_upload,
+                server_id=server_id,
+                batch_id=batch_id,
+                notify_completion=False,
+            )
+            batch_tasks.append(hard_task)
+
+        if (
+                not any(st.quality_folder_name in selected_soft_set for st in plan.softsub_targets)
+                and not selected_hb_srt
+        ):
+            skipped_items.append(
+                f"{key}: هیچ کیفیت SoftSub یا HardSub برای اجرا انتخاب/موجود نبود."
+            )
+
+    await state.clear()
+    await state.update_data(current_dir=str(target_dir))
+
+    title_str = plans[0].series_title if plans else target_dir.name
+    initial_report = _build_automation_batch_status_text(
+        title=title_str,
+        tasks=batch_tasks,
+        skipped_items=skipped_items,
+        auto_upload=auto_upload,
+        final=not bool(batch_tasks),
+    )
+
+    status_message = await call.message.edit_text(
+        initial_report,
+        reply_markup=_automation_batch_status_markup(),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+    if batch_tasks:
+        monitor_task = asyncio.create_task(
+            _watch_smart_automation_batch(
+                status_message=status_message,
+                batch_id=batch_id,
+                title=title_str,
+                initial_tasks=batch_tasks,
+                skipped_items=skipped_items,
+                auto_upload=auto_upload,
+                remote_root_path=AutomationService.compute_server_remote_dir_for_local_path(target_dir),
+            ),
+            name=f"automation-status-{batch_id}",
+        )
+        _ACTIVE_AUTOMATION_MONITORS.add(monitor_task)
+        monitor_task.add_done_callback(_release_automation_monitor)
+
+    await call.answer("اتوماسیون در صف قرار گرفت؛ گزارش نهایی پس از پایان ارسال می‌شود.")
 
 @router.callback_query(SubtitleStates.sauto_waiting_en_decision, F.data == "sauto_en:auto_extract")
 @router.callback_query(SubtitleStates.sauto_waiting_en_decision, F.data == "sauto_en:extract")
@@ -1242,159 +1705,6 @@ async def _detect_existing_automation_quality_defaults(
     }
 
 
-async def _prompt_final_automation_choices_step(
-        call_or_msg: CallbackQuery | Message,
-        state: FSMContext,
-        plans: list[AutomationPlan],
-        en_note: str = ""
-):
-    data = await state.get_data()
-    selected_sources = dict(data.get("sauto_fullhd_source_map", {}) or {})
-    for plan in plans:
-        plan_key = plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
-        selected_path = selected_sources.get(plan_key)
-        if selected_path:
-            selected_path = Path(selected_path)
-            if selected_path.is_file():
-                plan.fullhd_source_video = selected_path.resolve()
-                plan.source_type = AutomationService.detect_source_type(plan.fullhd_source_video.name)
-
-    ambiguous_plan = next(
-        (
-            plan for plan in plans
-            if not plan.fullhd_source_video
-            and len(plan.fullhd_source_candidates or []) > 1
-            and not selected_sources.get(
-                plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
-            )
-        ),
-        None,
-    )
-    if ambiguous_plan:
-        plan_key = (
-            ambiguous_plan.season_ep_tag
-            if (ambiguous_plan.is_series and ambiguous_plan.season_ep_tag)
-            else "MOVIE"
-        )
-        candidates = [
-            str(Path(item).resolve())
-            for item in ambiguous_plan.fullhd_source_candidates
-            if Path(item).is_file()
-        ]
-        await state.set_state(SubtitleStates.sauto_waiting_fullhd_source)
-        await state.update_data(
-            sauto_fhd_pending_key=plan_key,
-            sauto_fhd_pending_candidates=candidates,
-            sauto_fhd_en_note=en_note,
-        )
-        kb = InlineKeyboardBuilder()
-        for index, candidate in enumerate(candidates[:20]):
-            file_path = Path(candidate)
-            label = f"🎬 {file_path.parent.name}: {file_path.name}"
-            kb.row(
-                InlineKeyboardButton(
-                    text=label[:58],
-                    callback_data=f"sauto_fhd:pick:{index}",
-                )
-            )
-        kb.row(InlineKeyboardButton(text="❌ لغو", callback_data="menu:home"))
-        candidate_lines = "\n".join(
-            f"• <code>{html.escape(Path(item).name)}</code> — "
-            f"<code>{html.escape(Path(item).parent.name)}</code>"
-            for item in candidates[:20]
-        )
-        prompt = (
-            "🎬 <b>چند فایل مناسب برای سورس FullHD هاردساب پیدا شد.</b>\n\n"
-            f"عنوان/قسمت: <code>{html.escape(plan_key)}</code>\n"
-            "لطفاً فایل اصلی موردنظر برای انکود و هاردساب را انتخاب کنید. "
-            "ربات هیچ‌کدام را به‌صورت تصادفی انتخاب نمی‌کند.\n\n"
-            + candidate_lines
-        )
-        if isinstance(call_or_msg, CallbackQuery):
-            await call_or_msg.message.edit_text(
-                prompt[:3900],
-                reply_markup=kb.as_markup(),
-                parse_mode="HTML",
-            )
-        else:
-            await call_or_msg.answer(
-                prompt[:3900],
-                reply_markup=kb.as_markup(),
-                parse_mode="HTML",
-            )
-        return
-
-    avail_soft_quals = []
-    for p in plans:
-        for st in p.softsub_targets:
-            if st.quality_folder_name not in avail_soft_quals:
-                avail_soft_quals.append(st.quality_folder_name)
-
-    server_defaults = await _detect_existing_automation_quality_defaults(plans)
-    default_selected_soft = sorted(
-        set(avail_soft_quals) & set(server_defaults["soft"]),
-        key=str.casefold,
-    )
-    default_srt_hb = sorted(
-        set(server_defaults["hard"]),
-        key=lambda q: {"1080p": 1, "720p": 2, "480p": 3}.get(q, 9),
-    )
-    default_auto_upload = True
-
-    checked_roots = server_defaults["checked_roots"]
-    unavailable_roots = server_defaults["unavailable_roots"]
-    if checked_roots:
-        remote_check_note = (
-            "☁️ تیک‌های اولیه بر اساس پوشه‌ها/فایل‌های موجود در سرور مقصد تنظیم شده‌اند.\n"
-        )
-    else:
-        remote_check_note = (
-            "⚠️ پوشه مقصد در سرور قابل بررسی نبود؛ هیچ کیفیتی به‌صورت پیش‌فرض تیک نخورده است. "
-            "می‌توانید کیفیت‌ها را دستی انتخاب کنید.\n"
-        )
-    if unavailable_roots and checked_roots:
-        remote_check_note += (
-            f"⚠️ دسترسی به {len(unavailable_roots)} مسیر مقصد برقرار نشد؛ "
-            "برای آن مسیرها انتخاب پیش‌فرضی انجام نشد.\n"
-        )
-
-    await state.set_state(SubtitleStates.sauto_waiting_hb_qualities)
-    await state.update_data(
-        sauto_avail_soft_quals=avail_soft_quals,
-        sauto_selected_soft_quals=default_selected_soft,
-        sauto_hb_srt_qualities=default_srt_hb,
-        sauto_auto_upload=default_auto_upload
-    )
-
-    fhd_list = [f"• `{p.season_ep_tag or 'فیلم'}`: `{p.fullhd_source_video.name}`" for p in plans if
-                p.fullhd_source_video]
-    fhd_block = "\n".join(fhd_list[:8]) if fhd_list else "_(فایل FullHD یافت نشد)_"
-
-    text = (
-        f"{en_note}\n\n"
-        f"🎯 **مرحله نهایی اتوماسیون: انتخاب کیفیت‌های سافت‌ساب و هاردساب**\n\n"
-        f"🎞 تعداد قسمت‌های آماده: **`{len(plans)}` مورد**\n"
-        f"📂 پوشه‌های کیفیت خام موجود: `{', '.join(avail_soft_quals) or 'موردی یافت نشد'}`\n"
-        f"🔥 **سورس هاردساب (`FullHD`):**\n{fhd_block}\n\n"
-        f"{remote_check_note}\n"
-        f"✅ پیش‌فرض SoftSub: `{', '.join(default_selected_soft) or 'هیچ‌کدام'}`\n"
-        f"✅ پیش‌فرض HardSub: `{', '.join(default_srt_hb) or 'هیچ‌کدام'}`\n\n"
-        "👇 در پنل زیر می‌توانید:\n"
-        "1️⃣ مشخص کنید کدام **پوشه‌های کیفیت خام** سافت‌ساب شوند (`✅`).\n"
-        "2️⃣ مشخص کنید کدام یک از **۳ کیفیت اصلی (`1080p`, `720p`, `480p`)** از روی فایل `FullHD` هاردساب شوند:"
-    )
-    kb = smart_auto_final_selection_kb(
-        available_softsub_qualities=avail_soft_quals,
-        selected_softsub_qualities=set(default_selected_soft),
-        selected_hardsub_srt=set(default_srt_hb),
-        auto_upload=default_auto_upload
-    )
-
-    if isinstance(call_or_msg, CallbackQuery):
-        await call_or_msg.message.edit_text(text[:4000], reply_markup=kb, parse_mode="Markdown")
-    else:
-        await call_or_msg.answer(text[:4000], reply_markup=kb, parse_mode="Markdown")
-
 
 @router.callback_query(SubtitleStates.sauto_waiting_fullhd_source, F.data.startswith("sauto_fhd:pick:"))
 async def cb_sauto_pick_fullhd_source(call: CallbackQuery, state: FSMContext):
@@ -1427,53 +1737,6 @@ async def cb_sauto_pick_fullhd_source(call: CallbackQuery, state: FSMContext):
         en_note=str(data.get("sauto_fhd_en_note") or ""),
     )
 
-
-@router.callback_query(SubtitleStates.sauto_waiting_hb_qualities, F.data.startswith("sauto_hbq:"))
-async def cb_sauto_hb_quality_action(call: CallbackQuery, state: FSMContext):
-    action = call.data.split(":", 1)[1]
-    data = await state.get_data()
-    avail_soft: list[str] = data.get("sauto_avail_soft_quals", [])
-    sel_soft = set(data.get("sauto_selected_soft_quals", avail_soft))
-    srt_set = set(data.get("sauto_hb_srt_qualities", []))
-    auto_up = bool(data.get("sauto_auto_upload", True))
-
-    if action.startswith("toggle_soft:"):
-        idx = int(action.split(":")[1])
-        if idx < len(avail_soft):
-            q_name = avail_soft[idx]
-            sel_soft.remove(q_name) if q_name in sel_soft else sel_soft.add(q_name)
-    elif action == "all_soft":
-        if len(sel_soft) == len(avail_soft):
-            sel_soft.clear()
-        else:
-            sel_soft = set(avail_soft)
-    elif action.startswith("toggle_srt:"):
-        q = action.split(":")[1]
-        srt_set.remove(q) if q in srt_set else srt_set.add(q)
-    elif action == "all_srt":
-        srt_set = {"1080p", "720p", "480p"}
-    elif action == "no_srt":
-        srt_set.clear()
-    elif action == "toggle_upload":
-        auto_up = not auto_up
-    elif action == "launch":
-        return await _execute_smart_automation_batch(
-            call, state, list(sel_soft), list(srt_set), auto_up
-        )
-
-    await state.update_data(
-        sauto_selected_soft_quals=list(sel_soft),
-        sauto_hb_srt_qualities=list(srt_set),
-        sauto_auto_upload=auto_up
-    )
-    await call.message.edit_reply_markup(
-        reply_markup=smart_auto_final_selection_kb(
-            available_softsub_qualities=avail_soft,
-            selected_softsub_qualities=sel_soft,
-            selected_hardsub_srt=srt_set,
-            auto_upload=auto_up
-        )
-    )
 
 
 def _automation_batch_status_markup():
@@ -1669,178 +1932,6 @@ async def _watch_smart_automation_batch(
             return
 
         await asyncio.sleep(3)
-
-async def _execute_smart_automation_batch(
-        call: CallbackQuery,
-        state: FSMContext,
-        selected_soft_qualities: list[str],
-        selected_hb_srt: list[str],
-        auto_upload: bool
-):
-    data = await state.get_data()
-    target_dir = Path(data["sauto_target_dir"])
-    ep_tags = data.get("sauto_ep_tags", [])
-    fa_map: dict[str, str] = data.get("sauto_final_fa_map", {})
-    en_map: dict[str, str] = data.get("sauto_final_en_map", {})
-    server_id = str(data.get("sauto_server_id") or "").strip() or None
-    brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
-
-    plans = await AutomationService.analyze_multi_episodes_plan(target_dir, ep_tags)
-    selected_sources = dict(data.get("sauto_fullhd_source_map", {}) or {})
-    for plan in plans:
-        plan_key = plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
-        source_path = selected_sources.get(plan_key)
-        if source_path and Path(source_path).is_file():
-            plan.fullhd_source_video = Path(source_path).resolve()
-            plan.source_type = AutomationService.detect_source_type(plan.fullhd_source_video.name)
-    selected_soft_set = set(selected_soft_qualities)
-    batch_id = uuid.uuid4().hex[:10]
-    batch_tasks = []
-    skipped_items: list[str] = []
-
-    for plan in plans:
-        key = plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
-        fa_sub = Path(fa_map[key]) if key in fa_map else None
-        en_sub = Path(en_map[key]) if key in en_map else plan.existing_en_sub
-
-        if not fa_sub or not fa_sub.exists():
-            skipped_items.append(
-                f"{key}: زیرنویس فارسی معتبر پیدا نشد؛ SoftSub/HardSub این مورد اجرا نشد."
-            )
-            continue
-
-        if auto_upload:
-            if fa_sub.exists():
-                r_dir_fa = AutomationService.compute_server_remote_dir_for_local_path(fa_sub)
-                subtitle_task = await queue_engine.add_task(
-                    "upload",
-                    f"AutoUpload Sub [{r_dir_fa}]: {fa_sub.name}",
-                    CuteFTPService.upload_path,
-                    fa_sub,
-                    r_dir_fa,
-                    server_id=server_id,
-                    batch_id=batch_id,
-                    notify_completion=False,
-                )
-                batch_tasks.append(subtitle_task)
-
-                # در انیمه، نسخه SRT تبدیل‌شده نیز باید همراه ASS ارسال شود.
-                if plan.category == "Anime" and fa_sub.suffix.lower() in (".ass", ".ssa"):
-                    converted_srt = fa_sub.with_suffix(".srt")
-                    if converted_srt.exists():
-                        converted_task = await queue_engine.add_task(
-                            "upload",
-                            f"AutoUpload Sub [{r_dir_fa}]: {converted_srt.name}",
-                            CuteFTPService.upload_path,
-                            converted_srt,
-                            r_dir_fa,
-                            server_id=server_id,
-                            batch_id=batch_id,
-                            notify_completion=False,
-                        )
-                        batch_tasks.append(converted_task)
-
-            if en_sub and en_sub.exists() and plan.category != "Anime":
-                r_dir_en = AutomationService.compute_server_remote_dir_for_local_path(en_sub)
-                en_task = await queue_engine.add_task(
-                    "upload",
-                    f"AutoUpload Sub [{r_dir_en}]: {en_sub.name}",
-                    CuteFTPService.upload_path,
-                    en_sub,
-                    r_dir_en,
-                    server_id=server_id,
-                    batch_id=batch_id,
-                    notify_completion=False,
-                )
-                batch_tasks.append(en_task)
-
-        for st in plan.softsub_targets:
-            if st.quality_folder_name not in selected_soft_set:
-                continue
-            st.output_dir.mkdir(parents=True, exist_ok=True)
-            soft_task = await queue_engine.add_task(
-                "mkvtoolnix",
-                f"SoftSub [{st.quality_folder_name}]: {st.output_file.name}",
-                AutomationService.run_softsub_and_optional_upload,
-                st.raw_video,
-                st.output_file,
-                fa_sub,
-                en_sub,
-                brand,
-                auto_upload,
-                server_id=server_id,
-                batch_id=batch_id,
-                notify_completion=False,
-            )
-            batch_tasks.append(soft_task)
-
-        hardsub_targets = AutomationService.build_hardsub_targets(plan, selected_hb_srt)
-        if selected_hb_srt and not plan.fullhd_source_video:
-            skipped_items.append(
-                f"{key}: سورس FullHD موجود نیست؛ HardSub انتخاب‌شده اجرا نشد."
-            )
-
-        for ht in hardsub_targets:
-            ht.output_dir.mkdir(parents=True, exist_ok=True)
-            hard_task = await queue_engine.add_task(
-                "handbrake",
-                f"HardSub [{ht.quality_tag}]: {ht.output_file.name}",
-                AutomationService.run_hardsub_or_encode_and_optional_upload,
-                ht,
-                fa_sub,
-                en_sub,
-                brand,
-                auto_upload,
-                server_id=server_id,
-                batch_id=batch_id,
-                notify_completion=False,
-            )
-            batch_tasks.append(hard_task)
-
-        if (
-                not any(st.quality_folder_name in selected_soft_set for st in plan.softsub_targets)
-                and not selected_hb_srt
-        ):
-            skipped_items.append(
-                f"{key}: هیچ کیفیت SoftSub یا HardSub برای اجرا انتخاب/موجود نبود."
-            )
-
-    await state.clear()
-    await state.update_data(current_dir=str(target_dir))
-
-    title_str = plans[0].series_title if plans else target_dir.name
-    initial_report = _build_automation_batch_status_text(
-        title=title_str,
-        tasks=batch_tasks,
-        skipped_items=skipped_items,
-        auto_upload=auto_upload,
-        final=not bool(batch_tasks),
-    )
-
-    status_message = await call.message.edit_text(
-        initial_report,
-        reply_markup=_automation_batch_status_markup(),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-
-    if batch_tasks:
-        monitor_task = asyncio.create_task(
-            _watch_smart_automation_batch(
-                status_message=status_message,
-                batch_id=batch_id,
-                title=title_str,
-                initial_tasks=batch_tasks,
-                skipped_items=skipped_items,
-                auto_upload=auto_upload,
-                remote_root_path=AutomationService.compute_server_remote_dir_for_local_path(target_dir),
-            ),
-            name=f"automation-status-{batch_id}",
-        )
-        _ACTIVE_AUTOMATION_MONITORS.add(monitor_task)
-        monitor_task.add_done_callback(_release_automation_monitor)
-
-    await call.answer("اتوماسیون در صف قرار گرفت؛ گزارش نهایی پس از پایان ارسال می‌شود.")
 
 
 # وضعیت‌هایی که خودشان منتظر دریافت فایل زیرنویس در یک مرحله خاص هستند

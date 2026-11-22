@@ -233,10 +233,24 @@ def smart_auto_sub_name_kb(suggested_name: str, original_name: str) -> InlineKey
     return builder.as_markup()
 
 
-def smart_auto_missing_en_kb(has_embedded_en: bool = False) -> InlineKeyboardMarkup:
-    # Embedded EN extraction is handled only by the post-FullHD-download pipeline.
-    # Keep the argument for compatibility with existing callers.
+def smart_auto_missing_en_kb(
+    has_embedded_en: bool = False,
+    non_en_candidates: list[dict] | None = None
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+
+    for idx, cand in enumerate((non_en_candidates or [])[:8]):
+        lang = cand.get("language") or "und"
+        t_name = f" ({cand['track_name']})" if cand.get("track_name") else ""
+        ep_prefix = f"[{cand['plan_key']}] " if cand.get("plan_key") and cand["plan_key"] != "MOVIE" else ""
+        label = f"✅ {ep_prefix}افزودن Track #{cand['track_id']} ({lang}{t_name}) به عنوان EN"
+        builder.row(
+            InlineKeyboardButton(
+                text=smart_middle_truncate(label, 56),
+                callback_data=f"sauto_en:use_track:{idx}"
+            )
+        )
+
     builder.row(
         InlineKeyboardButton(
             text="📤 آپلود دستی فایل زیرنویس انگلیسی (.srt / .zip)",
@@ -257,11 +271,13 @@ def smart_auto_missing_en_kb(has_embedded_en: bool = False) -> InlineKeyboardMar
     )
     return builder.as_markup()
 
+
 def smart_auto_final_selection_kb(
     available_softsub_qualities: list[str],
     selected_softsub_qualities: set[str],
     selected_hardsub_srt: set[str],
-    auto_upload: bool = True
+    auto_upload: bool = True,
+    include_en: bool = True
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
@@ -319,6 +335,14 @@ def smart_auto_final_selection_kb(
         )
     )
 
+    en_mark = "🟢 فعال" if include_en else "🔴 غیرفعال"
+    builder.row(
+        InlineKeyboardButton(
+            text=f"🇬🇧 افزودن زیرنویس انگلیسی در اتوماسیون: {en_mark}",
+            callback_data="sauto_hbq:toggle_en"
+        )
+    )
+
     up_mark = "🟢 فعال" if auto_upload else "🔴 غیرفعال"
     builder.row(
         InlineKeyboardButton(
@@ -340,7 +364,6 @@ def smart_auto_final_selection_kb(
         )
     )
     return builder.as_markup()
-
 
 def manual_encode_ass_qualities_kb(
     selected_qualities: set[str],
