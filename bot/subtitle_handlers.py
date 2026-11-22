@@ -1943,6 +1943,8 @@ _EXPLICIT_SUB_UPLOAD_STATES = {
     SubtitleStates.waiting_fa_subtitle.state,
     SubtitleStates.waiting_en_subtitle.state,
     "MainStates:waiting_target_folder_sub_file",
+    SubtitleStates.waiting_incoming_subtitle_search.state,
+    SubtitleStates.waiting_incoming_subtitle_folder_reference.state,
 }
 
 
@@ -2590,7 +2592,12 @@ async def handle_incoming_subtitle_folder_reference(message: Message, state: FSM
         target_dir, media_category = _local_target_from_remote_folder(first_path)
         # Keep the exact remote-relative directory (including FullHD/1080p)
         # during transfer; _show_incoming_subtitle_actions normalizes it later.
-        inferred_tags = _incoming_subtitle_episode_tags(sub_files, target_dir)
+        inferred_tags = _incoming_episode_tags_with_fallback(
+            info,
+            sub_files,
+            target_dir,
+            explicit_episode_text,
+        )
     except Exception as exc:
         return await message.answer(
             f"❌ مسیر مقصد نامعتبر است: <code>{html.escape(str(exc)[:500])}</code>",
@@ -2598,12 +2605,6 @@ async def handle_incoming_subtitle_folder_reference(message: Message, state: FSM
         )
 
     episode_tags = list(inferred_tags)
-    if not episode_tags:
-        explicit_tag = AutomationService.extract_episode_tag(explicit_episode_text)
-        if not explicit_tag:
-            explicit_tag = AutomationService.extract_episode_tag(str(info.get("reference") or ""))
-        if explicit_tag:
-            episode_tags = [explicit_tag]
 
     if media_category in ("Series", "Anime") and not episode_tags:
         return await message.answer(
@@ -3003,10 +3004,17 @@ async def _start_remote_subtitle_media_sync(
 ):
     is_movie = media_category == "Movies"
     if not episode_tags and not is_movie:
-        return await call.answer("تگ قسمت برای دریافت دقیق فایل‌های سریال مشخص نیست.", show_alert=True)
+        warning = "تگ قسمت برای دریافت دقیق فایل‌های سریال مشخص نیست."
+        if isinstance(call, CallbackQuery):
+            return await call.answer(warning, show_alert=True)
+        return await call.answer(warning)
+
     server_id = str(server_info.get("server_id") or "")
     if not server_id:
-        return await call.answer("شناسه سرور منبع معتبر نیست.", show_alert=True)
+        warning = "شناسه سرور منبع معتبر نیست."
+        if isinstance(call, CallbackQuery):
+            return await call.answer(warning, show_alert=True)
+        return await call.answer(warning)
 
     target_dir.mkdir(parents=True, exist_ok=True)
     if is_movie:
