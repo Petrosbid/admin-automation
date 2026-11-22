@@ -8,7 +8,7 @@ proxy:
   url: "socks5://127.0.0.1:10808"
 
 concurrency:
-  handbrake_workers: 2
+  handbrake_workers: 3
   mkvtoolnix_workers: 1
   download_workers: 5
   upload_workers: 1
