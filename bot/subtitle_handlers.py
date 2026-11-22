@@ -2588,7 +2588,9 @@ async def handle_incoming_subtitle_folder_reference(message: Message, state: FSM
     first_path = str(matches[0].get("remote_dir") or "")
     try:
         target_dir, media_category = _local_target_from_remote_folder(first_path)
-        target_dir, inferred_tags = _resolve_incoming_subtitle_target(target_dir, sub_files)
+        # Keep the exact remote-relative directory (including FullHD/1080p)
+        # during transfer; _show_incoming_subtitle_actions normalizes it later.
+        inferred_tags = _incoming_subtitle_episode_tags(sub_files, target_dir)
     except Exception as exc:
         return await message.answer(
             f"❌ مسیر مقصد نامعتبر است: <code>{html.escape(str(exc)[:500])}</code>",
@@ -2602,8 +2604,6 @@ async def handle_incoming_subtitle_folder_reference(message: Message, state: FSM
             explicit_tag = AutomationService.extract_episode_tag(str(info.get("reference") or ""))
         if explicit_tag:
             episode_tags = [explicit_tag]
-            if media_category in ("Series", "Anime") and not AutomationService.SEASON_DIR_REGEX.match(target_dir.name):
-                target_dir = target_dir / f"S{int(explicit_tag[1:3]):02d}"
 
     if media_category in ("Series", "Anime") and not episode_tags:
         return await message.answer(

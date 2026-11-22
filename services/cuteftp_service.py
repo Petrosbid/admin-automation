@@ -310,22 +310,23 @@ class CuteFTPService:
                 public_path = incoming_path[len(base_path):] if base_path else incoming_path
                 public_path = public_path or "/"
 
-                remote_root = cls._normalize_remote_path(
+                configured_remote_root = cls._normalize_remote_path(
                     str(server.get("remote_base_dir") or "/English/Movies")
                 )
-                public_root = cls._public_path_from_remote_path(remote_root).rstrip("/") or "/"
-                if public_root == "/":
-                    if not public_path.startswith("/"):
-                        continue
-                    suffix = public_path
-                elif public_path == public_root:
-                    suffix = ""
-                elif public_path.startswith(public_root + "/"):
-                    suffix = public_path[len(public_root):]
-                else:
-                    continue
+                ftp_public_prefix = ""
+                for prefix in ("/public_html", "/www", "/htdocs"):
+                    if (
+                        configured_remote_root.casefold() == prefix
+                        or configured_remote_root.casefold().startswith(prefix.casefold() + "/")
+                    ):
+                        ftp_public_prefix = prefix
+                        break
 
-                add_candidate(server, remote_root.rstrip("/") + suffix)
+                # build_public_url() publishes the complete /English/... path and
+                # only hides the hosting root (/public_html, /www or /htdocs).
+                # Restore that hosting root without assuming the server's default
+                # remote_base_dir is the same category as the supplied folder.
+                add_candidate(server, ftp_public_prefix.rstrip("/") + public_path)
         elif not parsed.scheme and raw.startswith("/"):
             for server in servers:
                 add_candidate(server, raw)
