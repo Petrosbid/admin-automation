@@ -606,15 +606,26 @@ class MKVService:
             return f"{h:02d}:{m:02d}:{s:02d},{cs * 10:03d}"
 
         for line in content.splitlines():
-            if line.startswith("Dialogue:"):
-                fields = line[9:].split(",", 9)
-                if len(fields) >= 10:
-                    start_t = _parse_ass_time(fields[1])
-                    end_t = _parse_ass_time(fields[2])
-                    raw_txt = fields[9]
-                    clean_txt = re.sub(r"\{[^}]*\}", "", raw_txt).replace("\\N", "\n").replace("\\n", "\n").strip()
-                    if clean_txt:
-                        events.append((start_t, end_t, clean_txt))
+            # ASS event lines may contain leading whitespace or different casing.
+            match = re.match(r"^\\s*Dialogue\\s*:\\s*(.*)$", line, flags=re.IGNORECASE)
+            if not match:
+                continue
+            fields = match.group(1).split(",", 9)
+            if len(fields) < 10:
+                continue
+
+            start_t = _parse_ass_time(fields[1])
+            end_t = _parse_ass_time(fields[2])
+            raw_txt = fields[9]
+            clean_txt = (
+                re.sub(r"\\{[^}]*\\}", "", raw_txt)
+                .replace("\\\\N", "\n")
+                .replace("\\\\n", "\n")
+                .replace("\\\\h", " ")
+                .strip()
+            )
+            if clean_txt:
+                events.append((start_t, end_t, clean_txt))
 
         srt_blocks = [
             f"{idx}\n{st} --> {et}\n{txt}"
@@ -637,93 +648,211 @@ class MKVService:
         en_lang: str,
         fa_default: bool,
         fa_forced: bool,
+        require_fa_sub: bool = False,
+        require_en_sub: bool = False,
         progress_callback: Callable[[str], None] = None
     ) -> Path:
-        uid = uuid.uuid4().hex[:6]
+        """
+        Reliable MP4 SoftSub pipeline:
+        1) Mux subtitle files into a temporary MKV with MKVToolNix.
+        2) Verify that the temporary MKV really contains the requested tracks.
+        3) Remux that known-good MKV to MP4 with FFmpeg, converting text
+           subtitle streams to mov_text.
+        4) The caller verifies the final MP4 with FFprobe before publishing it.
+        """
+        uid = uuid.uuid4().hex[:8]
+        temp_mkv = output_path.with_name(f"_mp4_softsub_mux_{uid}.mkv")
         temp_subs_to_cleanup: list[Path] = []
+        mkvmerge_bin = cls._get_mkvmerge_bin()
 
         def _ensure_srt_for_mp4(sub_p: Path | None, tag: str) -> Path | None:
-            if not sub_p or not sub_p.exists():
+            if sub_p is None:
                 return None
-            if sub_p.suffix.lower() in (".ass", ".ssa"):
+            if not sub_p.is_file() or sub_p.stat().st_size <= 0:
+                raise FileNotFoundError(f"زیرنویس {tag} برای MP4 پیدا نشد یا خالی است: {sub_p}")
+            if sub_p.suffix.casefold() in (".ass", ".ssa"):
                 tmp_srt = output_path.with_name(f"_mp4_sub_{tag}_{uid}.srt")
                 cls._ass_to_clean_srt(sub_p, tmp_srt)
+                if not tmp_srt.is_file() or tmp_srt.stat().st_size <= 0:
+                    raise RuntimeError(
+                        f"تبدیل زیرنویس {tag} از ASS/SSA به SRT خروجی خالی تولید کرد: {sub_p.name}"
+                    )
+                SubtitleService.normalize_subtitle_file(tmp_srt)
+                cls.validate_subtitle_file(tmp_srt, f"زیرنویس {tag} تبدیل‌شده برای MP4")
                 temp_subs_to_cleanup.append(tmp_srt)
                 return tmp_srt
-            return sub_p
+            return cls.validate_subtitle_file(sub_p, f"زیرنویس {tag} برای MP4")
 
         try:
-            fa_srt_ready = _ensure_srt_for_mp4(clean_fa_sub, "fa")
-            en_srt_ready = _ensure_srt_for_mp4(clean_en_sub, "en")
+            if not Path(mkvmerge_bin).is_file() and not shutil.which(mkvmerge_bin):
+                raise FileNotFoundError(
+                    f"mkvmerge برای ساخت واسط MP4 SoftSub پیدا نشد: {mkvmerge_bin}"
+                )
+            if not ffmpeg_bin or (not Path(ffmpeg_bin).is_file() and not shutil.which(ffmpeg_bin)):
+                raise FileNotFoundError("FFmpeg برای تبدیل واسط MKV به MP4 پیدا نشد.")
 
-            if not en_srt_ready and kept_embedded_en_track_id is not None:
+            fa_srt_ready = _ensure_srt_for_mp4(clean_fa_sub, "فارسی")
+            en_srt_ready = _ensure_srt_for_mp4(clean_en_sub, "انگلیسی")
+
+            if require_fa_sub and fa_srt_ready is None:
+                raise ValueError("زیرنویس فارسی به مرحله ساخت MP4 نرسیده است.")
+            if require_en_sub and en_srt_ready is None and kept_embedded_en_track_id is None:
+                raise ValueError("زیرنویس انگلیسی موردنیاز برای MP4 موجود نیست.")
+
+            if en_srt_ready is None and kept_embedded_en_track_id is not None:
                 extracted_en = output_path.with_name(f"_mp4_emb_en_{uid}.srt")
-                try:
-                    await cls.extract_subtitle_track(video_path, kept_embedded_en_track_id, extracted_en)
-                    if extracted_en.exists():
-                        en_srt_ready = extracted_en
-                        temp_subs_to_cleanup.append(extracted_en)
-                except Exception:
-                    pass
+                await cls.extract_subtitle_track(
+                    video_path,
+                    int(kept_embedded_en_track_id),
+                    extracted_en,
+                )
+                cls.validate_subtitle_file(extracted_en, "زیرنویس انگلیسی استخراج‌شده برای MP4")
+                en_srt_ready = extracted_en
+                temp_subs_to_cleanup.append(extracted_en)
 
-            cmd = [ffmpeg_bin, "-y", "-i", str(video_path)]
-            sub_inputs = []
-            if fa_srt_ready:
-                cmd.extend(["-sub_charenc", "UTF-8", "-i", str(fa_srt_ready)])
-                sub_inputs.append(("fa", fa_lang, True))
-            if en_srt_ready:
-                cmd.extend(["-sub_charenc", "UTF-8", "-i", str(en_srt_ready)])
-                sub_inputs.append(("en", en_lang, False))
+            if progress_callback:
+                progress_callback("مرحله ۱/۲: ساخت فایل واسط MKV همراه با زیرنویس فارسی/انگلیسی...")
 
-            cmd.extend(["-map", "0:v", "-map", "0:a?"])
-            for idx in range(len(sub_inputs)):
-                cmd.extend(["-map", f"{idx + 1}:0"])
+            source_info = await cls.inspect_tracks(video_path)
+            source_tracks = source_info.get("tracks", []) or []
+            mux_cmd = [
+                mkvmerge_bin,
+                "--ui-language", "en",
+                "--output", str(temp_mkv),
+                "--title", brand,
+            ]
 
-            cmd.extend([
+            for track in source_tracks:
+                if track.get("type") in ("video", "audio"):
+                    track_id = track.get("id")
+                    if track_id is not None:
+                        mux_cmd.extend(["--track-name", f"{track_id}:{brand}"])
+
+            if kept_embedded_en_track_id is not None and en_srt_ready is None:
+                mux_cmd.extend([
+                    "--subtitle-tracks", str(int(kept_embedded_en_track_id)),
+                    "--track-name", f"{int(kept_embedded_en_track_id)}:{brand}",
+                    "--default-track-flag", f"{int(kept_embedded_en_track_id)}:no",
+                    "--forced-display-flag", f"{int(kept_embedded_en_track_id)}:no",
+                ])
+            else:
+                mux_cmd.append("--no-subtitles")
+            mux_cmd.append(str(video_path))
+
+            if fa_srt_ready is not None:
+                mux_cmd.extend([
+                    "--language", f"0:{fa_lang}",
+                    "--track-name", f"0:{brand}",
+                    "--default-track-flag", f"0:{'yes' if fa_default else 'no'}",
+                    "--forced-display-flag", f"0:{'yes' if fa_forced else 'no'}",
+                    "--sub-charset", "0:UTF-8",
+                    str(fa_srt_ready),
+                ])
+
+            if en_srt_ready is not None:
+                mux_cmd.extend([
+                    "--language", f"0:{en_lang}",
+                    "--track-name", f"0:{brand}",
+                    "--default-track-flag", "0:no",
+                    "--forced-display-flag", "0:no",
+                    "--sub-charset", "0:UTF-8",
+                    str(en_srt_ready),
+                ])
+
+            mux_proc = await asyncio.create_subprocess_exec(
+                *mux_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            mux_output, _ = await mux_proc.communicate()
+            mux_text = mux_output.decode("utf-8", errors="replace")
+            if (
+                mux_proc.returncode not in (0, 1)
+                or not temp_mkv.is_file()
+                or temp_mkv.stat().st_size <= 0
+            ):
+                raise RuntimeError(
+                    "ساخت فایل واسط MKV برای خروجی MP4 ناموفق بود "
+                    f"(exit={mux_proc.returncode}): {mux_text[-5000:]}"
+                )
+
+            muxed_tracks = await cls._verify_muxed_subtitle_languages(
+                temp_mkv,
+                require_fa_sub=require_fa_sub,
+                require_en_sub=require_en_sub,
+                fa_lang=fa_lang,
+                en_lang=en_lang,
+            )
+            if (require_fa_sub or require_en_sub) and not muxed_tracks:
+                raise RuntimeError("فایل واسط MKV ساخته شد اما هیچ ترک زیرنویسی در آن ثبت نشده است.")
+
+            if progress_callback:
+                progress_callback("مرحله ۲/۲: تبدیل فایل واسط MKV به MP4 با حفظ ترک‌های زیرنویس...")
+
+            ff_cmd = [
+                ffmpeg_bin,
+                "-hide_banner",
+                "-y",
+                "-i", str(temp_mkv),
+                "-map", "0:v?",
+                "-map", "0:a?",
+            ]
+            if muxed_tracks:
+                ff_cmd.extend(["-map", "0:s"])
+
+            ff_cmd.extend([
+                "-map_metadata", "0",
+                "-map_chapters", "0",
                 "-c:v", "copy",
                 "-c:a", "copy",
                 "-c:s", "mov_text",
+                "-movflags", "+faststart",
                 "-metadata", f"title={brand}",
-                "-metadata:s:v:0", f"title={brand}",
-                "-metadata:s:a:0", f"title={brand}",
             ])
 
-            for s_idx, (_, s_lang, is_fa) in enumerate(sub_inputs):
-                cmd.extend([
-                    f"-metadata:s:s:{s_idx}", f"language={s_lang}",
-                    f"-metadata:s:s:{s_idx}", f"title={brand}",
+            for sub_index, track in enumerate(muxed_tracks):
+                language = str(track.get("language") or "und").strip() or "und"
+                track_name = str(track.get("track_name") or brand).strip() or brand
+                ff_cmd.extend([
+                    f"-metadata:s:s:{sub_index}", f"language={language}",
+                    f"-metadata:s:s:{sub_index}", f"title={track_name}",
                 ])
-                if is_fa:
-                    disp_flags = []
-                    if fa_default:
-                        disp_flags.append("default")
-                    if fa_forced:
-                        disp_flags.append("forced")
-                    cmd.extend([f"-disposition:s:{s_idx}", "+".join(disp_flags) if disp_flags else "default"])
-                else:
-                    cmd.extend([f"-disposition:s:{s_idx}", "0"])
+                dispositions = []
+                if track.get("default_track"):
+                    dispositions.append("default")
+                if track.get("forced_track"):
+                    dispositions.append("forced")
+                ff_cmd.extend([
+                    f"-disposition:s:{sub_index}",
+                    "+".join(dispositions) if dispositions else "0",
+                ])
 
-            cmd.extend(["-movflags", "+faststart", str(output_path)])
-
-            if progress_callback:
-                progress_callback("در حال ساخت سافت‌ساب با فرمت MP4...")
-
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
+            ff_cmd.append(str(output_path))
+            ff_proc = await asyncio.create_subprocess_exec(
+                *ff_cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT
+                stderr=asyncio.subprocess.STDOUT,
             )
-            stdout, _ = await proc.communicate()
-            if proc.returncode != 0:
-                raise RuntimeError(f"FFmpeg MP4 SoftSub error: {stdout.decode('utf-8', errors='replace')[-400:]}")
+            ff_output, _ = await ff_proc.communicate()
+            ff_text = ff_output.decode("utf-8", errors="replace")
+            if (
+                ff_proc.returncode != 0
+                or not output_path.is_file()
+                or output_path.stat().st_size <= 0
+            ):
+                raise RuntimeError(
+                    "تبدیل MKV واسط به MP4 ناموفق بود "
+                    f"(exit={ff_proc.returncode}). گزارش FFmpeg:\n{ff_text[-5000:]}"
+                )
 
             if progress_callback:
-                progress_callback("100%")
+                progress_callback("ساخت فایل MP4 با ترک‌های زیرنویس انجام شد؛ در حال تأیید نهایی...")
             return output_path
 
         finally:
-            for tmp_f in temp_subs_to_cleanup:
-                tmp_f.unlink(missing_ok=True)
+            temp_mkv.unlink(missing_ok=True)
+            for temp_file in temp_subs_to_cleanup:
+                temp_file.unlink(missing_ok=True)
 
     @classmethod
     async def merge_softsub(
@@ -819,6 +948,8 @@ class MKVService:
                     en_lang=en_lang,
                     fa_default=fa_default,
                     fa_forced=fa_forced,
+                    require_fa_sub=require_fa_sub,
+                    require_en_sub=require_en_sub,
                     progress_callback=progress_callback
                 )
                 await cls._verify_muxed_subtitle_languages(
