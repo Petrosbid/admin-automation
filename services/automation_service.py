@@ -212,15 +212,19 @@ class AutomationService:
     @staticmethod
     def detect_source_type(text: str) -> str:
         low = text.lower()
-        if "bluray" in low or "blu-ray" in low or "bdrip" in low or "brrip" in low:
+        if re.search(r"blu[ ._-]?ray|bdrip|brrip", low):
             return "BluRay"
+        if re.search(r"web[ ._-]?rip", low):
+            return "WEBRip"
+        if "hdtv" in low:
+            return "HDTV"
         return "WEB-DL"
 
     @classmethod
     def format_clean_title(cls, raw_title: str) -> str:
         cleaned = re.sub(r'[<>:"/\\|?*]', "", raw_title).strip()
         cleaned = re.split(
-            r"[\s._\-]+(?:[Ss]\d{1,2}[Ee]\d{1,3}|(?:19|20)\d{2}|2160p|1080p|720p|480p|FullHD|WEB-DL|WEBRip|BluRay)\b",
+            r"(?:[\s._-]+(?:[\[(]\s*)?|[\[(]\s*)(?:S\d{1,2}E\d{1,3}|(?:19|20)\d{2}|2160p|1080p|720p|480p|FullHD|WEB-DL|WEBRip|BluRay)\b",
             cleaned,
             maxsplit=1,
             flags=re.IGNORECASE
@@ -362,6 +366,108 @@ class AutomationService:
                     break
         return net, enc
 
+    QUALITY_TAG = re.compile(r"(?<![a-z0-9])(2160p|1440p|1080p|720p|576p|540p|480p|360p|240p|4k|uhd)(?![a-z0-9])", re.I)
+
+    @classmethod
+    def quality_tag_from_name(cls, name: str) -> str:
+        match = cls.QUALITY_TAG.search(name)
+        tag = match.group(1).lower() if match else ""
+        return "2160p" if tag in ("4k", "uhd") else tag
+
+    @classmethod
+    async def detect_movie_quality(cls, video_path: Path, folder_name: str) -> str:
+        named_quality = cls.quality_tag_from_name(video_path.stem) or cls.quality_tag_from_name(folder_name)
+        dimensions = await MKVService.read_video_dimensions(video_path)
+        if dimensions is None:
+            return named_quality or ("1080p" if folder_name.casefold() == "fullhd" else "")
+        width, height = dimensions
+        # Standard widths account for releases cropped to a wider aspect ratio.
+        for quality, min_width, min_height in (
+            ("2160p", 3600, 1600), ("1440p", 2400, 1120),
+            ("1080p", 1800, 810), ("720p", 1200, 600),
+        ):
+            if width >= min_width or height >= min_height:
+                return quality
+        if height in (576, 540):
+            return f"{height}p"
+        if height >= 400 or width >= 800:
+            return "480p"
+        return "360p" if height >= 300 or width >= 600 else "240p"
+
+    @classmethod
+    def normalize_release_order(cls, stem: str) -> str:
+        source = r"(WEB[ ._-]?DL|WEB[ ._-]?Rip|Blu[ ._-]?Ray|HDTV)"
+        stem = re.sub(
+            rf"(?<![a-z0-9]){source}[. _-]+{cls.QUALITY_TAG.pattern}",
+            lambda match: f"{cls.quality_tag_from_name(match[2])}.{cls.detect_source_type(match[1])}",
+            stem,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(
+            rf"{cls.QUALITY_TAG.pattern}[. _-]+(\d{{1,2}}[ _-]?bit)[. _-]+{source}(?![a-z0-9])",
+            lambda match: f"{cls.quality_tag_from_name(match[1])}.{cls.detect_source_type(match[3])}.{match[2]}",
+            stem,
+            flags=re.IGNORECASE,
+        )
+
+    @classmethod
+    async def build_movie_release_filename(
+        cls, video_path: Path, folder_name: str, title: str, *,
+        softsub: bool = False, quality: str | None = None,
+    ) -> str:
+        stem = cls.clean_stem_for_ebtv(video_path.stem)
+        release_parts = re.split(r"(?<!\d)(?:19|20)\d{2}(?!\d)", stem, maxsplit=1)
+        metadata = release_parts[-1]
+        release = re.search(
+            rf"{cls.QUALITY_TAG.pattern}|\b(?:WEB[ ._-]?DL|WEB[ ._-]?Rip|Blu[ ._-]?Ray|HDTV)\b",
+            metadata,
+            flags=re.IGNORECASE,
+        )
+        if release and len(release_parts) == 1:
+            metadata = metadata[release.start():]
+        tags = f"{metadata} {folder_name}"
+        leading_group = re.match(r"^\[([a-z0-9]+)\]", stem, re.I)
+
+        def has_tag(tag: str) -> bool:
+            return bool(re.search(rf"(?<![a-z0-9]){re.escape(tag)}(?![a-z0-9])", tags, re.I))
+
+        year = cls.extract_media_year(title, video_path.name)
+        if quality is None:
+            quality = await cls.detect_movie_quality(video_path, folder_name)
+        network = next((tag for tag in (
+            "AMZN", "NF", "ATVP", "DSNP", "HMAX", "MAX", "PCOK", "HULU",
+            "PMTP", "STAN", "CRAV", "BBC", "ITV",
+        ) if has_tag(tag)), "")
+        audio = next((tag for tag in (
+            "DDP7.1", "DDP5.1", "DDP2.0", "DD5.1", "DD2.0", "AAC5.1", "AAC2.0",
+            "EAC3", "AC3", "AAC", "TrueHD", "DTS", "6CH", "2CH",
+        ) if has_tag(tag)), "")
+        encoder = next((tag for tag in (
+            "PSA", "Pahe", "YIFY", "YTS", "CHORTLE", "Judas", "RARBG", "RMTeam", "Tigole", "GalaxyRG",
+            "NTb", "FLUX", "ETHEL", "Kitsune", "SuccessfulCrab", "RAWR", "TEPES",
+            "SYNCOPY", "EDITH", "FENiX", "NOSiViD", "PECULATE",
+        ) if has_tag(tag) or (leading_group and leading_group[1].casefold() == tag.casefold())), "")
+        if not encoder and release:
+            separator = r"[.-]" if stem != video_path.stem else "-"
+            group = re.search(rf"(?<=[a-z0-9.]){separator}([a-z][a-z0-9]*)$", metadata, re.I)
+            if group and group[1].casefold() not in {network.casefold(), audio.casefold()} and not re.fullmatch(
+                r"DL|Rip|Ray|HD|FHD|FullHD|WEBRip|BluRay|HDTV|[xh]26[45]|HEVC|AVC",
+                group[1], re.I,
+            ):
+                encoder = group[1]
+        is_x265 = any(has_tag(tag) for tag in ("x265", "h265", "h.265", "HEVC"))
+        bit_depth = "10bit" if has_tag("10bit") or has_tag("10-bit") or (encoder == "PSA" and is_x265) else ""
+        fullhd = "FullHD" if quality == "1080p" and (has_tag("FullHD") or has_tag("FHD")) else ""
+        parts = (
+            cls.format_clean_title(title), year, quality, network, cls.detect_source_type(tags),
+            audio, bit_depth, "x265" if is_x265 else "", fullhd, encoder,
+            "SoftSub" if softsub else "", "EBTV",
+        )
+        ext = video_path.suffix.lower() or ".mkv"
+        if softsub and ext != ".mp4":
+            ext = ".mkv"
+        return ".".join(part for part in parts if part) + ext
+
     @classmethod
     async def build_standard_raw_filename_for_folder(
         cls,
@@ -369,8 +475,13 @@ class AutomationService:
         folder_name: str,
         series_or_movie_title: str,
         season_ep_tag: str | None = None,
-        is_series: bool = True
+        is_series: bool = True,
+        movie_quality: str | None = None,
     ) -> str:
+        if not is_series:
+            return await cls.build_movie_release_filename(
+                video_path, folder_name, series_or_movie_title, quality=movie_quality,
+            )
         clean_name = cls.format_clean_title(series_or_movie_title)
         fallback_s = cls.extract_season_num_from_dir(video_path.parent)
         ep_tag = season_ep_tag or cls.extract_episode_tag(video_path.name, fallback_season=fallback_s) or ""
@@ -379,53 +490,47 @@ class AutomationService:
         f_low = folder_name.lower()
         orig_ext = video_path.suffix.lower() or ".mkv"
 
-        if is_series and ep_tag:
-            if "1080p-x265-judas" in f_low or "judas" in f_low:
-                return f"{clean_name}.{ep_tag}.1080p.10bit.{src_type}.x265.Judas.EBTV.mkv"
+        if ep_tag:
+            if "1080p-x265-judas" in f_low:
+                return f"{clean_name}.{ep_tag}.1080p.{src_type}.10bit.x265.Judas.EBTV{orig_ext}"
             if "1080p-x265-psa" in f_low:
-                return f"{clean_name}.{ep_tag}.1080p.10bit.{src_type}.{ch_tag}.x265.PSA.EBTV.mkv"
+                return f"{clean_name}.{ep_tag}.1080p.{src_type}.10bit.{ch_tag}.x265.PSA.EBTV{orig_ext}"
             if "720p-x265-psa" in f_low:
-                return f"{clean_name}.{ep_tag}.720p.10bit.{src_type}.2CH.x265.PSA.EBTV.mkv"
+                return f"{clean_name}.{ep_tag}.720p.{src_type}.10bit.2CH.x265.PSA.EBTV{orig_ext}"
             if "1080p-pahe" in f_low:
-                return f"{clean_name}.{ep_tag}.1080p.{src_type}.6CH.Pahe.EBTV.mkv"
+                return f"{clean_name}.{ep_tag}.1080p.{src_type}.6CH.Pahe.EBTV{orig_ext}"
             if "720p-pahe" in f_low:
-                return f"{clean_name}.{ep_tag}.720p.{src_type}.Pahe.EBTV.mkv"
+                return f"{clean_name}.{ep_tag}.720p.{src_type}.Pahe.EBTV{orig_ext}"
             if "480p-rmteam" in f_low or "480p-rmt" in f_low:
-                return f"{clean_name}.{ep_tag}.480p.{src_type}.RMTeam.EBTV.mkv"
+                return f"{clean_name}.{ep_tag}.480p.{src_type}.RMTeam.EBTV{orig_ext}"
             if f_low == "fullhd":
                 net, enc_name = cls.detect_encoder_and_network(video_path.name)
-                return f"{clean_name}.{ep_tag}.1080p.{net}.{src_type}.FullHD.{enc_name}.EBTV.mkv"
+                return f"{clean_name}.{ep_tag}.1080p.{net}.{src_type}.FullHD.{enc_name}.EBTV{orig_ext}"
             if "1080p-ebtv" in f_low:
-                return f"{clean_name}.{ep_tag}.1080p.{src_type}.6CH.EBTV.mp4"
+                return f"{clean_name}.{ep_tag}.1080p.{src_type}.6CH.EBTV{orig_ext}"
             if "720p-ebtv" in f_low:
-                return f"{clean_name}.{ep_tag}.720p.{src_type}.EBTV.mp4"
+                return f"{clean_name}.{ep_tag}.720p.{src_type}.EBTV{orig_ext}"
             if "480p-ebtv" in f_low:
-                return f"{clean_name}.{ep_tag}.480p.{src_type}.EBTV.mp4"
+                return f"{clean_name}.{ep_tag}.480p.{src_type}.EBTV{orig_ext}"
 
-            custom_parts = [p for p in folder_name.split("-") if p]
-            custom_tag = ".".join(custom_parts)
-            return f"{clean_name}.{ep_tag}.{src_type}.{custom_tag}.EBTV{orig_ext}"
-
-        year_match = re.search(r"\b((?:19|20)\d{2})\b", video_path.name) or re.search(r"\b((?:19|20)\d{2})\b", series_or_movie_title)
-        year_str = f".{year_match.group(1)}" if year_match else ""
-        res_match = re.search(r"\b(2160p|1080p|720p|480p)\b", video_path.name, flags=re.IGNORECASE)
-        res_str = res_match.group(1).lower() if res_match else "1080p"
-
-        encoder_tag = ""
-        for enc_cand in ("PSA", "Pahe", "YTS", "RARBG", "RMTeam", "Tigole", "GalaxyRG"):
-            if enc_cand.lower() in video_path.name.lower():
-                encoder_tag = f".{enc_cand}"
-                break
-        x265_tag = ".10bit.x265" if ("x265" in video_path.name.lower() or "hevc" in video_path.name.lower()) else ""
-        ch_part = f".{ch_tag}" if ch_tag == "6CH" else ""
-
-        return f"{clean_name}{year_str}.{res_str}.{src_type}{ch_part}{x265_tag}{encoder_tag}.EBTV{orig_ext}"
+        quality = cls.quality_tag_from_name(folder_name) or cls.quality_tag_from_name(video_path.stem)
+        if f_low == "fullhd" and not quality:
+            quality = "1080p"
+        custom_tag = cls.QUALITY_TAG.sub("", folder_name)
+        custom_tag = re.sub(r"WEB[ ._-]?(?:DL|Rip)|Blu[ ._-]?Ray|HDTV", "", custom_tag, flags=re.I)
+        custom_parts = [
+            part for part in re.split(r"[-._\s]+", custom_tag)
+            if part and part.casefold() != "ebtv" and not cls.SEASON_DIR_REGEX.fullmatch(part)
+        ]
+        parts = (clean_name, ep_tag, quality, src_type, *custom_parts, "EBTV")
+        return ".".join(part for part in parts if part) + orig_ext
 
     @classmethod
     def match_filename_from_server_siblings(
         cls,
         server_filenames: list[str],
-        new_ep_tag: str
+        new_ep_tag: str,
+        video_extension: str | None = None,
     ) -> str | None:
         if not server_filenames or not new_ep_tag:
             return None
@@ -433,7 +538,10 @@ class AutomationService:
         video_exts = (".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm")
         valid_siblings = [
             f for f in server_filenames
-            if f.lower().endswith(video_exts) and cls.EPISODE_REGEX.search(f)
+            if f.lower().endswith(video_exts)
+            and "/" not in f and "\\" not in f
+            and (not video_extension or Path(f).suffix.casefold() == video_extension.casefold())
+            and cls.EPISODE_REGEX.search(f)
         ]
         if not valid_siblings:
             return None
@@ -445,7 +553,7 @@ class AutomationService:
             s_part = match.group(1)
             return f"S{int(s_part):02d}E{new_e_only}"
 
-        return cls.EPISODE_REGEX.sub(_replacer, template_name, count=1)
+        return cls.normalize_release_order(cls.EPISODE_REGEX.sub(_replacer, template_name, count=1))
 
     @classmethod
     def extract_media_year(cls, *values: object) -> str | None:
@@ -487,9 +595,9 @@ class AutomationService:
         source_type: str = "WEB-DL"
     ) -> str:
         clean_name = cls.format_clean_title(series_or_movie_title)
-        if season_ep_tag:
-            return f"{clean_name}.{season_ep_tag}.{source_type}.{quality_tag}.HardSub.EBTV.mp4"
-        return f"{clean_name}.{source_type}.{quality_tag}.HardSub.EBTV.mp4"
+        year = cls.extract_media_year(series_or_movie_title) if not season_ep_tag else None
+        parts = (clean_name, year, season_ep_tag, quality_tag, source_type, "HardSub", "EBTV", "mp4")
+        return ".".join(part for part in parts if part)
 
     @classmethod
     def build_encode_ass_filename(
@@ -500,10 +608,10 @@ class AutomationService:
         source_type: str = "WEB-DL"
     ) -> str:
         clean_name = cls.format_clean_title(series_or_movie_title)
-        ch_part = ".6CH" if quality_tag == "1080p" else ""
-        if season_ep_tag:
-            return f"{clean_name}.{season_ep_tag}.{source_type}.{quality_tag}{ch_part}.EBTV.mp4"
-        return f"{clean_name}.{source_type}.{quality_tag}{ch_part}.EBTV.mp4"
+        year = cls.extract_media_year(series_or_movie_title) if not season_ep_tag else None
+        channels = "6CH" if quality_tag == "1080p" else ""
+        parts = (clean_name, year, season_ep_tag, quality_tag, source_type, channels, "EBTV", "mp4")
+        return ".".join(part for part in parts if part)
 
     @staticmethod
     def clean_stem_for_ebtv(stem: str, target_res: str | None = None) -> str:
@@ -525,7 +633,7 @@ class AutomationService:
                 )
             else:
                 cleaned = f"{cleaned}.{target_res}"
-        return cleaned
+        return AutomationService.normalize_release_order(cleaned)
 
     @classmethod
     def build_softsub_filename(cls, raw_video: Path) -> str:
@@ -1201,6 +1309,24 @@ class AutomationService:
                         )
                     )
 
+            direct_videos = cls._find_raw_videos_in_dir(target_dir, recursive=False)
+            for vid in direct_videos:
+                vid_ep = cls.extract_episode_tag(vid.name, fallback_season=fallback_s)
+                if plan.season_ep_tag:
+                    if vid_ep and vid_ep != plan.season_ep_tag:
+                        continue
+                    if not vid_ep and (len(direct_videos) != 1 or plan.softsub_targets):
+                        continue
+                soft_out_dir = target_dir / "SoftSub"
+                plan.softsub_targets.append(
+                    SoftSubTarget(
+                        raw_video=vid,
+                        quality_folder_name=target_dir.name,
+                        output_dir=soft_out_dir,
+                        output_file=soft_out_dir / cls.build_softsub_filename(vid),
+                    )
+                )
+
             # FullHD source identification is filename-aware. Prefer an explicit FullHD
             # folder, then H.264/x264/AVC/1080p names; never silently take the first
             # quality file when several plausible sources exist.
@@ -1227,24 +1353,6 @@ class AutomationService:
                 plan.source_type = cls.detect_source_type(plan.fullhd_source_video.name)
             elif plan.fullhd_source_candidates:
                 plan.fullhd_source_video = None
-
-            # ۲. اگر کاربر به جای پوشه فصل، مستقیماً یک زیرپوشه کیفیت یا پوشه حاوی ویدئو را انتخاب کرده بود:
-            if not plan.softsub_targets:
-                direct_vids = cls._find_raw_videos_in_dir(target_dir, recursive=False)
-                for vid in direct_vids:
-                    vid_ep = cls.extract_episode_tag(vid.name, fallback_season=fallback_s)
-                    if plan.season_ep_tag and vid_ep and vid_ep.upper() != plan.season_ep_tag.upper():
-                        continue
-                    soft_out_dir = target_dir / "SoftSub"
-                    soft_out_file = soft_out_dir / cls.build_softsub_filename(vid)
-                    plan.softsub_targets.append(
-                        SoftSubTarget(
-                            raw_video=vid.resolve(),
-                            quality_folder_name=target_dir.name,
-                            output_dir=soft_out_dir,
-                            output_file=soft_out_file,
-                        )
-                    )
 
             if not plan.fullhd_source_candidates and plan.softsub_targets:
                 candidate_videos = cls.find_fullhd_source_candidates(
@@ -1282,7 +1390,10 @@ class AutomationService:
 
             raw_videos = cls._find_raw_videos_in_dir(target_dir, recursive=True)
             for vid in raw_videos:
-                soft_out_file = paths["softsub"] / cls.build_softsub_filename(vid)
+                soft_name = await cls.build_movie_release_filename(
+                    vid, vid.parent.name, target_dir.name, softsub=True,
+                )
+                soft_out_file = paths["softsub"] / soft_name
                 plan.softsub_targets.append(
                     SoftSubTarget(
                         raw_video=vid.resolve(),
@@ -1908,6 +2019,40 @@ class AutomationService:
                 mapping[plans[0].season_ep_tag] = untagged_subs[0]
 
         return mapping
+
+    @classmethod
+    async def find_remote_fa_subtitle(cls, plan: AutomationPlan) -> dict | None:
+        if plan.is_series and not plan.season_ep_tag:
+            return None
+        remote_dirs = dict.fromkeys(
+            cls.compute_server_remote_dir_for_local_path(path)
+            for path in (
+                plan.fa_sub_dest_dir, plan.base_dir / "srt" / "FA",
+                plan.base_dir / "srt", plan.base_dir / "sub", plan.base_dir,
+            )
+        )
+        listings = await asyncio.gather(*(CuteFTPService.inspect_remote_dir_all(path) for path in remote_dirs))
+        candidates: dict[Path, dict] = {}
+        for servers in listings:
+            for server in servers:
+                if not server.get("server_id") or not server.get("exists"):
+                    continue
+                for filename in sorted(server.get("files", []), key=str.casefold):
+                    if "/" in filename or "\\" in filename:
+                        continue
+                    path = Path(server["remote_dir"]) / filename
+                    if path.suffix.casefold() not in (".srt", ".ass", ".ssa"):
+                        continue
+                    if filename.casefold().startswith(("_temp_", "_soft_clean_")) or cls._is_english_subtitle_filename(filename):
+                        continue
+                    candidates.setdefault(path, {
+                        "filename": filename,
+                        "remote_dir": server["remote_dir"],
+                        "server_id": server["server_id"],
+                        "server_name": server["server_name"],
+                    })
+        match = cls.match_subtitles_to_episodes([plan], list(candidates)).get(plan.season_ep_tag or "MOVIE")
+        return candidates.get(match)
 
     @staticmethod
     def resolve_preset_for_quality(quality_tag: str) -> dict[str, str]:

@@ -701,6 +701,36 @@ class MKVService:
         raise RuntimeError(f"mkvmerge -J نتوانست فایل را تشخیص دهد: {mkv_error}")
 
     @classmethod
+    async def read_video_dimensions(cls, video_path: Path) -> tuple[int, int] | None:
+        try:
+            info = await cls.inspect_tracks(video_path)
+            for track in info.get("tracks", []):
+                if track.get("type") == "video":
+                    dimensions = str(track.get("properties", {}).get("pixel_dimensions", ""))
+                    if match := re.fullmatch(r"([1-9]\d*)x([1-9]\d*)", dimensions):
+                        return int(match[1]), int(match[2])
+        except Exception:
+            logging.debug("Could not inspect video tracks for %s", video_path, exc_info=True)
+
+        ffmpeg = cls._get_ffmpeg_bin()
+        if not ffmpeg or not video_path.is_file():
+            return None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                ffmpeg, "-hide_banner", "-nostdin", "-i", str(video_path.resolve()),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await process.communicate()
+        except OSError:
+            logging.debug("Could not read video dimensions with FFmpeg for %s", video_path, exc_info=True)
+            return None
+        for line in stderr.decode("utf-8", errors="replace").splitlines():
+            if re.match(r"\s*Stream #.*: Video:", line) and "(attached pic)" not in line:
+                if match := re.search(r"\b([1-9]\d{1,4})x([1-9]\d{1,4})\b", line):
+                    return int(match[1]), int(match[2])
+        return None
+
+    @classmethod
     async def convert_eac3_audio_to_aac(
         cls,
         video_path: Path,

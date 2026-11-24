@@ -10,6 +10,7 @@ from services.cuteftp_worker import (
     sync_upload_cuteftp,
     sync_download_episode_files,
     sync_download_movie_files,
+    sync_download_subtitle,
     get_current_cuteftp_remote_dir,
     list_ftp_dir_entries,
 )
@@ -476,6 +477,15 @@ class CuteFTPService:
         ]
         return response
 
+
+    @classmethod
+    async def download_subtitle(cls, remote_dir: str, filename: str, local_dir: Path, server_id: str) -> Path:
+        server = cls.get_server_by_id(server_id)
+        if not server:
+            raise RuntimeError("سرور انتخاب‌شده دیگر در تنظیمات FTP موجود نیست.")
+        return await asyncio.to_thread(
+            sync_download_subtitle, cls._remote_path_for_server(remote_dir, server), filename, local_dir, server,
+        )
 
     @classmethod
     async def download_episode_files(

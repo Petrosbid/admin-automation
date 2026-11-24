@@ -859,6 +859,30 @@ def _list_ftp_directory_for_download(ftp: FTP, remote_dir: str) -> tuple[list[tu
     return files, dirs
 
 
+def sync_download_subtitle(
+    remote_dir: str, filename: str, local_dir: Path, server_config: dict,
+) -> Path:
+    if not _safe_ftp_entry_name(filename) or Path(filename).suffix.casefold() not in {".srt", ".ass", ".ssa"}:
+        raise ValueError(f"نام فایل زیرنویس نامعتبر است: {filename}")
+    ftp = _create_ftp_connection(
+        host=server_config["host"],
+        port=server_config["port"],
+        username=server_config["username"],
+        password=server_config["password"],
+        protocol=server_config["protocol"],
+        timeout=server_config["timeout"],
+        passive_mode=server_config["passive_mode"],
+    )
+    try:
+        ftp.cwd(_normalize_remote_path(remote_dir))
+        target = local_dir / filename
+        with target.open("xb") as output:
+            ftp.retrbinary(f"RETR {filename}", output.write)
+        return target
+    finally:
+        _close_ftp_quietly(ftp)
+
+
 def sync_download_episode_files(
     remote_season_dir: str,
     local_season_dir: Path,
@@ -989,11 +1013,6 @@ def sync_download_episode_files(
             walk(remote_root, (), 0)
             candidates.sort(key=lambda item: ("/".join(item[1]).casefold(), item[2].casefold()))
 
-            if not candidates:
-                raise FileNotFoundError(
-                    f"در مسیر {remote_root} هیچ فایل ویدئویی برای قسمت‌های {', '.join(sorted(wanted))} پیدا نشد."
-                )
-
             local_root.mkdir(parents=True, exist_ok=True)
             total = len(candidates)
             for index, (remote_dir, relative_parts, filename, expected_size) in enumerate(candidates, start=1):
@@ -1012,7 +1031,7 @@ def sync_download_episode_files(
                         current_size = target_path.stat().st_size
                     except OSError:
                         current_size = -1
-                    if expected_size is None or current_size == expected_size:
+                    if current_size > 0 and (expected_size is None or current_size == expected_size):
                         result["skipped"] += 1
                         result["skipped_files"].append(str(target_path))
                     else:
@@ -1171,7 +1190,9 @@ def sync_download_movie_files(
                 for filename, size in remote_files:
                     if Path(filename).suffix.casefold() not in _DOWNLOAD_MEDIA_EXTENSIONS:
                         continue
-                    if "softsub" in filename.casefold():
+                    if filename.startswith(("_", ".")) or any(
+                        marker in filename.casefold() for marker in ("softsub", ".hardsub.")
+                    ):
                         continue
                     candidates.append((normalized, relative_parts, filename, size))
 
@@ -1182,7 +1203,8 @@ def sync_download_movie_files(
                     low_dir = dirname.casefold()
                     if (
                         "softsub" in low_dir
-                        or low_dir in {"srt", "sub", "subs", "subtitle", "subtitles"}
+                        or low_dir in _DOWNLOAD_SKIP_DIRS
+                        or low_dir.endswith("-hardsub")
                         or low_dir.startswith("_")
                         or not _safe_ftp_entry_name(dirname)
                     ):
@@ -1194,11 +1216,6 @@ def sync_download_movie_files(
             candidates.sort(
                 key=lambda item: ("/".join(item[1]).casefold(), item[2].casefold())
             )
-            if not candidates:
-                raise FileNotFoundError(
-                    f"در پوشه فیلم {remote_root} هیچ فایل ویدئویی بدون SoftSub پیدا نشد."
-                )
-
             local_root.mkdir(parents=True, exist_ok=True)
             total = len(candidates)
             for index, (remote_dir, relative_parts, filename, expected_size) in enumerate(
@@ -1220,7 +1237,7 @@ def sync_download_movie_files(
                         current_size = target_path.stat().st_size
                     except OSError:
                         current_size = -1
-                    if expected_size is None or current_size == expected_size:
+                    if current_size > 0 and (expected_size is None or current_size == expected_size):
                         result["skipped"] += 1
                         result["skipped_files"].append(str(target_path))
                     else:
