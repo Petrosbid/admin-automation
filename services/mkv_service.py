@@ -607,7 +607,7 @@ class MKVService:
 
         for line in content.splitlines():
             # ASS event lines may contain leading whitespace or different casing.
-            match = re.match(r"^\\s*Dialogue\\s*:\\s*(.*)$", line, flags=re.IGNORECASE)
+            match = re.match(r"^\s*Dialogue\s*:\s*(.*)$", line, flags=re.IGNORECASE)
             if not match:
                 continue
             fields = match.group(1).split(",", 9)
@@ -618,10 +618,10 @@ class MKVService:
             end_t = _parse_ass_time(fields[2])
             raw_txt = fields[9]
             clean_txt = (
-                re.sub(r"\\{[^}]*\\}", "", raw_txt)
-                .replace("\\\\N", "\n")
-                .replace("\\\\n", "\n")
-                .replace("\\\\h", " ")
+                re.sub(r"\{[^}]*\}", "", raw_txt)
+                .replace("\\N", "\n")
+                .replace("\\n", "\n")
+                .replace("\\h", " ")
                 .strip()
             )
             if clean_txt:
