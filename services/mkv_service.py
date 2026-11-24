@@ -905,15 +905,23 @@ class MKVService:
                 "-metadata", f"title={brand}",
             ])
 
+            fa_aliases = {"fa", "fas", "per", "persian", "farsi", str(fa_lang or "").casefold()}
             for sub_index, track in enumerate(muxed_tracks):
                 language = str(track.get("language") or "und").strip() or "und"
                 track_name = str(track.get("track_name") or brand).strip() or brand
+                is_fa_track = (
+                    language.casefold() in fa_aliases
+                    or language.casefold().split("-", 1)[0] in fa_aliases
+                )
                 ff_cmd.extend([
                     f"-metadata:s:s:{sub_index}", f"language={language}",
                     f"-metadata:s:s:{sub_index}", f"title={track_name}",
                 ])
                 dispositions = []
-                if track.get("default_track"):
+                # A SoftSub track is selectable, not burned into the picture.
+                # Mark the required Persian track as the MP4 default so players
+                # that honor MP4 dispositions select it automatically.
+                if track.get("default_track") or (require_fa_sub and is_fa_track):
                     dispositions.append("default")
                 if track.get("forced_track"):
                     dispositions.append("forced")
