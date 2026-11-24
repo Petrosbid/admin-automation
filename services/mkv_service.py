@@ -13,6 +13,8 @@ from services.subtitle_service import SubtitleService
 
 
 class MKVService:
+    MP4_EXTENSIONS = {".mp4", ".m4v", ".mov"}
+
     @staticmethod
     def _get_ffmpeg_bin() -> str | None:
         ffmpeg_cfg = str(cfg.get("paths", "ffmpeg_dir", "")).strip()
@@ -24,7 +26,9 @@ class MKVService:
                 candidates.append(p)
             else:
                 candidates.append(p / "ffmpeg.exe")
+                candidates.append(p / "ffmpeg")
                 candidates.append(p / "bin" / "ffmpeg.exe")
+                candidates.append(p / "bin" / "ffmpeg")
 
         which_ff = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
         if which_ff:
@@ -55,8 +59,8 @@ class MKVService:
     def _get_ffprobe_bin() -> str | None:
         """
         Resolve ffprobe from an explicit setting, beside ffmpeg, or PATH.
-        FFprobe is used for MP4 subtitle verification because MP4 subtitles
-        are stored as mov_text streams, not as Matroska subtitle tracks.
+        FFprobe is used for MP4 inspection because MP4 timed-text subtitles
+        (mov_text/tx3g) are not exposed by MKVToolNix (mkvmerge -J).
         """
         configured = str(cfg.get("paths", "ffprobe_bin", "")).strip()
         candidates: list[Path] = []
@@ -107,18 +111,80 @@ class MKVService:
         return None
 
     @classmethod
-    async def _list_mp4_subtitle_tracks_ffprobe(cls, video_path: Path) -> list[dict]:
+    async def _inspect_av_streams_ffprobe(cls, video_path: Path) -> tuple[list[dict], list[dict]]:
         """
-        Read MP4 timed-text (mov_text) streams with FFprobe.
-
-        Do not use mkvmerge -J for this check: MKVToolNix identifies Matroska
-        subtitle formats, while MP4 text subtitles are exposed by FFmpeg as
-        subtitle streams (normally codec_name=mov_text).
+        Inspect video (excluding attached cover art) and audio streams using FFprobe.
+        Returns (video_streams, audio_streams) with index and language tags.
         """
         ffprobe_bin = cls._get_ffprobe_bin()
         if not ffprobe_bin:
             raise FileNotFoundError(
-                "برای تأیید ترک‌های زیرنویس MP4، ffprobe.exe پیدا نشد. "
+                "برای بررسی استریم‌های MP4، فایل ffprobe.exe پیدا نشد. "
+                "فایل ffprobe.exe را کنار ffmpeg.exe قرار دهید یا paths.ffprobe_bin را تنظیم کنید."
+            )
+
+        cmd = [
+            ffprobe_bin,
+            "-v", "error",
+            "-show_entries",
+            "stream=index,codec_type,codec_name:"
+            "stream_tags=language,title,handler_name:"
+            "stream_disposition=attached_pic,default",
+            "-of", "json",
+            str(video_path),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            details = stderr.decode("utf-8", errors="replace")[-2400:]
+            raise RuntimeError(
+                f"FFprobe نتوانست استریم‌های فایل ورودی را بخواند (exit={proc.returncode}): {details}"
+            )
+
+        try:
+            payload = json.loads(stdout.decode("utf-8", errors="replace") or "{}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"خروجی JSON ابزار FFprobe معتبر نیست: {exc}") from exc
+
+        video_streams: list[dict] = []
+        audio_streams: list[dict] = []
+
+        for stream in payload.get("streams", []) or []:
+            codec_type = str(stream.get("codec_type") or "").casefold()
+            disposition = stream.get("disposition", {}) or {}
+            tags = stream.get("tags", {}) or {}
+
+            if codec_type == "video":
+                if int(disposition.get("attached_pic", 0) or 0) == 1:
+                    continue
+                video_streams.append({
+                    "index": int(stream["index"]),
+                    "codec": stream.get("codec_name", ""),
+                    "language": str(tags.get("language") or "").strip(),
+                })
+            elif codec_type == "audio":
+                audio_streams.append({
+                    "index": int(stream["index"]),
+                    "codec": stream.get("codec_name", ""),
+                    "language": str(tags.get("language") or "").strip(),
+                })
+
+        return video_streams, audio_streams
+
+    @classmethod
+    async def _list_mp4_subtitle_tracks_ffprobe(cls, video_path: Path) -> list[dict]:
+        """
+        Read MP4 timed-text (mov_text) streams with FFprobe.
+        MKVToolNix (mkvmerge -J) does not expose MP4 tx3g/mov_text tracks.
+        """
+        ffprobe_bin = cls._get_ffprobe_bin()
+        if not ffprobe_bin:
+            raise FileNotFoundError(
+                "برای بررسی ترک‌های زیرنویس MP4، ffprobe.exe پیدا نشد. "
                 "فایل ffprobe.exe را کنار ffmpeg.exe قرار دهید یا مسیر "
                 "paths.ffprobe_bin را در config تنظیم کنید."
             )
@@ -161,7 +227,7 @@ class MKVService:
                 "codec": stream.get("codec_name", "unknown"),
                 "language": tags.get("language", "und"),
                 "language_ietf": tags.get("language-ietf", tags.get("language_ietf", "")),
-                "track_name": tags.get("title") or tags.get("handler_name", ""),
+                "track_name": tags.get("handler_name") or tags.get("title") or "",
                 "default_track": bool(disposition.get("default", 0)),
                 "forced_track": bool(disposition.get("forced", 0)),
             })
@@ -233,8 +299,6 @@ class MKVService:
             if is_timestamp:
                 continue
 
-            # Drop SRT cue numbers only when the next non-empty line is a
-            # timestamp. A caption containing only digits remains valid text.
             if stripped.isdigit():
                 next_line = next(
                     (
@@ -315,7 +379,6 @@ class MKVService:
             return False
         return explicit_english_language or explicit_english_name
 
-
     @staticmethod
     def validate_subtitle_file(subtitle_path: Path | str | None, label: str = "زیرنویس") -> Path:
         """Reject missing, empty, malformed, or non-text subtitle inputs."""
@@ -352,12 +415,12 @@ class MKVService:
     ) -> list[dict]:
         if not output_path.is_file() or output_path.stat().st_size <= 0:
             raise RuntimeError(f"فایل خروجی سافت‌ساب ساخته نشده یا خالی است: {output_path}")
-        # MP4 subtitle streams are timed-text (mov_text). Inspect them with
-        # FFprobe instead of mkvmerge -J, whose track model is Matroska-focused.
-        if output_path.suffix.casefold() in {".mp4", ".m4v", ".mov"}:
+
+        if output_path.suffix.casefold() in cls.MP4_EXTENSIONS:
             tracks = await cls._list_mp4_subtitle_tracks_ffprobe(output_path)
         else:
             tracks = await cls.list_subtitle_tracks(output_path)
+
         if not tracks and (require_fa_sub or require_en_sub):
             raise RuntimeError(f"خروجی {output_path.name} هیچ ترک زیرنویسی ندارد؛ فایل رد شد.")
 
@@ -389,7 +452,7 @@ class MKVService:
                     "فایل ناقص رد شد."
                 )
 
-            if output_path.suffix.casefold() not in {".mp4", ".m4v", ".mov"}:
+            if output_path.suffix.casefold() not in cls.MP4_EXTENSIONS:
                 return
 
             failures: list[str] = []
@@ -511,7 +574,7 @@ class MKVService:
                 f"-b:a:{stream_index}", bitrate,
             ])
 
-        if video_path.suffix.casefold() == ".mp4":
+        if video_path.suffix.casefold() in cls.MP4_EXTENSIONS:
             cmd.extend(["-movflags", "+faststart"])
         cmd.append(str(temp_output))
 
@@ -546,6 +609,13 @@ class MKVService:
 
     @classmethod
     async def list_subtitle_tracks(cls, video_path: Path) -> list[dict]:
+        """
+        List subtitle tracks accurately for both MP4 (via FFprobe) and MKV/other (via mkvmerge).
+        """
+        video_path = Path(video_path)
+        if video_path.suffix.casefold() in cls.MP4_EXTENSIONS:
+            return await cls._list_mp4_subtitle_tracks_ffprobe(video_path)
+
         info = await cls.inspect_tracks(video_path)
         subs = []
         for t in info.get("tracks", []):
@@ -571,58 +641,36 @@ class MKVService:
         track_codec=None,
         **kwargs
     ) -> Path:
-        """Extract one MKVToolNix subtitle track and fail clearly when output is empty."""
+        """
+        Extract one subtitle track reliably:
+        - For MP4/M4V/MOV: extract mov_text/tx3g via FFmpeg using stream index.
+        - For MKV and other containers: extract via mkvextract.
+        """
         video_path = Path(video_path).resolve()
         output_sub_path = Path(output_sub_path).resolve()
         output_sub_path.parent.mkdir(parents=True, exist_ok=True)
         if track_id is None:
             raise ValueError("شناسه ترک زیرنویس نامعتبر است.")
 
-        mkvextract_bin = cls._get_mkvextract_bin()
-        if not Path(mkvextract_bin).is_file() and not shutil.which(mkvextract_bin):
-            raise FileNotFoundError(f"mkvextract پیدا نشد: {mkvextract_bin}")
-
-        target_for_extract = video_path
         selected_track_id = int(track_id)
-        temp_remux_mkv: Path | None = None
-        try:
-            # شناسه ترک mkvmerge با شماره stream در ffmpeg یکی نیست؛ برای MP4 ابتدا
-            # ترک انتخابی را با mkvmerge به یک MKV تک‌ترکی remux می‌کنیم.
-            if video_path.suffix.lower() == ".mp4":
-                mkvmerge_bin = cls._get_mkvmerge_bin()
-                if not Path(mkvmerge_bin).is_file() and not shutil.which(mkvmerge_bin):
-                    raise FileNotFoundError(f"mkvmerge پیدا نشد: {mkvmerge_bin}")
+        output_sub_path.unlink(missing_ok=True)
 
-                temp_remux_mkv = output_sub_path.with_name(
-                    f"_tmp_sub_remux_{uuid.uuid4().hex[:8]}.mkv"
-                )
-                remux_cmd = [
-                    mkvmerge_bin,
-                    "--output", str(temp_remux_mkv),
-                    "--no-video", "--no-audio",
-                    "--subtitle-tracks", str(selected_track_id),
-                    str(video_path),
-                ]
-                remux_proc = await asyncio.create_subprocess_exec(
-                    *remux_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                )
-                remux_out, _ = await remux_proc.communicate()
-                if remux_proc.returncode != 0 or not temp_remux_mkv.exists() or temp_remux_mkv.stat().st_size <= 0:
-                    raise RuntimeError(
-                        "Remux زیرنویس MP4 ناموفق بود: "
-                        + remux_out.decode("utf-8", errors="replace")[-1200:]
-                    )
-                target_for_extract = temp_remux_mkv
-                selected_track_id = 0
+        if video_path.suffix.casefold() in cls.MP4_EXTENSIONS:
+            ffmpeg_bin = cls._get_ffmpeg_bin()
+            if not ffmpeg_bin or (not Path(ffmpeg_bin).is_file() and not shutil.which(ffmpeg_bin)):
+                raise FileNotFoundError("برای استخراج زیرنویس از MP4، ابزار FFmpeg پیدا نشد.")
 
-            output_sub_path.unlink(missing_ok=True)
+            out_ext = output_sub_path.suffix.casefold()
+            sub_codec = "ass" if out_ext in {".ass", ".ssa"} else "srt"
             cmd = [
-                mkvextract_bin,
-                "tracks",
-                str(target_for_extract),
-                f"{selected_track_id}:{output_sub_path}",
+                ffmpeg_bin,
+                "-hide_banner",
+                "-loglevel", "error",
+                "-y",
+                "-i", str(video_path),
+                "-map", f"0:{selected_track_id}",
+                "-c:s", sub_codec,
+                str(output_sub_path),
             ]
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -632,16 +680,38 @@ class MKVService:
             stdout, _ = await proc.communicate()
             if proc.returncode != 0 or not output_sub_path.exists() or output_sub_path.stat().st_size <= 0:
                 raise RuntimeError(
-                    "خطا در استخراج زیرنویس: "
+                    "خطا در استخراج زیرنویس از MP4 با FFmpeg: "
                     + stdout.decode("utf-8", errors="replace")[-1600:]
                 )
-
-            if output_sub_path.suffix.lower() in (".srt", ".ass", ".ssa"):
+            if out_ext in (".srt", ".ass", ".ssa"):
                 SubtitleService.normalize_subtitle_file(output_sub_path)
             return output_sub_path
-        finally:
-            if temp_remux_mkv and temp_remux_mkv.exists():
-                temp_remux_mkv.unlink(missing_ok=True)
+
+        mkvextract_bin = cls._get_mkvextract_bin()
+        if not Path(mkvextract_bin).is_file() and not shutil.which(mkvextract_bin):
+            raise FileNotFoundError(f"mkvextract پیدا نشد: {mkvextract_bin}")
+
+        cmd = [
+            mkvextract_bin,
+            "tracks",
+            str(video_path),
+            f"{selected_track_id}:{output_sub_path}",
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0 or not output_sub_path.exists() or output_sub_path.stat().st_size <= 0:
+            raise RuntimeError(
+                "خطا در استخراج زیرنویس: "
+                + stdout.decode("utf-8", errors="replace")[-1600:]
+            )
+
+        if output_sub_path.suffix.lower() in (".srt", ".ass", ".ssa"):
+            SubtitleService.normalize_subtitle_file(output_sub_path)
+        return output_sub_path
 
     @classmethod
     async def extract_all_subtitles(
@@ -722,7 +792,6 @@ class MKVService:
             return f"{h:02d}:{m:02d}:{s:02d},{cs * 10:03d}"
 
         for line in content.splitlines():
-            # ASS event lines may contain leading whitespace or different casing.
             match = re.match(r"^\s*Dialogue\s*:\s*(.*)$", line, flags=re.IGNORECASE)
             if not match:
                 continue
@@ -747,8 +816,37 @@ class MKVService:
             f"{idx}\n{st} --> {et}\n{txt}"
             for idx, (st, et, txt) in enumerate(events, start=1)
         ]
-        srt_out_path.write_text("\n\n".join(srt_blocks) + "\n", encoding="utf-8-sig")
+        srt_out_path.write_text("\n\n".join(srt_blocks) + "\n", encoding="utf-8")
         return srt_out_path
+
+    @staticmethod
+    def _mp4_language_tag(raw_value: str, fallback: str) -> str:
+        """
+        MP4/QuickTime requires 3-letter ISO-639-2 language codes.
+        Two-letter codes like 'fa' or 'en' are silently dropped by FFmpeg's MP4 muxer.
+        """
+        value = str(raw_value or "").strip().casefold().replace("_", "-")
+        value = value.split("-", 1)[0]
+        aliases = {
+            "fa": "per", "fas": "fas", "per": "per",
+            "farsi": "per", "persian": "per",
+            "en": "eng", "eng": "eng", "english": "eng",
+            "ja": "jpn", "jp": "jpn", "jpn": "jpn",
+            "de": "deu", "ger": "deu", "deu": "deu",
+            "fr": "fra", "fre": "fra", "fra": "fra",
+            "es": "spa", "spa": "spa",
+            "ru": "rus", "rus": "rus",
+            "ar": "ara", "ara": "ara",
+            "zh": "zho", "chi": "zho", "zho": "zho",
+            "ko": "kor", "kor": "kor",
+            "it": "ita", "ita": "ita",
+            "pt": "por", "por": "por",
+        }
+        if value in aliases:
+            return aliases[value]
+        if len(value) == 3 and value.isascii() and value.isalpha():
+            return value
+        return fallback
 
     @classmethod
     async def _merge_softsub_mp4_ffmpeg(
@@ -769,17 +867,17 @@ class MKVService:
         progress_callback: Callable[[str], None] = None
     ) -> Path:
         """
-        Reliable MP4 SoftSub pipeline:
-        1) Mux subtitle files into a temporary MKV with MKVToolNix.
-        2) Verify that the temporary MKV really contains the requested tracks.
-        3) Remux that known-good MKV to MP4 with FFmpeg, converting text
-           subtitle streams to mov_text.
-        4) The caller verifies the final MP4 with FFprobe before publishing it.
+        Direct, lossless MP4 SoftSub pipeline with FFmpeg:
+        1) Validate and normalize external/embedded SRT subtitle inputs.
+        2) Inspect exact video/audio stream indices via FFprobe (skipping cover art).
+        3) Remux video/audio with stream-copy and encode subtitles to mov_text (tx3g),
+           explicitly writing MP4 handler_name & title on every video, audio, and
+           subtitle stream so branding and track names appear in all players.
+        4) Use clean 'default' disposition (avoiding 'forced' on full MP4 mov_text
+           tracks, which causes players to hide or misclassify the subtitle).
         """
         uid = uuid.uuid4().hex[:8]
-        temp_mkv = output_path.with_name(f"_mp4_softsub_mux_{uid}.mkv")
         temp_subs_to_cleanup: list[Path] = []
-        mkvmerge_bin = cls._get_mkvmerge_bin()
 
         def _ensure_srt_for_mp4(sub_p: Path | None, tag: str) -> Path | None:
             if sub_p is None:
@@ -800,15 +898,11 @@ class MKVService:
             return cls.validate_subtitle_file(sub_p, f"زیرنویس {tag} برای MP4")
 
         try:
-            if not Path(mkvmerge_bin).is_file() and not shutil.which(mkvmerge_bin):
-                raise FileNotFoundError(
-                    f"mkvmerge برای ساخت واسط MP4 SoftSub پیدا نشد: {mkvmerge_bin}"
-                )
             if not ffmpeg_bin or (not Path(ffmpeg_bin).is_file() and not shutil.which(ffmpeg_bin)):
-                raise FileNotFoundError("FFmpeg برای تبدیل واسط MKV به MP4 پیدا نشد.")
+                raise FileNotFoundError("FFmpeg برای ساخت فایل MP4 SoftSub پیدا نشد.")
 
-            fa_srt_ready = _ensure_srt_for_mp4(clean_fa_sub, "فارسی")
-            en_srt_ready = _ensure_srt_for_mp4(clean_en_sub, "انگلیسی")
+            fa_srt_ready = _ensure_srt_for_mp4(clean_fa_sub, "fa")
+            en_srt_ready = _ensure_srt_for_mp4(clean_en_sub, "en")
 
             if require_fa_sub and fa_srt_ready is None:
                 raise ValueError("زیرنویس فارسی به مرحله ساخت MP4 نرسیده است.")
@@ -826,135 +920,21 @@ class MKVService:
                 en_srt_ready = extracted_en
                 temp_subs_to_cleanup.append(extracted_en)
 
-            if progress_callback:
-                progress_callback("مرحله ۱/۲: ساخت فایل واسط MKV همراه با زیرنویس فارسی/انگلیسی...")
-
-            source_info = await cls.inspect_tracks(video_path)
-            source_tracks = source_info.get("tracks", []) or []
-            mux_cmd = [
-                mkvmerge_bin,
-                "--ui-language", "en",
-                "--output", str(temp_mkv),
-                "--title", brand,
-            ]
-
-            for track in source_tracks:
-                if track.get("type") in ("video", "audio"):
-                    track_id = track.get("id")
-                    if track_id is not None:
-                        mux_cmd.extend(["--track-name", f"{track_id}:{brand}"])
-
-            if kept_embedded_en_track_id is not None and en_srt_ready is None:
-                mux_cmd.extend([
-                    "--subtitle-tracks", str(int(kept_embedded_en_track_id)),
-                    "--track-name", f"{int(kept_embedded_en_track_id)}:{brand}",
-                    "--default-track-flag", f"{int(kept_embedded_en_track_id)}:no",
-                    "--forced-display-flag", f"{int(kept_embedded_en_track_id)}:no",
-                ])
-            else:
-                mux_cmd.append("--no-subtitles")
-            mux_cmd.append(str(video_path))
-
-            if fa_srt_ready is not None:
-                mux_cmd.extend([
-                    "--language", f"0:{fa_lang}",
-                    "--track-name", f"0:{brand}",
-                    "--default-track-flag", f"0:{'yes' if fa_default else 'no'}",
-                    "--forced-display-flag", f"0:{'yes' if fa_forced else 'no'}",
-                    "--sub-charset", "0:UTF-8",
-                    str(fa_srt_ready),
-                ])
-
-            if en_srt_ready is not None:
-                mux_cmd.extend([
-                    "--language", f"0:{en_lang}",
-                    "--track-name", f"0:{brand}",
-                    "--default-track-flag", "0:no",
-                    "--forced-display-flag", "0:no",
-                    "--sub-charset", "0:UTF-8",
-                    str(en_srt_ready),
-                ])
-
-            mux_proc = await asyncio.create_subprocess_exec(
-                *mux_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            mux_output, _ = await mux_proc.communicate()
-            mux_text = mux_output.decode("utf-8", errors="replace")
-            if (
-                mux_proc.returncode not in (0, 1)
-                or not temp_mkv.is_file()
-                or temp_mkv.stat().st_size <= 0
-            ):
-                raise RuntimeError(
-                    "ساخت فایل واسط MKV برای خروجی MP4 ناموفق بود "
-                    f"(exit={mux_proc.returncode}): {mux_text[-5000:]}"
-                )
-
-            muxed_tracks = await cls._verify_muxed_subtitle_languages(
-                temp_mkv,
-                require_fa_sub=require_fa_sub,
-                require_en_sub=require_en_sub,
-                fa_lang=fa_lang,
-                en_lang=en_lang,
-            )
-            if (require_fa_sub or require_en_sub) and not muxed_tracks:
-                raise RuntimeError("فایل واسط MKV ساخته شد اما هیچ ترک زیرنویسی در آن ثبت نشده است.")
-
-            if progress_callback:
-                progress_callback("مرحله ۲/۲: تبدیل فایل واسط MKV به MP4 با حفظ ترک‌های زیرنویس...")
-
-            # Use the validated MKV as the source for video/audio, but add each
-            # external SRT as its own FFmpeg input. This avoids relying on an
-            # FFmpeg build's Matroska subtitle demuxer/stream-index handling
-            # when converting SubRip tracks to MP4 timed text (mov_text).
-            # MP4/QuickTime stores language metadata in ISO-639-2 form.
-            # FFmpeg silently drops two-letter language values such as "fa" here.
-            def _mp4_language_tag(raw_value: str, fallback: str) -> str:
-                value = str(raw_value or "").strip().casefold().replace("_", "-")
-                value = value.split("-", 1)[0]
-                aliases = {
-                    "fa": "per", "fas": "fas", "per": "per",
-                    "farsi": "per", "persian": "per",
-                    "en": "eng", "eng": "eng", "english": "eng",
-                    "ja": "jpn", "jp": "jpn", "jpn": "jpn",
-                    "de": "deu", "ger": "deu", "deu": "deu",
-                    "fr": "fra", "fre": "fra", "fra": "fra",
-                    "es": "spa", "spa": "spa",
-                    "ru": "rus", "rus": "rus",
-                    "ar": "ara", "ara": "ara",
-                    "zh": "zho", "chi": "zho", "zho": "zho",
-                    "ko": "kor", "kor": "kor",
-                    "it": "ita", "ita": "ita",
-                    "pt": "por", "por": "por",
-                }
-                if value in aliases:
-                    return aliases[value]
-                if len(value) == 3 and value.isascii() and value.isalpha():
-                    return value
-                return fallback
-
-            # Do not rely on FFmpeg's automatic subtitle stream mapping from the MKV.
-            # Supply each validated SRT as an explicit input and map input N:0 directly.
-            # This avoids silently losing SubRip tracks when remuxing Matroska to MP4.
             subtitle_inputs: list[dict] = []
             if fa_srt_ready is not None:
                 subtitle_inputs.append({
                     "path": fa_srt_ready,
-                    "language": _mp4_language_tag(fa_lang, "per"),
+                    "language": cls._mp4_language_tag(fa_lang, "per"),
                     "name": brand,
                     "default": bool(fa_default or require_fa_sub),
-                    "forced": bool(fa_forced),
                     "label": "FA",
                 })
             if en_srt_ready is not None:
                 subtitle_inputs.append({
                     "path": en_srt_ready,
-                    "language": _mp4_language_tag(en_lang, "eng"),
+                    "language": cls._mp4_language_tag(en_lang, "eng"),
                     "name": brand,
                     "default": False,
-                    "forced": False,
                     "label": "EN",
                 })
 
@@ -963,11 +943,18 @@ class MKVService:
             ):
                 raise RuntimeError("ورودی زیرنویس فارسی برای نگاشت مستقیم MP4 آماده نیست.")
 
+            video_streams, audio_streams = await cls._inspect_av_streams_ffprobe(video_path)
+            if not video_streams:
+                raise RuntimeError(f"هیچ استریم ویدئویی در فایل ورودی پیدا نشد: {video_path}")
+
+            if progress_callback:
+                progress_callback("در حال ساخت فایل MP4 همراه با زیرنویس mov_text و متادیتای استاندارد...")
+
             ff_cmd = [
                 ffmpeg_bin,
                 "-hide_banner",
                 "-y",
-                "-i", str(temp_mkv),
+                "-i", str(video_path),
             ]
             for subtitle_input in subtitle_inputs:
                 ff_cmd.extend([
@@ -975,10 +962,13 @@ class MKVService:
                     "-i", str(subtitle_input["path"]),
                 ])
 
-            ff_cmd.extend([
-                "-map", "0:v?",
-                "-map", "0:a?",
-            ])
+            # Map exact video (non-attached_pic) and audio streams from input 0
+            for v_stream in video_streams:
+                ff_cmd.extend(["-map", f"0:{v_stream['index']}"])
+            for a_stream in audio_streams:
+                ff_cmd.extend(["-map", f"0:{a_stream['index']}"])
+
+            # Map each validated SRT input explicitly
             for input_index in range(1, len(subtitle_inputs) + 1):
                 ff_cmd.extend(["-map", f"{input_index}:0"])
 
@@ -992,30 +982,48 @@ class MKVService:
                 "-metadata", f"title={brand}",
             ])
 
+            # MP4 stores track display names in the 'hdlr' atom (handler_name), not 'title'.
+            for v_idx, v_stream in enumerate(video_streams):
+                ff_cmd.extend([
+                    f"-metadata:s:v:{v_idx}", f"handler_name={brand}",
+                    f"-metadata:s:v:{v_idx}", f"title={brand}",
+                ])
+                if v_stream.get("language"):
+                    ff_cmd.extend([
+                        f"-metadata:s:v:{v_idx}",
+                        f"language={cls._mp4_language_tag(v_stream['language'], 'und')}",
+                    ])
+
+            for a_idx, a_stream in enumerate(audio_streams):
+                ff_cmd.extend([
+                    f"-metadata:s:a:{a_idx}", f"handler_name={brand}",
+                    f"-metadata:s:a:{a_idx}", f"title={brand}",
+                ])
+                if a_stream.get("language"):
+                    ff_cmd.extend([
+                        f"-metadata:s:a:{a_idx}",
+                        f"language={cls._mp4_language_tag(a_stream['language'], 'und')}",
+                    ])
+
             for sub_index, subtitle_input in enumerate(subtitle_inputs):
                 language = subtitle_input["language"]
                 track_name = subtitle_input["name"]
                 ff_cmd.extend([
                     f"-metadata:s:s:{sub_index}", f"language={language}",
+                    f"-metadata:s:s:{sub_index}", f"handler_name={track_name}",
                     f"-metadata:s:s:{sub_index}", f"title={track_name}",
                 ])
-                dispositions = []
-                if subtitle_input["default"]:
-                    dispositions.append("default")
-                if subtitle_input["forced"]:
-                    dispositions.append("forced")
-                ff_cmd.extend([
-                    f"-disposition:s:{sub_index}",
-                    "+".join(dispositions) if dispositions else "0",
-                ])
+                # In MP4 (tx3g), use clean 'default' disposition without 'forced'
+                # so standard players list and auto-select the track properly.
+                disposition = "default" if subtitle_input["default"] else "0"
+                ff_cmd.extend([f"-disposition:s:{sub_index}", disposition])
 
             logging.info(
-                "[MP4 SOFTSUB] module=%s source=%s temp_mkv=%s output=%s "
-                "subtitle_inputs=%s ffmpeg=%s",
-                Path(__file__).resolve(),
+                "[MP4 SOFTSUB] source=%s output=%s video_streams=%d audio_streams=%d subtitle_inputs=%s",
                 video_path,
-                temp_mkv,
                 output_path,
+                len(video_streams),
+                len(audio_streams),
                 [
                     {
                         "path": str(item["path"]),
@@ -1024,18 +1032,9 @@ class MKVService:
                     }
                     for item in subtitle_inputs
                 ],
-                ffmpeg_bin,
             )
-            logging.info(
-                "[MP4 SOFTSUB] explicit FFmpeg maps: %s",
-                " ".join(
-                    ["0:v?", "0:a?"]
-                    + [f"{index}:0" for index in range(1, len(subtitle_inputs) + 1)]
-                ),
-            )
-            # Explicitly select the MP4 muxer for the .mp4 staging file.
-            ff_cmd.extend(["-f", "mp4"])
-            ff_cmd.append(str(output_path))
+
+            ff_cmd.extend(["-f", "mp4", str(output_path)])
             ff_proc = await asyncio.create_subprocess_exec(
                 *ff_cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -1049,7 +1048,7 @@ class MKVService:
                 or output_path.stat().st_size <= 0
             ):
                 raise RuntimeError(
-                    "تبدیل MKV واسط به MP4 ناموفق بود "
+                    "ساخت فایل MP4 با زیرنویس ناموفق بود "
                     f"(exit={ff_proc.returncode}). گزارش FFmpeg:\n{ff_text[-5000:]}"
                 )
 
@@ -1058,7 +1057,6 @@ class MKVService:
             return output_path
 
         finally:
-            temp_mkv.unlink(missing_ok=True)
             for temp_file in temp_subs_to_cleanup:
                 temp_file.unlink(missing_ok=True)
 
@@ -1089,6 +1087,7 @@ class MKVService:
             fa_sub_path = cls.validate_subtitle_file(fa_sub_path, "زیرنویس فارسی")
         if en_sub_path is not None:
             en_sub_path = cls.validate_subtitle_file(en_sub_path, "زیرنویس انگلیسی")
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
         mkvmerge_bin = cls._get_mkvmerge_bin()
         ffmpeg_bin = cls._get_ffmpeg_bin()
@@ -1098,8 +1097,10 @@ class MKVService:
         fa_default = bool(cfg.get("branding", "fa_default_flag", True))
         fa_forced = bool(cfg.get("branding", "fa_forced_flag", True))
 
-        if output_path.suffix.casefold() == ".mp4" and not ffmpeg_bin:
+        is_mp4_output = output_path.suffix.casefold() in cls.MP4_EXTENSIONS
+        if is_mp4_output and not ffmpeg_bin:
             raise FileNotFoundError("برای ساخت SoftSub با پسوند MP4، نصب/تنظیم FFmpeg الزامی است.")
+
         uid = uuid.uuid4().hex[:6]
         clean_fa_sub: Path | None = None
         clean_en_sub: Path | None = None
@@ -1108,7 +1109,11 @@ class MKVService:
         try:
             if fa_sub_path is not None:
                 clean_fa_sub = output_path.with_name(f"_soft_clean_fa_{uid}{fa_sub_path.suffix}")
-                clean_fa_sub.write_text(SubtitleService.read_subtitle_safe(fa_sub_path), encoding="utf-8", newline="\n")
+                clean_fa_sub.write_text(
+                    SubtitleService.read_subtitle_safe(fa_sub_path),
+                    encoding="utf-8",
+                    newline="\n",
+                )
                 SubtitleService.normalize_subtitle_file(clean_fa_sub)
 
                 if sync_mode == "auto":
@@ -1123,29 +1128,24 @@ class MKVService:
 
             if en_sub_path is not None:
                 clean_en_sub = output_path.with_name(f"_soft_clean_en_{uid}{en_sub_path.suffix}")
-                clean_en_sub.write_text(SubtitleService.read_subtitle_safe(en_sub_path), encoding="utf-8", newline="\n")
+                clean_en_sub.write_text(
+                    SubtitleService.read_subtitle_safe(en_sub_path),
+                    encoding="utf-8",
+                    newline="\n",
+                )
                 SubtitleService.normalize_subtitle_file(clean_en_sub)
 
-            info = await cls.inspect_tracks(video_path)
-            tracks = info.get("tracks", [])
-
+            # Detect embedded English subtitle using the container-aware method
+            # (FFprobe for MP4, mkvmerge for MKV).
             kept_embedded_en_id: int | None = None
             if keep_old_subs and not clean_en_sub:
-                for t in tracks:
-                    if t.get("type") == "subtitles":
-                        props = t.get("properties", {})
-                        t_dict = {
-                            "id": t.get("id"),
-                            "language": props.get("language", ""),
-                            "track_name": props.get("track_name", "")
-                        }
-                        if cls._is_english_track(t_dict):
-                            kept_embedded_en_id = t.get("id")
-                            break
+                existing_sub_tracks = await cls.list_subtitle_tracks(video_path)
+                for sub_track in existing_sub_tracks:
+                    if cls._is_english_track(sub_track):
+                        kept_embedded_en_id = sub_track.get("id")
+                        break
 
-            if output_path.suffix.lower() == ".mp4":
-                # If a subtitle file was supplied for MP4, it must survive into
-                # the published output even when a caller forgot the require flag.
+            if is_mp4_output:
                 mp4_require_fa_sub = bool(require_fa_sub or clean_fa_sub is not None)
                 mp4_require_en_sub = bool(require_en_sub or clean_en_sub is not None)
                 await cls._merge_softsub_mp4_ffmpeg(
@@ -1165,9 +1165,6 @@ class MKVService:
                     progress_callback=progress_callback
                 )
 
-                # Verify the exact destination file after the atomic publish.
-                # If verification fails, delete it so a raw/invalid MP4 cannot
-                # remain under a successful SoftSub filename.
                 staging_output_path.replace(output_path)
                 try:
                     verified_tracks = await cls._verify_muxed_subtitle_languages(
@@ -1182,8 +1179,7 @@ class MKVService:
                     raise
 
                 logging.info(
-                    "[MP4 SOFTSUB VERIFIED] module=%s output=%s bytes=%d subtitle_tracks=%s",
-                    Path(__file__).resolve(),
+                    "[MP4 SOFTSUB VERIFIED] output=%s bytes=%d subtitle_tracks=%s",
                     output_path,
                     output_path.stat().st_size,
                     [
@@ -1191,12 +1187,17 @@ class MKVService:
                             "stream": track.get("id"),
                             "codec": track.get("codec"),
                             "language": track.get("language"),
+                            "name": track.get("track_name"),
                             "default": track.get("default_track"),
                         }
                         for track in verified_tracks
                     ],
                 )
                 return output_path
+
+            # MKV output path via mkvmerge
+            info = await cls.inspect_tracks(video_path)
+            tracks = info.get("tracks", [])
 
             cmd = [
                 mkvmerge_bin,
@@ -1210,6 +1211,14 @@ class MKVService:
                 ttype = t.get("type")
                 if ttype in ("video", "audio"):
                     cmd.extend(["--track-name", f"{tid}:{brand}"])
+
+            extracted_mp4_en: Path | None = None
+            if kept_embedded_en_id is not None and video_path.suffix.casefold() in cls.MP4_EXTENSIONS:
+                # If source is MP4 and destination is MKV, extract mov_text via FFmpeg first
+                extracted_mp4_en = output_path.with_name(f"_soft_emb_en_{uid}.srt")
+                await cls.extract_subtitle_track(video_path, int(kept_embedded_en_id), extracted_mp4_en)
+                clean_en_sub = extracted_mp4_en
+                kept_embedded_en_id = None
 
             if kept_embedded_en_id is not None:
                 cmd.extend([
