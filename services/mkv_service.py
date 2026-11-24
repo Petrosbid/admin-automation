@@ -493,18 +493,212 @@ class MKVService:
         return ".srt"
 
     @classmethod
+    async def _inspect_tracks_with_ffprobe(cls, video_path: Path) -> dict:
+        """
+        Return the same normalized track structure as mkvmerge -J, but use
+        FFprobe for MP4/M4V/MOV and other containers mkvmerge cannot inspect.
+
+        FFprobe stream indexes are kept as track IDs. This is intentional:
+        extract_subtitle_track() uses those global indexes when extracting
+        mov_text/tx3g subtitle streams from MP4.
+        """
+        video_path = Path(video_path).expanduser().resolve()
+        ffprobe_bin = cls._get_ffprobe_bin()
+        if not ffprobe_bin:
+            raise FileNotFoundError(
+                "برای خواندن اطلاعات فایل MP4، ابزار ffprobe.exe پیدا نشد. "
+                "فایل ffprobe.exe را کنار ffmpeg.exe قرار دهید یا مسیر "
+                "paths.ffprobe_bin را در config.yaml تنظیم کنید."
+            )
+
+        cmd = [
+            ffprobe_bin,
+            "-v", "error",
+            "-show_format",
+            "-show_streams",
+            "-of", "json",
+            str(video_path),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            details = stderr.decode("utf-8", errors="replace")[-4000:]
+            raise RuntimeError(
+                f"FFprobe نتوانست اطلاعات فایل را بخواند (exit={proc.returncode}): {details}"
+            )
+
+        try:
+            payload = json.loads(stdout.decode("utf-8", errors="replace") or "{}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"خروجی JSON ابزار FFprobe معتبر نیست: {exc}") from exc
+
+        format_info = payload.get("format", {}) or {}
+        format_name = str(format_info.get("format_name") or "").strip()
+        format_long_name = str(format_info.get("format_long_name") or "").strip()
+
+        tracks: list[dict] = []
+        for stream in payload.get("streams", []) or []:
+            try:
+                stream_index = int(stream.get("index"))
+            except (TypeError, ValueError):
+                continue
+
+            codec_type = str(stream.get("codec_type") or "unknown").casefold()
+            track_type = {
+                "subtitle": "subtitles",
+                "video": "video",
+                "audio": "audio",
+            }.get(codec_type, codec_type)
+            codec_name = str(stream.get("codec_name") or "unknown")
+            codec_long_name = str(stream.get("codec_long_name") or codec_name)
+            codec_tag = str(stream.get("codec_tag_string") or "").strip()
+            tags = stream.get("tags", {}) or {}
+            disposition = stream.get("disposition", {}) or {}
+
+            properties: dict = {
+                "codec_id": codec_tag or codec_name,
+                "codec_name": codec_name,
+                "language": str(tags.get("language") or "und").strip(),
+                "language_ietf": str(
+                    tags.get("language-ietf")
+                    or tags.get("language_ietf")
+                    or ""
+                ).strip(),
+                "track_name": str(
+                    tags.get("title")
+                    or tags.get("handler_name")
+                    or ""
+                ).strip(),
+                "default_track": bool(disposition.get("default", 0)),
+                "forced_track": bool(disposition.get("forced", 0)),
+                "attached_pic": bool(disposition.get("attached_pic", 0)),
+            }
+
+            if track_type == "audio":
+                try:
+                    properties["audio_channels"] = int(stream.get("channels") or 0)
+                except (TypeError, ValueError):
+                    properties["audio_channels"] = 0
+                try:
+                    properties["audio_sampling_frequency"] = int(stream.get("sample_rate") or 0)
+                except (TypeError, ValueError):
+                    properties["audio_sampling_frequency"] = 0
+                if stream.get("channel_layout"):
+                    properties["audio_channel_layout"] = str(stream["channel_layout"])
+                if stream.get("bits_per_sample") is not None:
+                    properties["audio_bits_per_sample"] = stream.get("bits_per_sample")
+            elif track_type == "video":
+                width = stream.get("width")
+                height = stream.get("height")
+                if width and height:
+                    properties["pixel_dimensions"] = f"{width}x{height}"
+                if stream.get("display_aspect_ratio"):
+                    properties["display_dimensions"] = str(stream["display_aspect_ratio"])
+                if stream.get("avg_frame_rate"):
+                    properties["frame_rate"] = str(stream["avg_frame_rate"])
+                if stream.get("pix_fmt"):
+                    properties["pixel_format"] = str(stream["pix_fmt"])
+
+            for numeric_key in ("bit_rate", "duration"):
+                if stream.get(numeric_key) not in (None, ""):
+                    properties[numeric_key] = stream.get(numeric_key)
+
+            tracks.append({
+                "id": stream_index,
+                "type": track_type,
+                "codec": codec_long_name,
+                "properties": properties,
+            })
+
+        return {
+            "container": {
+                "recognized": bool(format_name),
+                "supported": bool(format_name),
+                "type": format_long_name or format_name or "Unknown container",
+                "properties": {
+                    "container_type": format_name,
+                    "container_long_name": format_long_name,
+                    "duration": format_info.get("duration"),
+                    "size": format_info.get("size"),
+                    "bit_rate": format_info.get("bit_rate"),
+                    "tags": format_info.get("tags", {}) or {},
+                },
+            },
+            "tracks": tracks,
+            "errors": [],
+        }
+
+    @classmethod
     async def inspect_tracks(cls, video_path: Path) -> dict:
+        """
+        Inspect media tracks with the parser appropriate for the container:
+        - MP4/M4V/MOV: FFprobe (mkvmerge -J does not expose MP4 timed-text data).
+        - Matroska: MKVToolNix/mkvmerge -J.
+        - Other formats: try MKVToolNix first, then FFprobe as a fallback.
+
+        The returned 'tracks' and 'properties' keys are normalized so existing
+        callers (audio-channel detection, HandBrake and subtitle workflows)
+        do not need format-specific branches.
+        """
+        video_path = Path(video_path).expanduser().resolve()
+        if not video_path.is_file():
+            raise FileNotFoundError(f"فایل برای بررسی ترک‌ها پیدا نشد: {video_path}")
+
+        if video_path.suffix.casefold() in cls.MP4_EXTENSIONS:
+            info = await cls._inspect_tracks_with_ffprobe(video_path)
+            logging.info(
+                "[MEDIA INSPECT] parser=ffprobe container=%s file=%s tracks=%s",
+                info.get("container", {}).get("properties", {}).get("container_type"),
+                video_path,
+                [
+                    {
+                        "id": track.get("id"),
+                        "type": track.get("type"),
+                        "codec": track.get("codec"),
+                        "channels": (track.get("properties") or {}).get("audio_channels"),
+                        "language": (track.get("properties") or {}).get("language"),
+                    }
+                    for track in info.get("tracks", [])
+                ],
+            )
+            return info
+
         mkvmerge_bin = cls._get_mkvmerge_bin()
         cmd = [mkvmerge_bin, "-J", str(video_path)]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"mkvmerge -J error: {stderr.decode('utf-8', errors='replace')}")
-        return json.loads(stdout.decode("utf-8", errors="replace"))
+        if proc.returncode == 0:
+            try:
+                return json.loads(stdout.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"خروجی JSON ابزار mkvmerge معتبر نیست: {exc}") from exc
+
+        mkv_error = stderr.decode("utf-8", errors="replace")[-4000:]
+        # Some files are MP4/QuickTime even when their extension is not .mp4,
+        # and some non-Matroska formats are not accepted by mkvmerge at all.
+        ffprobe_bin = cls._get_ffprobe_bin()
+        if ffprobe_bin:
+            try:
+                info = await cls._inspect_tracks_with_ffprobe(video_path)
+                logging.info(
+                    "[MEDIA INSPECT] parser=ffprobe-fallback file=%s tracks=%d mkvmerge_error=%s",
+                    video_path,
+                    len(info.get("tracks", [])),
+                    mkv_error[-600:],
+                )
+                return info
+            except Exception:
+                logging.exception("FFprobe fallback also failed for %s", video_path)
+
+        raise RuntimeError(f"mkvmerge -J نتوانست فایل را تشخیص دهد: {mkv_error}")
 
     @classmethod
     async def convert_eac3_audio_to_aac(
