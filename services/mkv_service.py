@@ -1053,7 +1053,11 @@ class MKVService:
                     }
                     for item in subtitle_inputs
                 ],
-                ["0:video", "0:audio?", *[f"{index}:0" for index in range(1, len(subtitle_inputs) + 1)]],
+                [
+                    *[f"0:{stream['index']}" for stream in video_streams],
+                    *[f"0:{stream['index']}" for stream in audio_streams],
+                    *[f"{index}:0" for index in range(1, len(subtitle_inputs) + 1)],
+                ],
             )
             ff_proc = await asyncio.create_subprocess_exec(
                 *ff_cmd,
