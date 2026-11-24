@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import logging
 import os
 import re
 import shutil
@@ -909,70 +910,52 @@ class MKVService:
             # external SRT as its own FFmpeg input. This avoids relying on an
             # FFmpeg build's Matroska subtitle demuxer/stream-index handling
             # when converting SubRip tracks to MP4 timed text (mov_text).
+            # Do not rely on FFmpeg's automatic subtitle stream mapping from the MKV.
+            # Supply each validated SRT as an explicit input and map input N:0 directly.
+            # This avoids silently losing SubRip tracks when remuxing Matroska to MP4.
+            subtitle_inputs: list[dict] = []
+            if fa_srt_ready is not None:
+                subtitle_inputs.append({
+                    "path": fa_srt_ready,
+                    "language": str(fa_lang or "per"),
+                    "name": brand,
+                    "default": bool(fa_default or require_fa_sub),
+                    "forced": bool(fa_forced),
+                    "label": "FA",
+                })
+            if en_srt_ready is not None:
+                subtitle_inputs.append({
+                    "path": en_srt_ready,
+                    "language": str(en_lang or "eng"),
+                    "name": brand,
+                    "default": False,
+                    "forced": False,
+                    "label": "EN",
+                })
+
+            if (require_fa_sub or fa_srt_ready is not None) and not any(
+                item["label"] == "FA" for item in subtitle_inputs
+            ):
+                raise RuntimeError("ورودی زیرنویس فارسی برای نگاشت مستقیم MP4 آماده نیست.")
+
             ff_cmd = [
                 ffmpeg_bin,
                 "-hide_banner",
                 "-y",
                 "-i", str(temp_mkv),
             ]
-
-            subtitle_sources: list[dict] = []
-            next_input_index = 1
-
-            if fa_srt_ready is not None:
-                if not fa_srt_ready.is_file() or fa_srt_ready.stat().st_size <= 0:
-                    raise RuntimeError(
-                        f"فایل SRT فارسی برای ورودی مستقیم MP4 وجود ندارد یا خالی است: {fa_srt_ready}"
-                    )
+            for subtitle_input in subtitle_inputs:
                 ff_cmd.extend([
                     "-sub_charenc", "UTF-8",
-                    "-f", "srt",
-                    "-i", str(fa_srt_ready),
+                    "-i", str(subtitle_input["path"]),
                 ])
-                subtitle_sources.append({
-                    "input_index": next_input_index,
-                    "language": fa_lang,
-                    "title": brand,
-                    "default": bool(fa_default),
-                    "forced": bool(fa_forced),
-                    "label": "FA",
-                })
-                next_input_index += 1
 
-            if en_srt_ready is not None:
-                if not en_srt_ready.is_file() or en_srt_ready.stat().st_size <= 0:
-                    raise RuntimeError(
-                        f"فایل SRT انگلیسی برای ورودی مستقیم MP4 وجود ندارد یا خالی است: {en_srt_ready}"
-                    )
-                ff_cmd.extend([
-                    "-sub_charenc", "UTF-8",
-                    "-f", "srt",
-                    "-i", str(en_srt_ready),
-                ])
-                subtitle_sources.append({
-                    "input_index": next_input_index,
-                    "language": en_lang,
-                    "title": brand,
-                    "default": False,
-                    "forced": False,
-                    "label": "EN",
-                })
-                next_input_index += 1
-
-            if require_fa_sub and not any(item["label"] == "FA" for item in subtitle_sources):
-                raise RuntimeError("ورودی مستقل زیرنویس فارسی برای ساخت MP4 تعریف نشده است.")
-            if require_en_sub and not any(item["label"] == "EN" for item in subtitle_sources):
-                raise RuntimeError("ورودی مستقل زیرنویس انگلیسی برای ساخت MP4 تعریف نشده است.")
-
-            # Copy video/audio from the already validated intermediate MKV.
-            # Map the subtitle files explicitly as inputs 1..N instead of
-            # relying on the subtitle stream selector from the Matroska file.
             ff_cmd.extend([
                 "-map", "0:v?",
                 "-map", "0:a?",
             ])
-            for item in subtitle_sources:
-                ff_cmd.extend(["-map", f'{item["input_index"]}:0'])
+            for input_index in range(1, len(subtitle_inputs) + 1):
+                ff_cmd.extend(["-map", f"{input_index}:0"])
 
             ff_cmd.extend([
                 "-map_metadata", "0",
@@ -984,24 +967,47 @@ class MKVService:
                 "-metadata", f"title={brand}",
             ])
 
-            for subtitle_index, item in enumerate(subtitle_sources):
+            for sub_index, subtitle_input in enumerate(subtitle_inputs):
+                language = subtitle_input["language"]
+                track_name = subtitle_input["name"]
                 ff_cmd.extend([
-                    f"-metadata:s:s:{subtitle_index}", f'language={item["language"]}',
-                    f"-metadata:s:s:{subtitle_index}", f'title={item["title"]}',
-                    f"-disposition:s:{subtitle_index}",
-                    (
-                        "+".join(
-                            flag for flag, enabled in (
-                                ("default", item["default"]),
-                                ("forced", item["forced"]),
-                            ) if enabled
-                        )
-                        or "0"
-                    ),
+                    f"-metadata:s:s:{sub_index}", f"language={language}",
+                    f"-metadata:s:s:{sub_index}", f"title={track_name}",
+                ])
+                dispositions = []
+                if subtitle_input["default"]:
+                    dispositions.append("default")
+                if subtitle_input["forced"]:
+                    dispositions.append("forced")
+                ff_cmd.extend([
+                    f"-disposition:s:{sub_index}",
+                    "+".join(dispositions) if dispositions else "0",
                 ])
 
-            # Force the target muxer instead of relying on filename extension.
-            ff_cmd.extend(["-f", "mp4"])
+            logging.info(
+                "[MP4 SOFTSUB] module=%s source=%s temp_mkv=%s output=%s "
+                "subtitle_inputs=%s ffmpeg=%s",
+                Path(__file__).resolve(),
+                video_path,
+                temp_mkv,
+                output_path,
+                [
+                    {
+                        "path": str(item["path"]),
+                        "language": item["language"],
+                        "label": item["label"],
+                    }
+                    for item in subtitle_inputs
+                ],
+                ffmpeg_bin,
+            )
+            logging.info(
+                "[MP4 SOFTSUB] explicit FFmpeg maps: %s",
+                " ".join(
+                    ["0:v?", "0:a?"]
+                    + [f"{index}:0" for index in range(1, len(subtitle_inputs) + 1)]
+                ),
+            )
             ff_cmd.append(str(output_path))
 
             logging.info(
@@ -1127,6 +1133,10 @@ class MKVService:
                             break
 
             if output_path.suffix.lower() == ".mp4":
+                # If a subtitle file was supplied for MP4, it must survive into
+                # the published output even when a caller forgot the require flag.
+                mp4_require_fa_sub = bool(require_fa_sub or clean_fa_sub is not None)
+                mp4_require_en_sub = bool(require_en_sub or clean_en_sub is not None)
                 await cls._merge_softsub_mp4_ffmpeg(
                     ffmpeg_bin=ffmpeg_bin,
                     video_path=video_path,
@@ -1139,18 +1149,42 @@ class MKVService:
                     en_lang=en_lang,
                     fa_default=fa_default,
                     fa_forced=fa_forced,
-                    require_fa_sub=require_fa_sub,
-                    require_en_sub=require_en_sub,
+                    require_fa_sub=mp4_require_fa_sub,
+                    require_en_sub=mp4_require_en_sub,
                     progress_callback=progress_callback
                 )
-                await cls._verify_muxed_subtitle_languages(
-                    staging_output_path,
-                    require_fa_sub=require_fa_sub,
-                    require_en_sub=require_en_sub,
-                    fa_lang=fa_lang,
-                    en_lang=en_lang,
-                )
+
+                # Verify the exact destination file after the atomic publish.
+                # If verification fails, delete it so a raw/invalid MP4 cannot
+                # remain under a successful SoftSub filename.
                 staging_output_path.replace(output_path)
+                try:
+                    verified_tracks = await cls._verify_muxed_subtitle_languages(
+                        output_path,
+                        require_fa_sub=mp4_require_fa_sub,
+                        require_en_sub=mp4_require_en_sub,
+                        fa_lang=fa_lang,
+                        en_lang=en_lang,
+                    )
+                except Exception:
+                    output_path.unlink(missing_ok=True)
+                    raise
+
+                logging.info(
+                    "[MP4 SOFTSUB VERIFIED] module=%s output=%s bytes=%d subtitle_tracks=%s",
+                    Path(__file__).resolve(),
+                    output_path,
+                    output_path.stat().st_size,
+                    [
+                        {
+                            "stream": track.get("id"),
+                            "codec": track.get("codec"),
+                            "language": track.get("language"),
+                            "default": track.get("default_track"),
+                        }
+                        for track in verified_tracks
+                    ],
+                )
                 return output_path
 
             cmd = [
