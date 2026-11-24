@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import logging
 import os
 import re
 import shutil
@@ -910,6 +909,32 @@ class MKVService:
             # external SRT as its own FFmpeg input. This avoids relying on an
             # FFmpeg build's Matroska subtitle demuxer/stream-index handling
             # when converting SubRip tracks to MP4 timed text (mov_text).
+            # MP4/QuickTime stores language metadata in ISO-639-2 form.
+            # FFmpeg silently drops two-letter language values such as "fa" here.
+            def _mp4_language_tag(raw_value: str, fallback: str) -> str:
+                value = str(raw_value or "").strip().casefold().replace("_", "-")
+                value = value.split("-", 1)[0]
+                aliases = {
+                    "fa": "per", "fas": "fas", "per": "per",
+                    "farsi": "per", "persian": "per",
+                    "en": "eng", "eng": "eng", "english": "eng",
+                    "ja": "jpn", "jp": "jpn", "jpn": "jpn",
+                    "de": "deu", "ger": "deu", "deu": "deu",
+                    "fr": "fra", "fre": "fra", "fra": "fra",
+                    "es": "spa", "spa": "spa",
+                    "ru": "rus", "rus": "rus",
+                    "ar": "ara", "ara": "ara",
+                    "zh": "zho", "chi": "zho", "zho": "zho",
+                    "ko": "kor", "kor": "kor",
+                    "it": "ita", "ita": "ita",
+                    "pt": "por", "por": "por",
+                }
+                if value in aliases:
+                    return aliases[value]
+                if len(value) == 3 and value.isascii() and value.isalpha():
+                    return value
+                return fallback
+
             # Do not rely on FFmpeg's automatic subtitle stream mapping from the MKV.
             # Supply each validated SRT as an explicit input and map input N:0 directly.
             # This avoids silently losing SubRip tracks when remuxing Matroska to MP4.
@@ -917,7 +942,7 @@ class MKVService:
             if fa_srt_ready is not None:
                 subtitle_inputs.append({
                     "path": fa_srt_ready,
-                    "language": str(fa_lang or "per"),
+                    "language": _mp4_language_tag(fa_lang, "per"),
                     "name": brand,
                     "default": bool(fa_default or require_fa_sub),
                     "forced": bool(fa_forced),
@@ -926,7 +951,7 @@ class MKVService:
             if en_srt_ready is not None:
                 subtitle_inputs.append({
                     "path": en_srt_ready,
-                    "language": str(en_lang or "eng"),
+                    "language": _mp4_language_tag(en_lang, "eng"),
                     "name": brand,
                     "default": False,
                     "forced": False,
@@ -1008,23 +1033,9 @@ class MKVService:
                     + [f"{index}:0" for index in range(1, len(subtitle_inputs) + 1)]
                 ),
             )
+            # Explicitly select the MP4 muxer for the .mp4 staging file.
+            ff_cmd.extend(["-f", "mp4"])
             ff_cmd.append(str(output_path))
-
-            logging.info(
-                "[MP4 SOFTSUB REMUX] source_mkv=%s output=%s subtitle_inputs=%s ffmpeg=%s",
-                temp_mkv,
-                output_path,
-                [
-                    {
-                        "label": item["label"],
-                        "language": item["language"],
-                        "default": item["default"],
-                        "forced": item["forced"],
-                    }
-                    for item in subtitle_sources
-                ],
-                ffmpeg_bin,
-            )
             ff_proc = await asyncio.create_subprocess_exec(
                 *ff_cmd,
                 stdout=asyncio.subprocess.PIPE,
