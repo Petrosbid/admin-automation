@@ -459,24 +459,28 @@ def _upload_single_file_with_retry(
     progress_callback: Callable[[str], None] | None = None
 ) -> Path:
     """
-    آپلود یک فایل منفرد با قابلیت Auto-Retry و تطبیق خودکار نام با سرور.
-    در پایان، مسیر نهایی فایل (که ممکن است هم‌نام با فرمول سرور تغییر نام یافته باشد) را برمی‌گرداند.
+    Upload one file with retry and server-side filename alignment.
+
+    Every retry starts a fresh STOR from byte zero. Blind REST-resume is unsafe
+    when an older file with the same name already exists: its prefix may not
+    match the newly generated MP4/MKV, producing a corrupt hybrid file.
     """
     import logging
+
+    local_file = Path(local_file).resolve()
     if not local_file.exists() or not local_file.is_file():
         raise FileNotFoundError(f"فایل محلی برای آپلود یافت نشد: {local_file}")
 
-    total_size = max(1, local_file.stat().st_size)
-    total_mb = total_size / (1024 * 1024)
     last_error: Exception | None = None
 
     for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
         try:
-            # ۱. اطمینان از برقراری اتصال فعال
             ftp = ftp_holder[0]
             if ftp is None:
                 if progress_callback:
-                    progress_callback(f"{progress_prefix}در حال اتصال به سرور FTP (تلاش {attempt}/{MAX_UPLOAD_RETRIES})...")
+                    progress_callback(
+                        f"{progress_prefix}در حال اتصال به سرور FTP (تلاش {attempt}/{MAX_UPLOAD_RETRIES})..."
+                    )
                 ftp = _create_ftp_connection(**conn_params)
                 ftp_holder[0] = ftp
             else:
@@ -487,28 +491,33 @@ def _upload_single_file_with_retry(
                     ftp = _create_ftp_connection(**conn_params)
                     ftp_holder[0] = ftp
 
-            # ۲. ورود به پوشه مقصد در سرور
             _ensure_ftp_remote_dir(ftp, remote_dest_dir)
-
-            # ۲.۵. تطبیق خودکار نام فایل با فرمول قسمت‌های قبلی موجود در همین پوشه روی سرور (تغییر فقط Eyy)
             local_file = _auto_align_filename_with_server_siblings(ftp, local_file)
 
-            # ۳. بررسی امکان Resume در صورتی که تلاش دوم به بعد باشد
-            rest_offset = 0
-            if attempt > 1:
-                try:
-                    ftp.voidcmd("TYPE I")
-                    remote_size = ftp.size(local_file.name)
-                    if isinstance(remote_size, int) and 0 < remote_size < total_size:
-                        rest_offset = remote_size
-                    elif remote_size == total_size:
-                        if progress_callback:
-                            progress_callback(f"{progress_prefix}100% ({total_mb:.1f} MB)")
-                        return local_file
-                except Exception:
-                    rest_offset = 0
+            if not local_file.is_file():
+                raise FileNotFoundError(f"فایل محلی پس از تطبیق نام پیدا نشد: {local_file}")
 
-            uploaded = rest_offset
+            total_size = local_file.stat().st_size
+            if total_size <= 0:
+                raise ValueError(f"فایل محلی برای آپلود خالی است: {local_file}")
+
+            # Inspect an existing remote file for diagnostics only. Never treat
+            # equal size as proof of equal content and never resume from its tail.
+            existing_remote_size = None
+            try:
+                ftp.voidcmd("TYPE I")
+                existing_remote_size = ftp.size(local_file.name)
+            except Exception:
+                existing_remote_size = None
+
+            if existing_remote_size is not None and progress_callback:
+                progress_callback(
+                    f"{progress_prefix}نسخه قبلی مقصد ({existing_remote_size} بایت) بررسی شد؛ "
+                    "فایل جدید از ابتدا جایگزین می‌شود..."
+                )
+
+            total_mb = total_size / (1024 * 1024)
+            uploaded = 0
             start_time = time.time()
             last_report_time = 0.0
 
@@ -521,44 +530,51 @@ def _upload_single_file_with_retry(
                     last_report_time = now
                     pct = min(100.0, (uploaded / total_size) * 100.0)
                     elapsed = now - start_time
-                    speed_info = _format_speed_and_eta(uploaded - rest_offset, total_size - rest_offset, elapsed)
+                    speed_info = _format_speed_and_eta(uploaded, total_size, elapsed)
                     progress_callback(
-                        f"{progress_prefix}{pct:.1f}% ({uploaded / (1024*1024):.1f}/{total_mb:.1f} MB) | {speed_info}"
+                        f"{progress_prefix}{pct:.1f}% "
+                        f"({uploaded / (1024 * 1024):.1f}/{total_mb:.1f} MB) | {speed_info}"
                     )
 
-            with open(local_file, "rb") as f:
-                if rest_offset > 0:
-                    f.seek(rest_offset)
-                try:
-                    ftp.storbinary(
-                        f"STOR {local_file.name}",
-                        f,
-                        blocksize=UPLOAD_BLOCK_SIZE,
-                        callback=_on_chunk_sent,
-                        rest=(rest_offset if rest_offset > 0 else None)
-                    )
-                except error_perm:
-                    if rest_offset > 0:
-                        f.seek(0)
-                        uploaded = 0
-                        ftp.storbinary(
-                            f"STOR {local_file.name}",
-                            f,
-                            blocksize=UPLOAD_BLOCK_SIZE,
-                            callback=_on_chunk_sent
-                        )
-                    else:
-                        raise
+            with open(local_file, "rb") as file_handle:
+                ftp.storbinary(
+                    f"STOR {local_file.name}",
+                    file_handle,
+                    blocksize=UPLOAD_BLOCK_SIZE,
+                    callback=_on_chunk_sent,
+                )
+
+            # Verify the actual remote object after the server confirms STOR.
+            ftp.voidcmd("TYPE I")
+            remote_size = ftp.size(local_file.name)
+            if remote_size is None or int(remote_size) != total_size:
+                raise IOError(
+                    f"تأیید اندازه فایل روی سرور ناموفق بود: "
+                    f"local={total_size}, remote={remote_size}, file={local_file.name}"
+                )
 
             if progress_callback:
-                progress_callback(f"{progress_prefix}100% ({total_mb:.1f} MB) - تکمیل شد")
+                progress_callback(
+                    f"{progress_prefix}100% ({total_mb:.1f} MB) - "
+                    f"آپلود و تأیید اندازه ({remote_size} بایت) تکمیل شد"
+                )
 
+            logging.info(
+                "[FTP UPLOAD VERIFIED] file=%s local_bytes=%d remote_bytes=%d",
+                local_file.name,
+                total_size,
+                remote_size,
+            )
             return local_file
 
-        except all_errors as e:
-            last_error = e
+        except all_errors as exc:
+            last_error = exc
             logging.warning(
-                f"⚠️ [FTP UPLOAD RETRY {attempt}/{MAX_UPLOAD_RETRIES}] خطا در آپلود '{local_file.name}': {e}"
+                "⚠️ [FTP UPLOAD RETRY %s/%s] Failed to upload '%s': %s",
+                attempt,
+                MAX_UPLOAD_RETRIES,
+                local_file.name,
+                exc,
             )
             _close_ftp_quietly(ftp_holder[0])
             ftp_holder[0] = None
@@ -567,14 +583,15 @@ def _upload_single_file_with_retry(
                 wait_sec = attempt * 3
                 if progress_callback:
                     progress_callback(
-                        f"⚠️ خطای شبکه در آپلود {local_file.name[:20]}؛ تلاش مجدد {attempt + 1}/{MAX_UPLOAD_RETRIES} تا {wait_sec} ثانیه دیگر..."
+                        f"⚠️ خطای شبکه در آپلود {local_file.name[:20]}؛ "
+                        f"تلاش مجدد {attempt + 1}/{MAX_UPLOAD_RETRIES} تا {wait_sec} ثانیه دیگر..."
                     )
                 time.sleep(wait_sec)
 
     raise RuntimeError(
-        f"آپلود فایل '{local_file.name}' پس از {MAX_UPLOAD_RETRIES} بار تلاش ناموفق بود. آخرین خطا: {last_error}"
+        f"آپلود فایل '{local_file.name}' پس از {MAX_UPLOAD_RETRIES} بار تلاش ناموفق بود. "
+        f"آخرین خطا: {last_error}"
     )
-
 
 def get_current_cuteftp_remote_dir() -> str:
     return str(cfg.get("cuteftp", "remote_base_dir", "/English/Movies")).strip() or "/English/Movies"
