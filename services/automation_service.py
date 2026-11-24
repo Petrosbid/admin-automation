@@ -1691,6 +1691,17 @@ class AutomationService:
         if en_sub is not None:
             en_sub = MKVService.validate_subtitle_file(en_sub, "زیرنویس انگلیسی SoftSub")
 
+        logging.info(
+            "[SOFTSUB AUTOMATION DISPATCH] module=%s python=%s cwd=%s "
+            "source=%s output=%s fa_sub=%s en_sub=%s",
+            Path(__file__).resolve(),
+            __import__("sys").executable,
+            Path.cwd(),
+            raw_video,
+            output_file,
+            fa_sub,
+            en_sub,
+        )
         output_file.parent.mkdir(parents=True, exist_ok=True)
         res_path = await MKVService.merge_softsub(
             video_path=raw_video,
