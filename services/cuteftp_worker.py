@@ -241,44 +241,127 @@ def _list_remote_media_sibling_dirs(ftp: FTP, current_dir: str) -> list[str]:
     return [posixpath.join(parent_dir, name).replace("\\", "/") for name in result]
 
 
-def _build_aligned_upload_filename(local_filename: str, template_filename: str) -> str | None:
-    """Apply the server's release naming pattern while preserving the local output type."""
-    current_match = _EP_TAG_RE.search(str(local_filename or ""))
-    template_match = _EP_TAG_RE.search(str(template_filename or ""))
-    if not current_match or not template_match:
-        return None
-    if int(current_match.group(1)) != int(template_match.group(1)):
+def _season_from_remote_dir(remote_dir: str) -> int | None:
+    for part in reversed([item for item in str(remote_dir or "").replace("\\", "/").split("/") if item]):
+        match = re.fullmatch(r"(?i)s(?:eason[\s._\-]*)?(\d{1,2})", part)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _extract_upload_episode_identity(
+    filename: str,
+    fallback_season: int | None = None,
+) -> tuple[int, int, int, int, str] | None:
+    """
+    Return (season, episode, token_start, token_end, format) from a release name.
+    Supports canonical SxxEyy, 1x02, E02/EP02, " - 02", and bracketed [02]/(02)
+    when the parent remote directory provides an unambiguous season.
+    """
+    stem = Path(str(filename or "")).stem
+
+    match = _EP_TAG_RE.search(stem)
+    if match:
+        return (
+            int(match.group(1)),
+            int(match.group(2)),
+            match.start(),
+            match.end(),
+            "standard",
+        )
+
+    alt_match = re.search(r"(?<!\d)(\d{1,2})[xX](\d{1,3})(?!\d)", stem)
+    if alt_match:
+        return (
+            int(alt_match.group(1)),
+            int(alt_match.group(2)),
+            alt_match.start(),
+            alt_match.end(),
+            "alternate",
+        )
+
+    if fallback_season is None:
         return None
 
+    patterns = (
+        (
+            r"(?i)(?:^|[ ._\-])(?:episode|ep|e)[ ._\-]*(\d{1,3})(?=$|[ ._\-\[\]()])",
+            "numeric",
+        ),
+        (r"\s-\s(\d{1,3})(?=$|[ ._\-\[\]()])", "numeric"),
+        (r"[\[(]\s*(\d{1,3})(?:v\d)?\s*[\])]", "numeric"),
+        (
+            r"(?:^|[ ._\-])(\d{1,3})(?:v\d)?(?=\s*(?:\[|\())",
+            "numeric",
+        ),
+    )
+    for pattern, style in patterns:
+        match = re.search(pattern, stem)
+        if match:
+            token = match.group(1)
+            return (
+                int(fallback_season),
+                int(token),
+                match.start(1),
+                match.end(1),
+                style,
+            )
+    return None
+
+
+def _build_aligned_upload_filename(
+    local_filename: str,
+    template_filename: str,
+    fallback_season: int | None = None,
+) -> str | None:
+    """Apply the server's release naming pattern while preserving the local output type."""
     local_path = Path(local_filename)
     template_path = Path(template_filename)
-    local_stem = local_path.stem
-    template_stem = template_path.stem
-    current_season = int(current_match.group(1))
-    current_episode = int(current_match.group(2))
+    current = _extract_upload_episode_identity(local_path.name, fallback_season)
+    template = _extract_upload_episode_identity(template_path.name, fallback_season)
+    if not current or not template:
+        return None
 
-    # Keep SoftSub/HardSub/EBTV suffix from the local artifact, but take the
-    # release title/quality/codec token order from a known-good server sibling.
+    current_season, current_episode = current[0], current[1]
+    template_season, _, template_start, template_end, template_style = template
+    if current_season != template_season:
+        return None
+
+    # Preserve the template's episode-token format and zero-padding width.
+    if template_style == "standard":
+        replacement = f"S{current_season:02d}E{current_episode:02d}"
+    elif template_style == "alternate":
+        token = template_path.stem[template_start:template_end]
+        x_char = "X" if "X" in token else "x"
+        replacement = f"{current_season:02d}{x_char}{current_episode:02d}"
+    else:
+        template_token = template_path.stem[template_start:template_end]
+        width = len(template_token)
+        replacement = f"{current_episode:0{width}d}"
+
+    template_stem = template_path.stem
+    local_stem = local_path.stem
     local_marker_match = re.search(
         r"(?i)(?:[._\-](?:softsub|hardsub)(?:[._\-]ebtv)?|[._\-]ebtv)$",
         local_stem,
     )
     local_output_marker = local_marker_match.group(0) if local_marker_match else ""
 
-    template_tail = template_stem[template_match.end():]
+    template_tail = template_stem[template_end:]
     template_tail = re.sub(
         r"(?i)(?:[._\-](?:softsub|hardsub)(?:[._\-]ebtv)?|[._\-]ebtv)$",
         "",
         template_tail,
     )
     aligned_stem = (
-        template_stem[:template_match.start()]
-        + f"S{current_season:02d}E{current_episode:02d}"
+        template_stem[:template_start]
+        + replacement
         + template_tail
         + local_output_marker
     )
     aligned_filename = f"{aligned_stem}{local_path.suffix}"
     return aligned_filename if aligned_filename.casefold() != local_path.name.casefold() else None
+
 
 
 def _auto_align_filename_with_server_siblings(ftp: FTP, local_file: Path) -> Path:
@@ -291,14 +374,15 @@ def _auto_align_filename_with_server_siblings(ftp: FTP, local_file: Path) -> Pat
     import logging
 
     local_file = Path(local_file)
-    current_match = _EP_TAG_RE.search(local_file.name)
-    if not current_match:
-        return local_file
-
     try:
         current_dir = str(ftp.pwd() or "").replace("\\", "/").rstrip("/") or "/"
     except Exception:
         current_dir = ""
+
+    fallback_season = _season_from_remote_dir(current_dir)
+    current_identity = _extract_upload_episode_identity(local_file.name, fallback_season)
+    if not current_identity:
+        return local_file
 
     candidate_dirs: list[str | None] = [None]  # Current working directory first.
     if current_dir:
@@ -306,7 +390,7 @@ def _auto_align_filename_with_server_siblings(ftp: FTP, local_file: Path) -> Pat
 
     video_exts = {".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"}
     is_video = local_file.suffix.casefold() in video_exts
-    current_season = int(current_match.group(1))
+    current_season = current_identity[0]
     best_template: tuple[int, int, str] | None = None
 
     for dir_priority, remote_dir in enumerate(candidate_dirs):
@@ -318,10 +402,10 @@ def _auto_align_filename_with_server_siblings(ftp: FTP, local_file: Path) -> Pat
                 continue
             if not is_video and remote_ext != local_file.suffix.casefold():
                 continue
-            match = _EP_TAG_RE.search(remote_name)
-            if not match or int(match.group(1)) != current_season:
+            identity = _extract_upload_episode_identity(remote_name, fallback_season)
+            if not identity or identity[0] != current_season:
                 continue
-            siblings.append((int(match.group(2)), remote_name))
+            siblings.append((identity[1], remote_name))
 
         if siblings:
             episode_number, template_name = max(
@@ -334,7 +418,11 @@ def _auto_align_filename_with_server_siblings(ftp: FTP, local_file: Path) -> Pat
     if not best_template:
         return local_file
 
-    aligned_name = _build_aligned_upload_filename(local_file.name, best_template[2])
+    aligned_name = _build_aligned_upload_filename(
+        local_file.name,
+        best_template[2],
+        fallback_season=fallback_season,
+    )
     if not aligned_name:
         return local_file
 
