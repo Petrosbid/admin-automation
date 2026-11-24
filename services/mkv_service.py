@@ -14,6 +14,7 @@ from services.subtitle_service import SubtitleService
 
 class MKVService:
     MP4_EXTENSIONS = {".mp4", ".m4v", ".mov"}
+    MP4_SOFTSUB_PIPELINE_ID = "direct-srt-input-audit-2026-11-24"
 
     @staticmethod
     def _get_ffmpeg_bin() -> str | None:
@@ -1035,6 +1036,25 @@ class MKVService:
             )
 
             ff_cmd.extend(["-f", "mp4", str(output_path)])
+            logging.info(
+                "[MP4 SOFTSUB IMPLEMENTATION] pipeline=%s module=%s ffmpeg=%s "
+                "source=%s output=%s subtitle_inputs=%s mapped_inputs=%s",
+                cls.MP4_SOFTSUB_PIPELINE_ID,
+                Path(__file__).resolve(),
+                ffmpeg_bin,
+                video_path,
+                output_path,
+                [
+                    {
+                        "path": str(item["path"]),
+                        "bytes": item["path"].stat().st_size,
+                        "language": item["language"],
+                        "label": item["label"],
+                    }
+                    for item in subtitle_inputs
+                ],
+                ["0:video", "0:audio?", *[f"{index}:0" for index in range(1, len(subtitle_inputs) + 1)]],
+            )
             ff_proc = await asyncio.create_subprocess_exec(
                 *ff_cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -1042,6 +1062,15 @@ class MKVService:
             )
             ff_output, _ = await ff_proc.communicate()
             ff_text = ff_output.decode("utf-8", errors="replace")
+            logging.info(
+                "[MP4 SOFTSUB FFMPEG FINISHED] pipeline=%s exit=%s output_exists=%s "
+                "output_bytes=%s log_tail=%s",
+                cls.MP4_SOFTSUB_PIPELINE_ID,
+                ff_proc.returncode,
+                output_path.is_file(),
+                output_path.stat().st_size if output_path.is_file() else 0,
+                ff_text[-1800:],
+            )
             if (
                 ff_proc.returncode != 0
                 or not output_path.is_file()
@@ -1079,6 +1108,19 @@ class MKVService:
         output_path = Path(output_path).expanduser().resolve()
         if not video_path.is_file() or video_path.stat().st_size <= 0:
             raise FileNotFoundError(f"فایل ویدئوی ورودی پیدا نشد یا خالی است: {video_path}")
+        if output_path.suffix.casefold() in cls.MP4_EXTENSIONS:
+            logging.info(
+                "[MP4 SOFTSUB SERVICE ENTRY] pipeline=%s module=%s python=%s cwd=%s "
+                "source=%s output=%s fa_sub=%s en_sub=%s",
+                cls.MP4_SOFTSUB_PIPELINE_ID,
+                Path(__file__).resolve(),
+                os.sys.executable,
+                Path.cwd(),
+                video_path,
+                output_path,
+                fa_sub_path,
+                en_sub_path,
+            )
         if require_fa_sub and fa_sub_path is None:
             raise ValueError("برای ساخت SoftSub معتبر، زیرنویس فارسی الزامی است.")
         if require_en_sub and en_sub_path is None:
@@ -1179,7 +1221,12 @@ class MKVService:
                     raise
 
                 logging.info(
-                    "[MP4 SOFTSUB VERIFIED] output=%s bytes=%d subtitle_tracks=%s",
+                    "[MP4 SOFTSUB VERIFIED] pipeline=%s module=%s python=%s cwd=%s "
+                    "output=%s bytes=%d subtitle_tracks=%s",
+                    cls.MP4_SOFTSUB_PIPELINE_ID,
+                    Path(__file__).resolve(),
+                    os.sys.executable,
+                    Path.cwd(),
                     output_path,
                     output_path.stat().st_size,
                     [
