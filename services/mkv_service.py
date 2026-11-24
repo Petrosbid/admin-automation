@@ -209,8 +209,8 @@ class MKVService:
             )
 
         cue_matches = list(re.finditer(
-            r"(?m)^\\s*\\d{2}:\\d{2}:\\d{2}[,.]\\d{1,3}\\s*-->\\s*"
-            r"\\d{2}:\\d{2}:\\d{2}[,.]\\d{1,3}\\s*$",
+            r"(?m)^\s*\d{2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*"
+            r"\d{2}:\d{2}:\d{2}[,.]\d{1,3}\s*$",
             decoded,
         ))
         if not cue_matches:
@@ -220,18 +220,18 @@ class MKVService:
 
         caption_lines = []
         for line in decoded.splitlines():
-            stripped = line.strip().lstrip("\\ufeff")
+            stripped = line.strip().lstrip("\ufeff")
             if not stripped or stripped.isdigit():
                 continue
             if re.match(
-                r"^\\d{2}:\\d{2}:\\d{2}[,.]\\d{1,3}\\s*-->\\s*"
-                r"\\d{2}:\\d{2}:\\d{2}[,.]\\d{1,3}$",
+                r"^\d{2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*"
+                r"\d{2}:\d{2}:\d{2}[,.]\d{1,3}$",
                 stripped,
             ):
                 continue
             caption_lines.append(stripped)
 
-        caption_text = "\\n".join(caption_lines).strip()
+        caption_text = "\n".join(caption_lines).strip()
         if not caption_text:
             raise RuntimeError(
                 f"ترک {language_label} در MP4 دارای زمان‌بندی است، اما متن قابل‌نمایشی ندارد."
