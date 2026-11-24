@@ -166,6 +166,79 @@ class MKVService:
             })
         return result
 
+    @classmethod
+    async def _extract_mp4_subtitle_text(
+        cls,
+        video_path: Path,
+        track: dict,
+        language_label: str,
+    ) -> tuple[int, str]:
+        """
+        Decode one MP4 subtitle stream back to SRT and prove it contains
+        real timed caption text, not merely an empty subtitle stream.
+        """
+        ffmpeg_bin = cls._get_ffmpeg_bin()
+        if not ffmpeg_bin:
+            raise FileNotFoundError("برای بررسی محتوای زیرنویس MP4، FFmpeg پیدا نشد.")
+
+        stream_index = track.get("id")
+        if stream_index is None:
+            raise RuntimeError(f"شناسه Stream زیرنویس {language_label} در MP4 مشخص نیست.")
+
+        cmd = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", str(video_path),
+            "-map", f"0:{int(stream_index)}",
+            "-f", "srt",
+            "-",
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        decoded = stdout.decode("utf-8-sig", errors="replace")
+        if proc.returncode != 0:
+            details = stderr.decode("utf-8", errors="replace")[-1800:]
+            raise RuntimeError(
+                f"استخراج محتوای زیرنویس {language_label} از MP4 ناموفق بود "
+                f"(exit={proc.returncode}): {details}"
+            )
+
+        cue_matches = list(re.finditer(
+            r"(?m)^\\s*\\d{2}:\\d{2}:\\d{2}[,.]\\d{1,3}\\s*-->\\s*"
+            r"\\d{2}:\\d{2}:\\d{2}[,.]\\d{1,3}\\s*$",
+            decoded,
+        ))
+        if not cue_matches:
+            raise RuntimeError(
+                f"ترک {language_label} در MP4 وجود دارد، اما FFmpeg هیچ زیرنویس زمان‌داری از آن استخراج نکرد."
+            )
+
+        caption_lines = []
+        for line in decoded.splitlines():
+            stripped = line.strip().lstrip("\\ufeff")
+            if not stripped or stripped.isdigit():
+                continue
+            if re.match(
+                r"^\\d{2}:\\d{2}:\\d{2}[,.]\\d{1,3}\\s*-->\\s*"
+                r"\\d{2}:\\d{2}:\\d{2}[,.]\\d{1,3}$",
+                stripped,
+            ):
+                continue
+            caption_lines.append(stripped)
+
+        caption_text = "\\n".join(caption_lines).strip()
+        if not caption_text:
+            raise RuntimeError(
+                f"ترک {language_label} در MP4 دارای زمان‌بندی است، اما متن قابل‌نمایشی ندارد."
+            )
+
+        return len(cue_matches), caption_text
+
     @staticmethod
     def _get_mkvmerge_bin() -> str:
         mkv_cfg = str(cfg.get("paths", "mkvmerge_bin", "C:\\Program Files\\MKVToolNix\\mkvmerge.exe")).strip()
@@ -283,22 +356,44 @@ class MKVService:
                 for value in values(track)
             )
 
-        if require_fa_sub and not any(matches(track, fa_aliases) for track in tracks):
-            found = ", ".join(
-                str(track.get("language") or track.get("language_ietf") or "und")
-                for track in tracks
-            ) or "هیچ‌کدام"
+        async def verify_language_content(aliases: set[str], label: str) -> None:
+            candidates = [track for track in tracks if matches(track, aliases)]
+            if not candidates:
+                found = ", ".join(
+                    str(track.get("language") or track.get("language_ietf") or "und")
+                    for track in tracks
+                ) or "هیچ‌کدام"
+                raise RuntimeError(
+                    f"ترک {label} در {output_path.name} تأیید نشد (زبان‌های موجود: {found}). "
+                    "فایل ناقص رد شد."
+                )
+
+            if output_path.suffix.casefold() not in {".mp4", ".m4v", ".mov"}:
+                return
+
+            failures: list[str] = []
+            for track in candidates:
+                try:
+                    cue_count, _caption_text = await cls._extract_mp4_subtitle_text(
+                        output_path,
+                        track,
+                        label,
+                    )
+                    if cue_count > 0:
+                        return
+                except Exception as exc:
+                    failures.append(str(exc))
+
+            diagnostic = " | ".join(failures[-3:]) or "هیچ Cue متنی پیدا نشد."
             raise RuntimeError(
-                f"ترک فارسی در {output_path.name} تأیید نشد (زبان‌ها: {found}). فایل ناقص رد شد."
+                f"ترک {label} در MP4 فقط از نظر Stream شناسایی شده، اما محتوای واقعی زیرنویس "
+                f"قابل استخراج نیست؛ فایل ناقص رد شد. جزئیات: {diagnostic}"
             )
-        if require_en_sub and not any(matches(track, en_aliases) for track in tracks):
-            found = ", ".join(
-                str(track.get("language") or track.get("language_ietf") or "und")
-                for track in tracks
-            ) or "هیچ‌کدام"
-            raise RuntimeError(
-                f"ترک انگلیسی در {output_path.name} تأیید نشد (زبان‌ها: {found}). فایل ناقص رد شد."
-            )
+
+        if require_fa_sub:
+            await verify_language_content(fa_aliases, "فارسی")
+        if require_en_sub:
+            await verify_language_content(en_aliases, "انگلیسی")
         return tracks
 
     @staticmethod
