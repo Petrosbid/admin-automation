@@ -1,4 +1,5 @@
 import os
+import posixpath
 import uuid
 from ftplib import FTP, FTP_TLS, error_perm, all_errors
 import logging
@@ -129,70 +130,236 @@ def _ensure_ftp_remote_dir(ftp: FTP, remote_dir: str):
             ftp.cwd(accum)
 
 
-def _auto_align_filename_with_server_siblings(ftp: FTP, local_file: Path) -> Path:
-    """
-    بررسی فایل‌های موجود در پوشه مقصد روی سرور (دقیقاً قبل از آپلود):
-    اگر قسمت‌های قبلی در همین پوشه روی سرور وجود داشته باشند و فرمول نامشان متفاوت باشد،
-    فرمول نام سرور را کپی کرده، فقط بخش Eyy را به قسمت فعلی تغییر می‌دهد و فایل لوکال را هم تغییر نام می‌دهد.
-    """
-    import logging
-    m_cur = _EP_TAG_RE.search(local_file.name)
-    if not m_cur:
-        return local_file
-
-    cur_ep_num = int(m_cur.group(2))
-    cur_ext = local_file.suffix.lower()
-
-    remote_files: list[str] = []
+def _list_remote_files_for_alignment(ftp: FTP, remote_dir: str | None = None) -> list[str]:
+    """List remote files for naming templates without changing the active FTP directory."""
     try:
-        for name, facts in ftp.mlsd():
-            if name not in (".", "..") and str(facts.get("type", "")).lower() == "file":
-                remote_files.append(name)
+        entries = ftp.mlsd(remote_dir) if remote_dir else ftp.mlsd()
+        return [
+            posixpath.basename(str(name).rstrip("/"))
+            for name, facts in entries
+            if str(name).strip() not in (".", "..")
+            and str((facts or {}).get("type", "")).casefold() == "file"
+        ]
     except Exception:
         try:
             lines: list[str] = []
-            ftp.retrlines("NLST", lines.append)
-            remote_files = [Path(ln.strip()).name for ln in lines if ln.strip() not in (".", "..")]
+            command = "NLST" if not remote_dir else f"NLST {remote_dir}"
+            ftp.retrlines(command, lines.append)
+            return [
+                posixpath.basename(str(line).strip().rstrip("/"))
+                for line in lines
+                if str(line).strip() not in ("", ".", "..")
+            ]
         except Exception:
-            return local_file
+            return []
 
-    video_exts = {".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"}
-    is_vid = cur_ext in video_exts
 
-    siblings = []
-    for rf in remote_files:
-        rf_ext = Path(rf).suffix.lower()
-        if is_vid and rf_ext not in video_exts:
+def _list_remote_media_sibling_dirs(ftp: FTP, current_dir: str) -> list[str]:
+    """Find raw quality folders beside SoftSub/HardSub output folders."""
+    parent_dir = posixpath.dirname(current_dir.rstrip("/")) or "/"
+    current_name = posixpath.basename(current_dir.rstrip("/"))
+    raw_counterpart = re.sub(
+        r"(?i)[._\- ](?:softsub|hardsub)$",
+        "",
+        current_name,
+    ).strip(" ._-")
+
+    candidates: list[str] = []
+    try:
+        entries = ftp.mlsd(parent_dir)
+        for name, facts in entries:
+            if str((facts or {}).get("type", "")).casefold() != "dir":
+                continue
+            folder_name = posixpath.basename(str(name).rstrip("/"))
+            if folder_name:
+                candidates.append(folder_name)
+    except Exception:
+        # A number of FTP hosts disable MLSD. NLST may list both files and
+        # folders, so probe only media-looking candidates with CWD and always
+        # restore the original working directory before continuing the upload.
+        try:
+            original_dir = str(ftp.pwd() or current_dir).replace("\\", "/")
+            lines: list[str] = []
+            ftp.retrlines(f"NLST {parent_dir}", lines.append)
+            for line in lines:
+                folder_name = posixpath.basename(str(line).strip().rstrip("/"))
+                if not folder_name:
+                    continue
+                low = folder_name.casefold()
+                looks_like_quality = (
+                    folder_name.casefold() == raw_counterpart.casefold()
+                    or "fullhd" in low
+                    or "ebtv" in low
+                    or bool(re.search(r"(?i)(?:2160p|1080p|720p|480p)", folder_name))
+                )
+                if not looks_like_quality:
+                    continue
+                full_path = posixpath.join(parent_dir, folder_name).replace("\\", "/")
+                is_dir = False
+                try:
+                    ftp.cwd(full_path)
+                    is_dir = True
+                except Exception:
+                    is_dir = False
+                finally:
+                    try:
+                        ftp.cwd(original_dir)
+                    except Exception as restore_exc:
+                        raise RuntimeError(
+                            f"Could not restore FTP working directory to {original_dir}: {restore_exc}"
+                        ) from restore_exc
+                if is_dir:
+                    candidates.append(folder_name)
+        except Exception:
+            return []
+
+    ranked: list[tuple[int, str]] = []
+    for folder_name in candidates:
+        if not folder_name or folder_name.casefold() == current_name.casefold():
             continue
-        if not is_vid and rf_ext != cur_ext:
-            continue
-        if _EP_TAG_RE.search(rf):
-            siblings.append(rf)
+        low = folder_name.casefold()
+        if folder_name.casefold() == raw_counterpart.casefold():
+            ranked.append((0, folder_name))
+        elif (
+            "softsub" not in low
+            and "hardsub" not in low
+            and (
+                "fullhd" in low
+                or "ebtv" in low
+                or re.search(r"(?i)(?:2160p|1080p|720p|480p)", folder_name)
+            )
+        ):
+            ranked.append((1, folder_name))
 
-    if not siblings:
+    ranked.sort(key=lambda item: (item[0], item[1].casefold()))
+    result: list[str] = []
+    for _, name in ranked:
+        if name not in result:
+            result.append(name)
+        if len(result) >= 10:
+            break
+    return [posixpath.join(parent_dir, name).replace("\\", "/") for name in result]
+
+
+def _build_aligned_upload_filename(local_filename: str, template_filename: str) -> str | None:
+    """Apply the server's release naming pattern while preserving the local output type."""
+    current_match = _EP_TAG_RE.search(str(local_filename or ""))
+    template_match = _EP_TAG_RE.search(str(template_filename or ""))
+    if not current_match or not template_match:
+        return None
+    if int(current_match.group(1)) != int(template_match.group(1)):
+        return None
+
+    local_path = Path(local_filename)
+    template_path = Path(template_filename)
+    local_stem = local_path.stem
+    template_stem = template_path.stem
+    current_season = int(current_match.group(1))
+    current_episode = int(current_match.group(2))
+
+    # Keep SoftSub/HardSub/EBTV suffix from the local artifact, but take the
+    # release title/quality/codec token order from a known-good server sibling.
+    local_marker_match = re.search(
+        r"(?i)(?:[._\-](?:softsub|hardsub)(?:[._\-]ebtv)?|[._\-]ebtv)$",
+        local_stem,
+    )
+    local_output_marker = local_marker_match.group(0) if local_marker_match else ""
+
+    template_tail = template_stem[template_match.end():]
+    template_tail = re.sub(
+        r"(?i)(?:[._\-](?:softsub|hardsub)(?:[._\-]ebtv)?|[._\-]ebtv)$",
+        "",
+        template_tail,
+    )
+    aligned_stem = (
+        template_stem[:template_match.start()]
+        + f"S{current_season:02d}E{current_episode:02d}"
+        + template_tail
+        + local_output_marker
+    )
+    aligned_filename = f"{aligned_stem}{local_path.suffix}"
+    return aligned_filename if aligned_filename.casefold() != local_path.name.casefold() else None
+
+
+def _auto_align_filename_with_server_siblings(ftp: FTP, local_file: Path) -> Path:
+    """
+    Correct the local upload name from the naming convention already used on the
+    destination server. For SoftSub/HardSub output folders, also inspect their
+    raw EBTV/FullHD sibling quality folders, because the output folder is often
+    empty before its first upload.
+    """
+    import logging
+
+    local_file = Path(local_file)
+    current_match = _EP_TAG_RE.search(local_file.name)
+    if not current_match:
         return local_file
 
-    template_name = sorted(siblings)[-1]
-    template_stem = Path(template_name).stem
+    try:
+        current_dir = str(ftp.pwd() or "").replace("\\", "/").rstrip("/") or "/"
+    except Exception:
+        current_dir = ""
 
-    def _replace_ep(match: re.Match) -> str:
-        s_num = int(match.group(1))
-        return f"S{s_num:02d}E{cur_ep_num:02d}"
+    candidate_dirs: list[str | None] = [None]  # Current working directory first.
+    if current_dir:
+        candidate_dirs.extend(_list_remote_media_sibling_dirs(ftp, current_dir))
 
-    aligned_stem = _EP_TAG_RE.sub(_replace_ep, template_stem, count=1)
-    aligned_name = f"{aligned_stem}{local_file.suffix}"
+    video_exts = {".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm"}
+    is_video = local_file.suffix.casefold() in video_exts
+    current_season = int(current_match.group(1))
+    best_template: tuple[int, int, str] | None = None
 
-    if aligned_name != local_file.name:
-        new_local_path = local_file.with_name(aligned_name)
-        try:
-            if not new_local_path.exists():
-                local_file.rename(new_local_path)
-                logging.info(f"✏️ [AUTO-RENAME ON UPLOAD] '{local_file.name}' -> '{aligned_name}'")
-                return new_local_path
-        except Exception as e:
-            logging.warning(f"Could not rename local file before upload: {e}")
+    for dir_priority, remote_dir in enumerate(candidate_dirs):
+        remote_names = _list_remote_files_for_alignment(ftp, remote_dir)
+        siblings: list[tuple[int, str]] = []
+        for remote_name in remote_names:
+            remote_ext = Path(remote_name).suffix.casefold()
+            if is_video and remote_ext not in video_exts:
+                continue
+            if not is_video and remote_ext != local_file.suffix.casefold():
+                continue
+            match = _EP_TAG_RE.search(remote_name)
+            if not match or int(match.group(1)) != current_season:
+                continue
+            siblings.append((int(match.group(2)), remote_name))
 
-    return local_file
+        if siblings:
+            episode_number, template_name = max(
+                siblings,
+                key=lambda item: (item[0], item[1].casefold()),
+            )
+            best_template = (dir_priority, episode_number, template_name)
+            break
+
+    if not best_template:
+        return local_file
+
+    aligned_name = _build_aligned_upload_filename(local_file.name, best_template[2])
+    if not aligned_name:
+        return local_file
+
+    aligned_path = local_file.with_name(aligned_name)
+    if aligned_path.exists():
+        logging.warning(
+            "Server naming template resolved to %s, but that local path already exists; "
+            "leaving the new file name unchanged.",
+            aligned_path,
+        )
+        return local_file
+
+    try:
+        local_file.rename(aligned_path)
+        logging.info(
+            "✏️ [AUTO-RENAME ON UPLOAD] '%s' -> '%s' (template=%s, remote_dir_priority=%s)",
+            local_file.name,
+            aligned_path.name,
+            best_template[2],
+            best_template[0],
+        )
+        return aligned_path
+    except Exception:
+        logging.exception("Could not apply server naming template to %s", local_file)
+        return local_file
 
 
 def _upload_single_file_with_retry(

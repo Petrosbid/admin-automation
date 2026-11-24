@@ -183,11 +183,30 @@ class AutomationService:
             text,
             flags=re.IGNORECASE
         )
+        # Anime releases often encode the episode as [01] or (01), not SxxEyy.
+        # In a known season directory this numeric token is a safe episode fallback.
+        bracketed = re.findall(r"[\[(]\s*(\d{1,3})(?:v\d)?\s*[\])]", cleaned)
+        for token in reversed(bracketed):
+            value = int(token)
+            if 0 <= value <= 999:
+                return value
+
         m = re.search(r"(?:[Ee][Pp]?(?:isode)?[\s._\-]*|\s-\s|[\s._\-\[]E)(\d{1,3})(?:v\d)?(?:[\s._\-\]\[]|$)", cleaned)
         if m:
             val = int(m.group(1))
             if 0 <= val <= 999:
                 return val
+
+        # Final bare episode token immediately before release metadata, e.g.
+        # Show.05.1080p.WEB-DL or Show 05 [HEVC].
+        trailing_tokens = re.findall(
+            r"(?:^|[ ._\-])(\d{1,3})(?:v\d)?(?=\s*(?:\[|\())",
+            cleaned,
+        )
+        if trailing_tokens:
+            value = int(trailing_tokens[-1])
+            if 0 <= value <= 999:
+                return value
         return None
 
     @staticmethod
@@ -1158,9 +1177,16 @@ class AutomationService:
                 for vid in videos_in_sub:
                     vid_ep = cls.extract_episode_tag(vid.name, fallback_season=fallback_s)
                     if plan.season_ep_tag:
+                        target_ep_num = cls.extract_episode_number_only(plan.season_ep_tag)
+                        vid_ep_num = cls.extract_episode_number_only(vid.name)
                         if vid_ep and vid_ep.upper() != plan.season_ep_tag.upper():
                             continue
-                        if not vid_ep and len(videos_in_sub) > 1:
+                        if not vid_ep and vid_ep_num is not None and target_ep_num is not None:
+                            if vid_ep_num != target_ep_num:
+                                continue
+                        elif not vid_ep and vid_ep_num is None and len(videos_in_sub) > 1:
+                            # Never fan out one untagged source video to every episode
+                            # when multiple raw episodes exist in the same quality folder.
                             continue
 
                     soft_out_dir = target_dir / f"{sub.name}-SoftSub"
@@ -1653,6 +1679,14 @@ class AutomationService:
             server_id: str | None = None,
             keep_old_subs: bool = True,
     ) -> Path:
+        raw_video = Path(raw_video).expanduser().resolve()
+        output_file = Path(output_file).expanduser().resolve()
+        if not raw_video.is_file() or raw_video.stat().st_size <= 0:
+            raise FileNotFoundError(f"ویدئوی خام برای SoftSub پیدا نشد یا خالی است: {raw_video}")
+        fa_sub = MKVService.validate_subtitle_file(fa_sub, "زیرنویس فارسی SoftSub")
+        if en_sub is not None:
+            en_sub = MKVService.validate_subtitle_file(en_sub, "زیرنویس انگلیسی SoftSub")
+
         output_file.parent.mkdir(parents=True, exist_ok=True)
         res_path = await MKVService.merge_softsub(
             video_path=raw_video,
@@ -1663,8 +1697,11 @@ class AutomationService:
             custom_brand=brand,
             sync_mode="none",
             sync_offset_ms=0,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            require_fa_sub=True,
         )
+        if not res_path.is_file() or res_path.stat().st_size <= 0:
+            raise RuntimeError(f"خروجی SoftSub معتبر ساخته نشد: {res_path}")
         if res_path.exists():
             try:
                 from services.daily_activity_service import DailyActivityService
@@ -1688,6 +1725,19 @@ class AutomationService:
         return res_path
 
 
+    @staticmethod
+    def _is_english_subtitle_filename(filename: str) -> bool:
+        stem = Path(str(filename or "")).stem.casefold().strip()
+        if stem.startswith(("en_", "eng_", "english_")) or stem in {"en", "eng", "english"}:
+            return True
+        # Treat a language tag as English only at the filename tail (optionally
+        # followed by common subtitle attributes), not when "English" is part of
+        # a legitimate media title such as "The English Teacher".
+        return bool(re.search(
+            r"(?:^|[._-])(?:en|eng|english)(?:[._-](?:forced|default|sdh|cc|hi|v\d+))?$",
+            stem,
+        ))
+
     @classmethod
     def collect_all_local_fa_subtitles_in_dir(cls, base_dir: Path, fa_dest_dir: Path) -> list[Path]:
         from services.subtitle_service import SubtitleService
@@ -1700,7 +1750,7 @@ class AutomationService:
             base_dir,
         ]
         for sub in base_dir.iterdir():
-            if sub.is_dir() and sub.name.lower() not in ("en", "softsub", "hardsub") and not sub.name.lower().endswith(("-softsub", "-hardsub")):
+            if sub.is_dir() and sub.name.lower() not in ("en", "eng", "english", "softsub", "hardsub") and not sub.name.lower().endswith(("-softsub", "-hardsub")):
                 if sub not in search_dirs:
                     search_dirs.append(sub)
 
@@ -1723,7 +1773,7 @@ class AutomationService:
                 if not f.is_file() or f.suffix.lower() not in (".srt", ".ass", ".ssa"):
                     continue
                 low_name = f.name.lower()
-                if low_name.startswith(("_temp_", "_soft_clean_", "en_")) or low_name.endswith((".en.srt", ".en.ass", "_en.srt")):
+                if low_name.startswith(("_temp_", "_soft_clean_")) or cls._is_english_subtitle_filename(low_name):
                     continue
                 res_str = str(f.resolve())
                 if res_str not in seen:
@@ -1734,6 +1784,13 @@ class AutomationService:
     @classmethod
     def find_local_fa_subtitles(cls, plan: AutomationPlan) -> list[Path]:
         all_subs = cls.collect_all_local_fa_subtitles_in_dir(plan.base_dir, plan.fa_sub_dest_dir)
+        validated_subs: list[Path] = []
+        for subtitle_path in all_subs:
+            try:
+                validated_subs.append(MKVService.validate_subtitle_file(subtitle_path, "زیرنویس فارسی"))
+            except (OSError, ValueError) as exc:
+                logging.warning("Skipping invalid Persian subtitle candidate %s: %s", subtitle_path, exc)
+        all_subs = validated_subs
         if not plan.is_series or not plan.season_ep_tag:
             return all_subs
 
@@ -1918,6 +1975,16 @@ class AutomationService:
         server_id: str | None = None,
     ) -> Path:
         ht.output_dir.mkdir(parents=True, exist_ok=True)
+        if ht.mode == "hardsub_srt":
+            fa_sub = MKVService.validate_subtitle_file(fa_sub, "زیرنویس فارسی HardSub")
+        needs_english_track = (
+            ht.mode == "encode_ass"
+            or bool(fa_sub and fa_sub.suffix.casefold() in (".ass", ".ssa"))
+        )
+        if needs_english_track and en_sub is not None:
+            en_sub = MKVService.validate_subtitle_file(en_sub, "زیرنویس انگلیسی HardSub")
+        elif not needs_english_track:
+            en_sub = None
         if ht.mode == "encode_ass":
             logo_ass = ht.ass_logo_path or cls.get_movie_ass_logo_path()
             if not logo_ass.exists():
@@ -1952,6 +2019,8 @@ class AutomationService:
                 progress_callback=progress_callback
             )
 
+        if not res_path.is_file() or res_path.stat().st_size <= 0:
+            raise RuntimeError(f"خروجی HardSub معتبر ساخته نشد: {res_path}")
         if res_path.exists():
             try:
                 from services.daily_activity_service import DailyActivityService

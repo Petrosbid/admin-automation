@@ -1313,9 +1313,24 @@ async def _execute_smart_automation_batch(
             else None
         )
 
+        fa_validation_error = ""
+        if fa_sub is not None:
+            try:
+                fa_sub = MKVService.validate_subtitle_file(fa_sub, "زیرنویس فارسی")
+            except (OSError, ValueError) as exc:
+                fa_validation_error = str(exc)
+                fa_sub = None
+        if en_sub is not None:
+            try:
+                en_sub = MKVService.validate_subtitle_file(en_sub, "زیرنویس انگلیسی")
+            except (OSError, ValueError) as exc:
+                logging.warning("Skipping invalid English subtitle for %s: %s", key, exc)
+                en_sub = None
+
         if not fa_sub or not fa_sub.exists():
+            detail = f" علت: {fa_validation_error}" if fa_validation_error else ""
             skipped_items.append(
-                f"{key}: زیرنویس فارسی معتبر پیدا نشد؛ SoftSub/HardSub این مورد اجرا نشد."
+                f"{key}: زیرنویس فارسی معتبر پیدا نشد؛ SoftSub/HardSub این مورد اجرا نشد.{detail}"
             )
             continue
 
@@ -4069,11 +4084,67 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
     custom_output_dir = data.get("custom_output_dir")
     brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
 
+    fa_error = ""
+    if fa_sub is not None:
+        try:
+            fa_sub = MKVService.validate_subtitle_file(fa_sub, "زیرنویس فارسی")
+        except (OSError, ValueError) as exc:
+            fa_error = str(exc)
+            fa_sub = None
+    if en_sub is not None:
+        try:
+            en_sub = MKVService.validate_subtitle_file(en_sub, "زیرنویس انگلیسی")
+        except (OSError, ValueError):
+            en_sub = None
+
+    target_episode_tags = {
+        tag for video in target_videos
+        if (tag := AutomationService.extract_episode_tag(
+            video.name,
+            fallback_season=AutomationService.extract_season_num_from_dir(video.parent),
+        ))
+    }
     scheduled_ids = []
     total_vids = len(target_videos)
 
     for idx, vid in enumerate(target_videos, start=1):
         base_stem = _build_numbered_stem(custom_name, vid, idx, total_vids)
+        fallback_season = AutomationService.extract_season_num_from_dir(vid.parent)
+        video_ep = AutomationService.extract_episode_tag(vid.name, fallback_season=fallback_season)
+        video_fa_sub = fa_sub
+        video_en_sub = en_sub
+        expected_batch_episode = (
+            next(iter(target_episode_tags)) if len(target_episode_tags) == 1 else None
+        )
+        if video_fa_sub:
+            sub_ep = AutomationService.extract_episode_tag(video_fa_sub.name, fallback_season=fallback_season)
+            if video_ep:
+                if sub_ep and sub_ep != video_ep:
+                    video_fa_sub = None
+                elif not sub_ep and len(target_episode_tags) > 1:
+                    video_fa_sub = None
+            elif len(target_episode_tags) > 1:
+                video_fa_sub = None
+            elif not target_episode_tags and len(target_videos) > 1:
+                # Multiple videos with no reliable episode identity must not
+                # share one subtitle by guesswork.
+                video_fa_sub = None
+            elif expected_batch_episode and sub_ep and sub_ep != expected_batch_episode:
+                video_fa_sub = None
+
+        if video_en_sub:
+            en_ep = AutomationService.extract_episode_tag(video_en_sub.name, fallback_season=fallback_season)
+            if video_ep:
+                if en_ep and en_ep != video_ep:
+                    video_en_sub = None
+                elif not en_ep and len(target_episode_tags) > 1:
+                    video_en_sub = None
+            elif len(target_episode_tags) > 1:
+                video_en_sub = None
+            elif not target_episode_tags and len(target_videos) > 1:
+                video_en_sub = None
+            elif expected_batch_episode and en_ep and en_ep != expected_batch_episode:
+                video_en_sub = None
 
         if custom_output_dir:
             out_dir = Path(custom_output_dir)
@@ -4085,7 +4156,7 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
             soft_dir = dirs["softsub"]
             hard_dir = dirs["hardsub"]
 
-        if mode in ("softsub", "both") and (fa_sub or en_sub):
+        if mode in ("softsub", "both") and video_fa_sub and video_fa_sub.is_file():
             soft_ext = ".mp4" if vid.suffix.lower() == ".mp4" else ".mkv"
             soft_out = soft_dir / f"{base_stem}.SoftSub.EBTV{soft_ext}"
             t_soft = await queue_engine.add_task(
@@ -4094,20 +4165,24 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
                 MKVService.merge_softsub,
                 vid,
                 soft_out,
-                fa_sub,
-                en_sub,
+                video_fa_sub,
+                video_en_sub,
                 True,
                 brand,
                 sync_mode,
-                sync_offset_ms
+                sync_offset_ms,
+                require_fa_sub=True,
             )
             scheduled_ids.append(f"📎 SoftSub (`{soft_out.name}` در `{soft_dir.name}/`): `{t_soft.task_id}`")
+        elif mode in ("softsub", "both"):
+            reason = fa_error or "زیرنویس فارسی این قسمت پیدا نشد یا با شماره قسمت تطبیق ندارد."
+            scheduled_ids.append(f"⏭ SoftSub برای `{vid.name}` اجرا نشد: {reason}")
 
-        if mode in ("hardsub", "both") and chosen_preset:
+        if mode in ("hardsub", "both") and chosen_preset and video_fa_sub and video_fa_sub.is_file():
             hard_out = hard_dir / f"{base_stem}.HardSub.EBTV.mp4"
-            primary_sub = fa_sub
-            is_fa_ass = bool(fa_sub and fa_sub.suffix.lower() in (".ass", ".ssa"))
-            secondary_sub = en_sub if is_fa_ass else None
+            primary_sub = video_fa_sub
+            is_fa_ass = bool(video_fa_sub and video_fa_sub.suffix.lower() in (".ass", ".ssa"))
+            secondary_sub = video_en_sub if is_fa_ass else None
 
             t_hard = await queue_engine.add_task(
                 "handbrake",
@@ -4123,7 +4198,12 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
                 sync_offset_ms
             )
             scheduled_ids.append(f"🔥 HardSub (`{hard_out.name}` در `{hard_dir.name}/`): `{t_hard.task_id}`")
+        elif mode in ("hardsub", "both") and chosen_preset:
+            reason = fa_error or "زیرنویس فارسی این قسمت پیدا نشد یا با شماره قسمت تطبیق ندارد."
+            scheduled_ids.append(f"⏭ HardSub برای `{vid.name}` اجرا نشد: {reason}")
 
+    if not scheduled_ids:
+        scheduled_ids.append("⏭ هیچ فایل معتبری برای اجرای SoftSub/HardSub انتخاب نشد.")
     return scheduled_ids
 
 

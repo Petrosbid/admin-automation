@@ -105,6 +105,81 @@ class MKVService:
             return False
         return explicit_english_language or explicit_english_name
 
+
+    @staticmethod
+    def validate_subtitle_file(subtitle_path: Path | str | None, label: str = "زیرنویس") -> Path:
+        """Reject missing, empty, malformed, or non-text subtitle inputs."""
+        if subtitle_path is None:
+            raise ValueError(f"{label} انتخاب نشده است.")
+        path = Path(subtitle_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"{label} پیدا نشد: {path}")
+        if path.suffix.casefold() not in {".srt", ".ass", ".ssa"}:
+            raise ValueError(f"فرمت {label} پشتیبانی نمی‌شود: {path.suffix or '(بدون پسوند)'}")
+        content = SubtitleService.read_subtitle_safe(path)
+        if not content or not content.strip():
+            raise ValueError(f"{label} خالی است: {path.name}")
+        if path.suffix.casefold() == ".srt":
+            cue_pattern = (
+                r"(?m)^\s*\d{2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*"
+                r"\d{2}:\d{2}:\d{2}[,.]\d{1,3}"
+            )
+            if not re.search(cue_pattern, content):
+                raise ValueError(f"{label} از نوع SRT هیچ تایم‌کد معتبری ندارد: {path.name}")
+        elif not re.search(r"(?im)^\s*Dialogue\s*:", content):
+            raise ValueError(f"{label} از نوع ASS/SSA هیچ خط Dialogue ندارد: {path.name}")
+        return path
+
+    @classmethod
+    async def _verify_muxed_subtitle_languages(
+        cls,
+        output_path: Path,
+        *,
+        require_fa_sub: bool = False,
+        require_en_sub: bool = False,
+        fa_lang: str = "per",
+        en_lang: str = "eng",
+    ) -> list[dict]:
+        if not output_path.is_file() or output_path.stat().st_size <= 0:
+            raise RuntimeError(f"فایل خروجی سافت‌ساب ساخته نشده یا خالی است: {output_path}")
+        tracks = await cls.list_subtitle_tracks(output_path)
+        if not tracks and (require_fa_sub or require_en_sub):
+            raise RuntimeError(f"خروجی {output_path.name} هیچ ترک زیرنویسی ندارد؛ فایل رد شد.")
+
+        def values(track: dict) -> set[str]:
+            return {
+                str(track.get(key) or "").strip().casefold()
+                for key in ("language", "language_ietf", "track_name")
+                if str(track.get(key) or "").strip()
+            }
+
+        fa_aliases = {"fa", "fas", "per", "persian", "farsi", str(fa_lang or "").casefold()}
+        en_aliases = {"en", "eng", "english", str(en_lang or "").casefold()}
+
+        def matches(track: dict, aliases: set[str]) -> bool:
+            return any(
+                value in aliases or value.split("-", 1)[0] in aliases
+                for value in values(track)
+            )
+
+        if require_fa_sub and not any(matches(track, fa_aliases) for track in tracks):
+            found = ", ".join(
+                str(track.get("language") or track.get("language_ietf") or "und")
+                for track in tracks
+            ) or "هیچ‌کدام"
+            raise RuntimeError(
+                f"ترک فارسی در {output_path.name} تأیید نشد (زبان‌ها: {found}). فایل ناقص رد شد."
+            )
+        if require_en_sub and not any(matches(track, en_aliases) for track in tracks):
+            found = ", ".join(
+                str(track.get("language") or track.get("language_ietf") or "und")
+                for track in tracks
+            ) or "هیچ‌کدام"
+            raise RuntimeError(
+                f"ترک انگلیسی در {output_path.name} تأیید نشد (زبان‌ها: {found}). فایل ناقص رد شد."
+            )
+        return tracks
+
     @staticmethod
     def subtitle_extension_for_codec(codec: str) -> str:
         value = str(codec or "").casefold()
@@ -540,8 +615,22 @@ class MKVService:
         custom_brand: str | None = None,
         sync_mode: str = "none",
         sync_offset_ms: int = 0,
-        progress_callback: Callable[[str], None] = None
+        progress_callback: Callable[[str], None] = None,
+        require_fa_sub: bool = False,
+        require_en_sub: bool = False,
     ) -> Path:
+        video_path = Path(video_path).expanduser().resolve()
+        output_path = Path(output_path).expanduser().resolve()
+        if not video_path.is_file() or video_path.stat().st_size <= 0:
+            raise FileNotFoundError(f"فایل ویدئوی ورودی پیدا نشد یا خالی است: {video_path}")
+        if require_fa_sub and fa_sub_path is None:
+            raise ValueError("برای ساخت SoftSub معتبر، زیرنویس فارسی الزامی است.")
+        if require_en_sub and en_sub_path is None:
+            raise ValueError("زیرنویس انگلیسی برای این خروجی الزامی است.")
+        if fa_sub_path is not None:
+            fa_sub_path = cls.validate_subtitle_file(fa_sub_path, "زیرنویس فارسی")
+        if en_sub_path is not None:
+            en_sub_path = cls.validate_subtitle_file(en_sub_path, "زیرنویس انگلیسی")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         mkvmerge_bin = cls._get_mkvmerge_bin()
         ffmpeg_bin = cls._get_ffmpeg_bin()
@@ -551,13 +640,15 @@ class MKVService:
         fa_default = bool(cfg.get("branding", "fa_default_flag", True))
         fa_forced = bool(cfg.get("branding", "fa_forced_flag", True))
 
+        if output_path.suffix.casefold() == ".mp4" and not ffmpeg_bin:
+            raise FileNotFoundError("برای ساخت SoftSub با پسوند MP4، نصب/تنظیم FFmpeg الزامی است.")
         uid = uuid.uuid4().hex[:6]
         clean_fa_sub: Path | None = None
         clean_en_sub: Path | None = None
+        staging_output_path = output_path.with_name(f"_temp_softsub_{uid}{output_path.suffix}")
 
         try:
-            if fa_sub_path and Path(fa_sub_path).exists():
-                fa_sub_path = Path(fa_sub_path)
+            if fa_sub_path is not None:
                 clean_fa_sub = output_path.with_name(f"_soft_clean_fa_{uid}{fa_sub_path.suffix}")
                 clean_fa_sub.write_text(SubtitleService.read_subtitle_safe(fa_sub_path), encoding="utf-8", newline="\n")
                 SubtitleService.normalize_subtitle_file(clean_fa_sub)
@@ -572,8 +663,7 @@ class MKVService:
                 elif sync_mode == "manual" and sync_offset_ms != 0 and clean_fa_sub.suffix.lower() == ".srt":
                     SubtitleService.shift_srt_time(clean_fa_sub, clean_fa_sub, sync_offset_ms)
 
-            if en_sub_path and Path(en_sub_path).exists():
-                en_sub_path = Path(en_sub_path)
+            if en_sub_path is not None:
                 clean_en_sub = output_path.with_name(f"_soft_clean_en_{uid}{en_sub_path.suffix}")
                 clean_en_sub.write_text(SubtitleService.read_subtitle_safe(en_sub_path), encoding="utf-8", newline="\n")
                 SubtitleService.normalize_subtitle_file(clean_en_sub)
@@ -595,11 +685,11 @@ class MKVService:
                             kept_embedded_en_id = t.get("id")
                             break
 
-            if output_path.suffix.lower() == ".mp4" and ffmpeg_bin:
-                return await cls._merge_softsub_mp4_ffmpeg(
+            if output_path.suffix.lower() == ".mp4":
+                await cls._merge_softsub_mp4_ffmpeg(
                     ffmpeg_bin=ffmpeg_bin,
                     video_path=video_path,
-                    output_path=output_path,
+                    output_path=staging_output_path,
                     clean_fa_sub=clean_fa_sub,
                     clean_en_sub=clean_en_sub,
                     kept_embedded_en_track_id=kept_embedded_en_id,
@@ -610,11 +700,20 @@ class MKVService:
                     fa_forced=fa_forced,
                     progress_callback=progress_callback
                 )
+                await cls._verify_muxed_subtitle_languages(
+                    staging_output_path,
+                    require_fa_sub=require_fa_sub,
+                    require_en_sub=require_en_sub,
+                    fa_lang=fa_lang,
+                    en_lang=en_lang,
+                )
+                staging_output_path.replace(output_path)
+                return output_path
 
             cmd = [
                 mkvmerge_bin,
                 "--ui-language", "en",
-                "--output", str(output_path),
+                "--output", str(staging_output_path),
                 "--title", brand,
             ]
 
@@ -690,13 +789,22 @@ class MKVService:
                     f"Input video: {video_path}\n"
                     f"Persian subtitle: {clean_fa_sub or '(none)'}\n"
                     f"English subtitle: {clean_en_sub or '(none)'}\n"
-                    f"Output: {output_path}\n"
+                    f"Output: {staging_output_path}\n"
                     f"mkvmerge output:\n{diagnostic}"
                 )
 
+            await cls._verify_muxed_subtitle_languages(
+                staging_output_path,
+                require_fa_sub=require_fa_sub,
+                require_en_sub=require_en_sub,
+                fa_lang=fa_lang,
+                en_lang=en_lang,
+            )
+            staging_output_path.replace(output_path)
             return output_path
 
         finally:
+            staging_output_path.unlink(missing_ok=True)
             if clean_fa_sub and clean_fa_sub.exists():
                 clean_fa_sub.unlink(missing_ok=True)
             if clean_en_sub and clean_en_sub.exists():

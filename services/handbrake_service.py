@@ -183,6 +183,22 @@ class HandBrakeService:
         ۲. اگر فایل ورودی زیرنویس از نوع .srt باشد:
            - بولد و زرد (#fbff00) شده، روی تصویر هاردساب (Burn-in) می‌شود و هیچ زیرنویس انگلیسی‌ای به آن اضافه نمی‌گردد.
         """
+        video_path = Path(video_path).expanduser().resolve()
+        output_media_path = Path(output_media_path).expanduser().resolve()
+        if not video_path.is_file() or video_path.stat().st_size <= 0:
+            raise FileNotFoundError(f"ویدئوی ورودی HardSub پیدا نشد یا خالی است: {video_path}")
+        primary_srt_path = MKVService.validate_subtitle_file(
+            primary_srt_path,
+            "زیرنویس اصلی برای Burn-in",
+        )
+        if secondary_en_srt_path is not None:
+            secondary_en_srt_path = MKVService.validate_subtitle_file(
+                secondary_en_srt_path,
+                "زیرنویس انگلیسی تکمیلی",
+            )
+        if not Path(preset_json_path).is_file():
+            raise FileNotFoundError(f"فایل Preset مربوط به HandBrake پیدا نشد: {preset_json_path}")
+
         output_media_path.parent.mkdir(parents=True, exist_ok=True)
         unique_tag = str(uuid.uuid4())[:6]
         working_sub = None
@@ -190,11 +206,12 @@ class HandBrakeService:
         temp_en_srt = output_media_path.with_name(f"_temp_en_soft_{unique_tag}.srt")
         temp_mkv = output_media_path.with_name(f"_temp_hb_mux_{unique_tag}.mkv")
         temp_hb_encoded = output_media_path.with_name(f"_temp_hb_enc_{unique_tag}{output_media_path.suffix}")
+        temp_final_output = output_media_path.with_name(f"_temp_hb_final_{unique_tag}{output_media_path.suffix}")
         brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
         handbrake_bin = cfg.get("paths", "handbrake_bin")
 
         try:
-            has_primary_sub = bool(primary_srt_path and Path(primary_srt_path).exists())
+            has_primary_sub = True
             burn_in_sub_path: Path | None = None
             is_ass_format = False
 
@@ -249,14 +266,21 @@ class HandBrakeService:
                 en_sub_path=None,
                 keep_old_subs=False,
                 custom_brand=brand,
-                sync_mode="none"
+                sync_mode="none",
+                require_fa_sub=True,
             )
+            mux_subtitle_tracks = await MKVService.list_subtitle_tracks(temp_mkv)
+            if len(mux_subtitle_tracks) != 1:
+                raise RuntimeError(
+                    "فایل واسط HandBrake باید دقیقاً یک ترک زیرنویس اصلی داشته باشد؛ "
+                    f"تعداد فعلی: {len(mux_subtitle_tracks)}"
+                )
             audio_cli_flags = await cls._build_all_audio_cli_flags(
                 video_path=video_path,
                 target_resolution=target_resolution
             )
-            # اگر قرار است بعد از انکود، زیرنویس انگلیسی به صورت سافت‌ساب اضافه شود، خروجی HandBrake را در فایل موقت بریز
-            hb_target_out = temp_hb_encoded if (is_ass_format and ready_en_srt) else output_media_path
+            # همیشه ابتدا در فایل موقت انکود کن؛ خروجی ناقص نباید جایگزین نسخه قبلی شود.
+            hb_target_out = temp_hb_encoded
 
             cmd = [
                 handbrake_bin,
@@ -271,14 +295,10 @@ class HandBrakeService:
                 max_w, max_h = cls.RESOLUTION_LIMITS[target_resolution]
                 cmd.extend(["--maxWidth", max_w, "--maxHeight", max_h])
 
-            if burn_in_sub_path is not None:
-                # اجبار قطعی HandBrake به سوزاندن (Burn-in) ترک شماره ۱ روی تصویر
-                cmd.extend([
-                    "--subtitle", "1",
-                    "--subtitle-burned=1",
-                ])
-            else:
-                cmd.extend(["--subtitle", "none"])
+            if burn_in_sub_path is None:
+                raise RuntimeError("زیرنویس اصلی برای Burn-in آماده نشده است؛ انکود متوقف شد.")
+            # فایل واسط دقیقاً یک ترک زیرنویس دارد؛ انتخاب ترک 1 و Burn-in اجباری است.
+            cmd.extend(["--subtitle", "1", "--subtitle-burned=1"])
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -302,32 +322,40 @@ class HandBrakeService:
             await proc.wait()
             if proc.returncode != 0:
                 raise RuntimeError(f"HandBrakeCLI exited with code {proc.returncode}")
+            if not temp_hb_encoded.is_file() or temp_hb_encoded.stat().st_size <= 0:
+                raise RuntimeError(
+                    "HandBrake با کد صفر پایان یافت اما فایل خروجی معتبر تولید نکرد؛ "
+                    "هیچ فایل ناقصی منتشر یا آپلود نمی‌شود."
+                )
 
-            # مرحله ۲: اگر فایل ASS بوده (مثل movie.ass) و زیرنویس انگلیسی داریم،
-            # اکنون که movie.ass روی تصویر سوزانده (Burn-in) شده، زیرنویس انگلیسی را به صورت سافت‌ساب به MP4 اضافه کن!
+            # فقط پس از تأیید خروجی HandBrake، فایل نهایی منتشر می‌شود.
             if is_ass_format and ready_en_srt and ready_en_srt.exists():
                 if progress_callback:
                     progress_callback("در حال افزودن زیرنویس انگلیسی به صورت سافت‌ساب به فایل انکود شده...")
                 await MKVService.merge_softsub(
                     video_path=temp_hb_encoded,
-                    output_path=output_media_path,
+                    output_path=temp_final_output,
                     fa_sub_path=None,
                     en_sub_path=ready_en_srt,
                     keep_old_subs=False,
                     custom_brand=brand,
-                    sync_mode="none"
+                    sync_mode="none",
+                    require_en_sub=True,
                 )
+                temp_final_output.replace(output_media_path)
             elif output_media_path.suffix.lower() == ".mkv":
-                tagged_mkv = output_media_path.with_name(f"_tagged_{unique_tag}_{output_media_path.name}")
                 await MKVService.merge_softsub(
-                    video_path=output_media_path,
-                    output_path=tagged_mkv,
+                    video_path=temp_hb_encoded,
+                    output_path=temp_final_output,
                     keep_old_subs=False,
-                    custom_brand=brand
+                    custom_brand=brand,
                 )
-                output_media_path.unlink(missing_ok=True)
-                tagged_mkv.rename(output_media_path)
+                temp_final_output.replace(output_media_path)
+            else:
+                temp_hb_encoded.replace(output_media_path)
 
+            if not output_media_path.is_file() or output_media_path.stat().st_size <= 0:
+                raise RuntimeError("فایل نهایی HardSub پس از مرحله انتشار پیدا نشد یا خالی است.")
             return output_media_path
 
         finally:
@@ -337,3 +365,4 @@ class HandBrakeService:
             temp_en_srt.unlink(missing_ok=True)
             temp_mkv.unlink(missing_ok=True)
             temp_hb_encoded.unlink(missing_ok=True)
+            temp_final_output.unlink(missing_ok=True)
