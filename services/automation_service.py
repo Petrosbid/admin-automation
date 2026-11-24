@@ -1683,6 +1683,10 @@ class AutomationService:
         output_file = Path(output_file).expanduser().resolve()
         if not raw_video.is_file() or raw_video.stat().st_size <= 0:
             raise FileNotFoundError(f"ویدئوی خام برای SoftSub پیدا نشد یا خالی است: {raw_video}")
+        if raw_video == output_file:
+            raise RuntimeError(
+                "مسیر خروجی SoftSub با فایل خام یکسان است؛ برای جلوگیری از جایگزینی فایل اصلی، عملیات متوقف شد."
+            )
         fa_sub = MKVService.validate_subtitle_file(fa_sub, "زیرنویس فارسی SoftSub")
         if en_sub is not None:
             en_sub = MKVService.validate_subtitle_file(en_sub, "زیرنویس انگلیسی SoftSub")
@@ -1702,6 +1706,33 @@ class AutomationService:
         )
         if not res_path.is_file() or res_path.stat().st_size <= 0:
             raise RuntimeError(f"خروجی SoftSub معتبر ساخته نشد: {res_path}")
+
+        # Re-verify the exact file that will be recorded and uploaded.
+        # For MP4 this decodes each required text track back to SRT and
+        # rejects empty subtitle streams before an upload task is queued.
+        if res_path.suffix.casefold() in {".mp4", ".m4v", ".mov"}:
+            verified_tracks = await MKVService._verify_muxed_subtitle_languages(
+                res_path,
+                require_fa_sub=True,
+                fa_lang=cfg.get("branding", "sub_fa_language", "per"),
+                en_lang=cfg.get("branding", "sub_en_language", "eng"),
+            )
+            logging.info(
+                "[SOFTSUB VERIFIED] source=%s output=%s bytes=%d subtitle_tracks=%s",
+                raw_video,
+                res_path,
+                res_path.stat().st_size,
+                [
+                    {
+                        "stream": track.get("id"),
+                        "language": track.get("language"),
+                        "codec": track.get("codec"),
+                        "default": track.get("default_track"),
+                    }
+                    for track in verified_tracks
+                ],
+            )
+
         if res_path.exists():
             try:
                 from services.daily_activity_service import DailyActivityService
