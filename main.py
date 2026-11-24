@@ -61,6 +61,7 @@ RELOADABLE_MODULES_ORDER = [
     "services.downloader_service",
     "services.automation_service",
     "services.monitor_service",
+    "services.nyaa_release",
     "services.eztv_tracker_service",
     "bot.keyboards",
     "bot.queue_handlers",
@@ -214,7 +215,7 @@ async def main():
         monitor_mod.monitor_service.start(bot)
         logging.info("Monitor service started.")
         eztv_mod.eztv_tracker_service.start(bot)
-        logging.info("EZTV RSS tracker started.")
+        logging.info("EZTV and Nyaa RSS tracker started.")
 
         console_task = asyncio.create_task(console_key_listener(dp, bot))
 

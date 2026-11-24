@@ -14,6 +14,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from core.config_loader import cfg
 from services.eztv_tracker_service import eztv_tracker_service
 from services.daily_activity_service import DailyActivityService
+from services.nyaa_release import DEFAULT_FEED_URL
 
 router = Router()
 
@@ -32,20 +33,28 @@ DAY_OPTIONS = [
 
 QUALITY_LABELS = {
     "fullhd_h264": "FullHD H.264",
+    "fullhd_x265": "1080p x265",
     "480p": "480p",
     "2160p": "2160p",
 }
 
 DEFAULT_QUALITY_FOLDERS = {
     "fullhd_h264": "FullHD",
+    "fullhd_x265": "1080p-x265",
     "480p": ["480p-RMTeam", "480p-EBTV"],
     "2160p": "2160p-HDR-x265",
+}
+
+AUDIO_LABELS = {
+    False: "فقط صدای ژاپنی",
+    True: "صدای ژاپنی و دوبلهٔ انگلیسی",
 }
 
 
 class EztvEditStates(StatesGroup):
     title = State()
     aliases = State()
+    anime_audio = State()
     season = State()
     next_episode = State()
     qualities = State()
@@ -97,7 +106,7 @@ def _day_text(day: str | None) -> str:
 
 def _folder_text(folders: dict[str, Any]) -> str:
     parts = []
-    for key in ("fullhd_h264", "480p", "2160p"):
+    for key in QUALITY_LABELS:
         if key not in folders:
             continue
         value = folders[key]
@@ -160,7 +169,7 @@ async def _render_list(target: Message, page: int = 0, edit: bool = False):
 
     if entries:
         lines = [
-            "📡 <b>مدیریت سریال‌ها و فیلم‌های EZTV</b>",
+            "📡 <b>مدیریت RSS سریال‌ها و انیمه‌ها</b>",
             f"تعداد موارد ثبت‌شده: <b>{len(entries)}</b>",
             "برای مشاهده جزئیات، روی عنوان موردنظر بزنید.",
             "",
@@ -179,7 +188,7 @@ async def _render_list(target: Message, page: int = 0, edit: bool = False):
         lines.append(f"\nصفحه {page + 1} از {total_pages}")
     else:
         lines = [
-            "📡 <b>مدیریت سریال‌ها و فیلم‌های EZTV</b>",
+            "📡 <b>مدیریت RSS سریال‌ها و انیمه‌ها</b>",
             "هنوز هیچ سریالی ثبت نشده است.",
             "برای شروع، روی «افزودن سریال» بزنید.",
         ]
@@ -233,10 +242,14 @@ async def _render_detail(target: Message, index: int, edit: bool = True):
     folders = show.get("quality_folders", {})
     if not isinstance(folders, dict):
         folders = {}
+    audio_line = ""
+    if normalized_show["category"] == "Anime":
+        audio_line = f"صدا: <b>{AUDIO_LABELS[show.get('dual_audio') is True]}</b>\n"
     body = (
         f"🎬 <b>{html.escape(_show_title(show))}</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"نوع: <b>{category_text}</b>\n"
+        f"{audio_line}"
         f"قسمت بعدی: <code>{episode_tag}</code>\n"
         f"نام‌های جایگزین: {html.escape(aliases_text)}\n"
         f"کیفیت‌ها: <b>{html.escape(_quality_text(show.get('qualities', [])))}</b>\n"
@@ -275,7 +288,7 @@ async def _prompt_title(target: Message, state: FSMContext, edit: bool):
         f"✏️ عنوان فعلی: <code>{html.escape(current)}</code>\n"
         "عنوان جدید را ارسال کنید. برای حفظ عنوان فعلی، - بفرستید."
         if edit else
-        "نام سریال یا انیمه را ارسال کنید. بهتر است عنوان انگلیسی مطابق نام انتشارهای EZTV باشد."
+        "نام سریال یا انیمه را مطابق نام انتشار در EZTV یا Nyaa بفرستید."
     )
     await state.set_state(EztvEditStates.title)
     await target.answer(prompt, parse_mode="HTML", reply_markup=_cancel_keyboard())
@@ -339,9 +352,9 @@ async def _prompt_next_episode(target: Message, state: FSMContext, edit: bool):
     await target.answer(prompt, parse_mode="HTML", reply_markup=_cancel_keyboard())
 
 
-def _quality_keyboard(selected: list[str]):
+def _quality_keyboard(selected: list[str], category: str):
     builder = InlineKeyboardBuilder()
-    for key in eztv_tracker_service.QUALITY_KEYS:
+    for key in eztv_tracker_service.quality_keys(category):
         mark = "✅" if key in selected else "⬜"
         builder.row(
             InlineKeyboardButton(
@@ -357,29 +370,32 @@ def _quality_keyboard(selected: list[str]):
 async def _prompt_qualities(target: Message, state: FSMContext):
     data = await state.get_data()
     selected = data.get("draft_qualities", [])
+    category = data["draft"]["category"]
     await state.set_state(EztvEditStates.qualities)
     await target.answer(
         "کیفیت‌هایی را که باید در RSS رصد شوند انتخاب کنید. برای فعال/غیرفعال‌کردن هر مورد روی آن بزنید:",
-        reply_markup=_quality_keyboard(selected),
+        reply_markup=_quality_keyboard(selected, category),
     )
 
 
-def _default_folders(existing: dict[str, Any] | None = None) -> dict[str, Any]:
-    result = dict(DEFAULT_QUALITY_FOLDERS)
-    if isinstance(existing, dict):
-        result.update(existing)
-    return result
+def _default_folders(category: str, existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    existing = existing if isinstance(existing, dict) else {}
+    return {
+        key: existing.get(key, DEFAULT_QUALITY_FOLDERS[key])
+        for key in eztv_tracker_service.quality_keys(category)
+    }
 
 
 async def _prompt_folders(target: Message, state: FSMContext):
     data = await state.get_data()
-    folders = _default_folders(data.get("draft", {}).get("quality_folders", {}))
+    draft = data["draft"]
+    folders = _default_folders(draft["category"], draft.get("quality_folders"))
     lines = [
         "📁 پوشه‌های مقصد را مشخص کنید؛ هر کیفیت را در یک خط وارد کنید:",
-        "فرمت:",
-        "<code>fullhd_h264=FullHD</code>",
-        "<code>480p=480p-RMTeam,480p-EBTV</code>",
-        "<code>2160p=2160p-HDR-x265</code>",
+        *[
+            f"<code>{key}={','.join(value) if isinstance(value, list) else value}</code>"
+            for key, value in DEFAULT_QUALITY_FOLDERS.items() if key in folders
+        ],
         "",
         "برای چند پوشه 480p از کاما استفاده کنید. نام پوشه باید نام یک پوشه مستقیم باشد و / نداشته باشد.",
         "ارسال - یعنی استفاده از تنظیمات فعلی/پیش‌فرض.",
@@ -424,12 +440,11 @@ def _parse_aliases(raw: str) -> list[str]:
     return list(dict.fromkeys(value.strip() for value in values if value.strip()))
 
 
-def _parse_folders(raw: str, existing: dict[str, Any]) -> dict[str, Any]:
+def _parse_folders(raw: str, category: str, existing: dict[str, Any]) -> dict[str, Any]:
     if raw.strip() == "-":
-        return _default_folders(existing)
+        return _default_folders(category, existing)
 
-    result = _default_folders(existing)
-    allowed = set(eztv_tracker_service.QUALITY_KEYS)
+    result = _default_folders(category, existing)
     seen = set()
     for line in raw.splitlines():
         line = line.strip()
@@ -437,7 +452,7 @@ def _parse_folders(raw: str, existing: dict[str, Any]) -> dict[str, Any]:
             continue
         key, value = [part.strip() for part in line.split("=", 1)]
         key = key.casefold()
-        if key not in allowed:
+        if key not in result:
             continue
         if not value:
             raise ValueError(f"مقدار پوشه {key} خالی است.")
@@ -465,11 +480,11 @@ async def _start_wizard(
     draft = dict(old_show)
     draft.setdefault("title", "")
     draft.setdefault("aliases", [])
-    draft.setdefault("category", "Series")
+    draft["category"] = str(draft.get("category", "Series")).strip().title()
     draft.setdefault("season", 1)
     draft.setdefault("next_episode", 1)
     draft.setdefault("qualities", ["fullhd_h264", "480p"])
-    draft.setdefault("quality_folders", _default_folders())
+    draft.setdefault("quality_folders", _default_folders(draft["category"]))
     draft.setdefault("release_day", "")
     initial_days = draft.get("release_days")
     if not isinstance(initial_days, list):
@@ -505,7 +520,8 @@ async def _save_wizard(call: CallbackQuery, state: FSMContext, release_days: lis
     ))
     draft["release_days"] = normalized_days
     draft["release_day"] = normalized_days[0] if normalized_days else ""
-    draft["qualities"] = list(data.get("draft_qualities", []))
+    allowed_qualities = eztv_tracker_service.quality_keys(draft["category"])
+    draft["qualities"] = [key for key in data.get("draft_qualities", []) if key in allowed_qualities]
 
     if not draft.get("title", "").strip():
         return await call.answer("عنوان سریال خالی است.", show_alert=True)
@@ -532,7 +548,9 @@ async def _save_wizard(call: CallbackQuery, state: FSMContext, release_days: lis
     draft["season"] = int(draft["season"])
     draft["next_episode"] = int(draft["next_episode"])
     draft["aliases"] = list(draft.get("aliases", []))
-    draft["quality_folders"] = _default_folders(draft.get("quality_folders", {}))
+    draft["quality_folders"] = _default_folders(draft["category"], draft.get("quality_folders"))
+    if draft["category"] == "Series":
+        draft.pop("dual_audio", None)
 
     old_show = data.get("old_show", {})
     if mode == "edit" and isinstance(index, int) and 0 <= index < len(entries):
@@ -639,25 +657,52 @@ async def cb_eztv_manager(call: CallbackQuery, state: FSMContext):
         data = await state.get_data()
         draft = dict(data.get("draft", {}))
         draft["category"] = category
+        allowed_qualities = eztv_tracker_service.quality_keys(category)
+        draft["qualities"] = [key for key in draft.get("qualities", []) if key in allowed_qualities]
         await state.update_data(draft=draft)
+        if category == "Anime":
+            await state.set_state(EztvEditStates.anime_audio)
+            builder = InlineKeyboardBuilder()
+            current = draft.get("dual_audio") is True
+            for value, label in AUDIO_LABELS.items():
+                builder.row(InlineKeyboardButton(
+                    text=("✅ " if value == current else "") + label,
+                    callback_data=f"eztv:audio:{int(value)}",
+                ))
+            builder.row(InlineKeyboardButton(text="✖️ انصراف", callback_data="eztv:cancel"))
+            await call.message.edit_text("زبان صدای این انیمه را انتخاب کنید.", reply_markup=builder.as_markup())
+            return await call.answer()
         await call.message.edit_text(
-            f"✅ نوع محتوا: {'سریال' if category == 'Series' else 'انیمه'}"
+            "✅ نوع محتوا: سریال"
         )
+        await _prompt_season(call.message, state, data.get("eztv_mode") == "edit")
+        return await call.answer()
+
+    if action == "audio":
+        value = parts[2] if len(parts) > 2 else ""
+        if value not in ("0", "1") or await state.get_state() != EztvEditStates.anime_audio.state:
+            return await call.answer("انتخاب صدا معتبر نیست.", show_alert=True)
+        data = await state.get_data()
+        draft = dict(data["draft"])
+        draft["dual_audio"] = value == "1"
+        await state.update_data(draft=draft)
+        await call.message.edit_text(f"✅ {AUDIO_LABELS[draft['dual_audio']]}")
         await _prompt_season(call.message, state, data.get("eztv_mode") == "edit")
         return await call.answer()
 
     if action == "quality":
         quality = parts[2] if len(parts) > 2 else ""
-        if quality not in eztv_tracker_service.QUALITY_KEYS:
-            return await call.answer("کیفیت معتبر نیست.", show_alert=True)
         data = await state.get_data()
+        category = data.get("draft", {}).get("category", "Series")
+        if quality not in eztv_tracker_service.quality_keys(category):
+            return await call.answer("کیفیت معتبر نیست.", show_alert=True)
         selected = list(data.get("draft_qualities", []))
         if quality in selected:
             selected.remove(quality)
         else:
             selected.append(quality)
         await state.update_data(draft_qualities=selected)
-        await call.message.edit_reply_markup(reply_markup=_quality_keyboard(selected))
+        await call.message.edit_reply_markup(reply_markup=_quality_keyboard(selected, category))
         return await call.answer("انتخاب کیفیت به‌روزرسانی شد.")
 
     if action == "qualities_done":
@@ -797,6 +842,7 @@ async def handle_eztv_folders(message: Message, state: FSMContext):
     try:
         draft["quality_folders"] = _parse_folders(
             raw,
+            draft["category"],
             draft.get("quality_folders", {}),
         )
     except ValueError as exc:
@@ -817,16 +863,17 @@ async def cmd_eztv_status(message: Message):
     shows = eztv_tracker_service.get_shows()
     if not shows:
         return await message.answer(
-            "📡 ردیاب EZTV فعال است، اما فهرست سریال‌ها خالی است.\n"
-            "با دستور /eztv_edit سریال‌ها را از داخل تلگرام اضافه کنید.",
+            "📡 فهرست ردیاب RSS خالی است.\n"
+            "با دستور /eztv_edit سریال یا انیمه اضافه کنید.",
             parse_mode="HTML",
         )
 
     state = eztv_tracker_service._load_state()
     lines = [
-        "📡 <b>وضعیت ردیاب EZTV</b>",
+        "📡 <b>وضعیت ردیاب RSS</b>",
         f"وضعیت سرویس: {'✅ فعال' if config.get('enabled', True) else '⏸ غیرفعال'}",
-        f"RSS: <code>{html.escape(str(config.get('feed_url', 'https://myrss.org/eztv')))}</code>",
+        f"EZTV: <code>{html.escape(str(config.get('feed_url') or 'https://myrss.org/eztv'))}</code>",
+        f"Nyaa: <code>{html.escape(str(config.get('nyaa_feed_url') or DEFAULT_FEED_URL))}</code>",
         f"فاصله بررسی: <code>{int(config.get('poll_interval_seconds', 300) or 300)}</code> ثانیه",
         f"گزارش روزانه: <code>{html.escape(str(config.get('daily_report_time', '09:00')))}</code>",
         "",
@@ -856,20 +903,24 @@ async def cmd_eztv_check(message: Message):
         result = await eztv_tracker_service.poll_once(message.bot, send_summary=True)
         queued = result.get("queued", [])
         completed = result.get("completed_updates", [])
-        await wait.edit_text(
-            "✅ بررسی فوری تمام شد.\n"
-            f"سریال‌های تنظیم‌شده: <code>{result.get('shows', 0)}</code>\n"
-            f"دانلودهای جدید به صف: <code>{len(queued)}</code>\n"
-            f"موارد موجود در Workspace: <code>{len(result.get('already_local', []))}</code>\n"
+        feed_errors = result.get("feed_errors", {})
+        lines = [
+            "⚠️ بررسی RSS با خطا مواجه شد." if feed_errors else "✅ بررسی فوری تمام شد.",
+            f"عنوان‌های تنظیم‌شده: <code>{result.get('shows', 0)}</code>",
+            f"دانلودهای جدید به صف: <code>{len(queued)}</code>",
+            f"موارد موجود در Workspace: <code>{len(result.get('already_local', []))}</code>",
             f"موارد موجود روی سرور مقصد: <code>{len(result.get('already_remote', []))}</code>",
-            f"نتایج نهایی جدید: <code>{len(completed)}</code>\n"
-            f"مواردی که از قبل موجود بودند: <code>{len(result.get('already_local', []))}</code>",
+            f"نتایج نهایی جدید: <code>{len(completed)}</code>",
+        ]
+        lines.extend(f"{source}: <code>{html.escape(error[:500])}</code>" for source, error in feed_errors.items())
+        await wait.edit_text(
+            "\n".join(lines),
             parse_mode="HTML",
         )
     except Exception as exc:
         logging.exception("Manual EZTV check failed")
         await wait.edit_text(
-            "❌ بررسی EZTV با خطا مواجه شد:\n<code>"
+            "❌ بررسی RSS با خطا مواجه شد:\n<code>"
             + html.escape(str(exc)[:1000])
             + "</code>",
             parse_mode="HTML",

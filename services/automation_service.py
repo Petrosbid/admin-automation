@@ -596,7 +596,7 @@ class AutomationService:
     ) -> str:
         clean_name = cls.format_clean_title(series_or_movie_title)
         year = cls.extract_media_year(series_or_movie_title) if not season_ep_tag else None
-        parts = (clean_name, year, season_ep_tag, quality_tag, source_type, "HardSub", "EBTV", "mp4")
+        parts = (clean_name, year, season_ep_tag, quality_tag, source_type, "HardSub", "EBTV", "mkv")
         return ".".join(part for part in parts if part)
 
     @classmethod
@@ -610,7 +610,7 @@ class AutomationService:
         clean_name = cls.format_clean_title(series_or_movie_title)
         year = cls.extract_media_year(series_or_movie_title) if not season_ep_tag else None
         channels = "6CH" if quality_tag == "1080p" else ""
-        parts = (clean_name, year, season_ep_tag, quality_tag, source_type, channels, "EBTV", "mp4")
+        parts = (clean_name, year, season_ep_tag, quality_tag, source_type, channels, "EBTV", "mkv")
         return ".".join(part for part in parts if part)
 
     @staticmethod

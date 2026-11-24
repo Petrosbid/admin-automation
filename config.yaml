@@ -43,8 +43,8 @@ paths:
   workspace_dir: "C:\\MediaBot\\workspace"
   presets_dir: "C:\\MediaBot\\presets"
   aria2c_bin: "C:\\Tools\\aria2\\aria2c.exe"
-  mkvmerge_bin: "C:\\Program Files\\MKVToolNix\\mkvmerge.exe"
-  mkvextract_bin: "C:\\Program Files\\MKVToolNix\\mkvextract.exe"
+  mkvmerge_bin: "E:\\MKVToolNix\\mkvmerge.exe"
+  mkvextract_bin: "E:\\MKVToolNix\\mkvextract.exe"
   handbrake_bin: "C:\\Program Files\\HandBrakeCLI\\HandBrakeCLI.exe"
   megadl_bin: "C:\\Tools\\megatools\\megatools.exe"
   ffsubsync_bin: "ffsubsync"
@@ -106,6 +106,8 @@ ftp:
 eztv_tracker:
   enabled: true
   feed_url: "https://myrss.org/eztv"
+  nyaa_feed_url: "https://nyaa.land/?page=rss"
+  nyaa_fallback_feed_url: "https://nyaa.si/?page=rss"
   poll_interval_seconds: 300       # بررسی RSS هر ۵ دقیقه
   daily_report_time: "09:00"       # ساعت گزارش روزانه بر اساس timezone
   timezone: "Asia/Tehran"
@@ -129,3 +131,6 @@ eztv_tracker:
   #       fullhd_h264: "FullHD"
   #       480p: ["480p-RMTeam", "480p-EBTV"]
   #       2160p: "2160p-HDR-x265"
+  # برای category: Anime، کیفیت fullhd_x265 و تنظیم dual_audio در دسترس‌اند.
+  # dual_audio: false یعنی فقط ژاپنی. true یعنی ژاپنی به همراه دوبله انگلیسی.
+  # برای فصل‌های بعد، اگر انتشار شماره فصل ندارد، نام مختص آن فصل را در aliases اضافه کنید.

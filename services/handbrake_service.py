@@ -179,9 +179,10 @@ class HandBrakeService:
            - در مرحله اول فقط فایل .ass به عنوان تنها ترک زیرنویس (Track 1) وارد HandBrake می‌شود و با --subtitle-burned=1
              به صورت ۱۰۰٪ قطعی روی تصویر هاردساب (Burn-in) می‌شود.
            - در مرحله دوم، زیرنویس انگلیسی (از فایل ارسالی، پوشه srt/EN یا داخل خود فیلم) به صورت سافت‌ساب (SoftSub)
-             به فایل خروجی MP4 اضافه می‌شود!
+             به کانتینر Matroska فایل خروجی اضافه می‌شود.
         ۲. اگر فایل ورودی زیرنویس از نوع .srt باشد:
            - بولد و زرد (#fbff00) شده، روی تصویر هاردساب (Burn-in) می‌شود و هیچ زیرنویس انگلیسی‌ای به آن اضافه نمی‌گردد.
+        پسوند نام فایل نهایی از output_media_path گرفته می‌شود.
         """
         video_path = Path(video_path).expanduser().resolve()
         output_media_path = Path(output_media_path).expanduser().resolve()
@@ -205,8 +206,9 @@ class HandBrakeService:
         temp_styled_srt = output_media_path.with_name(f"_temp_styled_{unique_tag}.srt")
         temp_en_srt = output_media_path.with_name(f"_temp_en_soft_{unique_tag}.srt")
         temp_mkv = output_media_path.with_name(f"_temp_hb_mux_{unique_tag}.mkv")
-        temp_hb_encoded = output_media_path.with_name(f"_temp_hb_enc_{unique_tag}{output_media_path.suffix}")
-        temp_final_output = output_media_path.with_name(f"_temp_hb_final_{unique_tag}{output_media_path.suffix}")
+        temp_hb_encoded = output_media_path.with_name(f"_temp_hb_enc_{unique_tag}.mkv")
+        # merge_softsub کانتینر را از پسوند مسیر خروجی انتخاب می‌کند.
+        temp_final_output = output_media_path.with_name(f"_temp_hb_final_{unique_tag}.mkv")
         brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
         handbrake_bin = cfg.get("paths", "handbrake_bin")
 
@@ -286,6 +288,7 @@ class HandBrakeService:
                 handbrake_bin,
                 "--preset-import-file", preset_json_path,
                 "--preset", preset_name,
+                "--format", "av_mkv",
                 "--input", str(temp_mkv),
                 *audio_cli_flags,
                 "--output", str(hb_target_out),
@@ -342,17 +345,14 @@ class HandBrakeService:
                     sync_mode="none",
                     require_en_sub=True,
                 )
-                temp_final_output.replace(output_media_path)
-            elif output_media_path.suffix.lower() == ".mkv":
+            else:
                 await MKVService.merge_softsub(
                     video_path=temp_hb_encoded,
                     output_path=temp_final_output,
                     keep_old_subs=False,
                     custom_brand=brand,
                 )
-                temp_final_output.replace(output_media_path)
-            else:
-                temp_hb_encoded.replace(output_media_path)
+            temp_final_output.replace(output_media_path)
 
             if not output_media_path.is_file() or output_media_path.stat().st_size <= 0:
                 raise RuntimeError("فایل نهایی HardSub پس از مرحله انتشار پیدا نشد یا خالی است.")

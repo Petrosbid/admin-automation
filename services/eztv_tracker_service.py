@@ -20,12 +20,14 @@ from core.queue_manager import queue_engine
 from services.automation_service import AutomationService
 from services.cuteftp_service import CuteFTPService
 from services.downloader_service import DownloaderService
+from services.nyaa_release import AUDIO_MISMATCH, DEFAULT_FEED_URL, episode_and_metadata, release_priority
 
 
 class EZTVTrackerService:
     """RSS watcher for explicitly configured shows and expected SxxEyy releases."""
 
     QUALITY_KEYS = ("fullhd_h264", "480p", "2160p")
+    ANIME_QUALITY_KEYS = (*QUALITY_KEYS, "fullhd_x265")
     VIDEO_EXTENSIONS = DownloaderService.VIDEO_EXTENSIONS
     MAX_SEEN_IDS = 2500
     MAX_HISTORY_PER_EPISODE = 20
@@ -234,6 +236,10 @@ class EZTVTrackerService:
         raw = cfg.get("eztv_tracker") or {}
         return raw if isinstance(raw, dict) else {}
 
+    @classmethod
+    def quality_keys(cls, category: str) -> tuple[str, ...]:
+        return cls.ANIME_QUALITY_KEYS if category == "Anime" else cls.QUALITY_KEYS
+
     def get_shows(self) -> list[dict[str, Any]]:
         raw_shows = self.get_show_entries()
         if not isinstance(raw_shows, list):
@@ -256,7 +262,7 @@ class EZTVTrackerService:
             qualities = [
                 str(q).strip().casefold()
                 for q in raw.get("qualities", [])
-                if str(q).strip().casefold() in self.QUALITY_KEYS
+                if str(q).strip().casefold() in self.quality_keys(category)
             ] if isinstance(raw.get("qualities", []), list) else []
             if not qualities:
                 continue
@@ -266,6 +272,7 @@ class EZTVTrackerService:
                 "season": season,
                 "next_episode": configured_episode,
                 "category": category,
+                "dual_audio": raw.get("dual_audio") is True,
                 "qualities": list(dict.fromkeys(qualities)),
                 "aliases": [str(x).strip() for x in raw.get("aliases", []) if str(x).strip()]
                     if isinstance(raw.get("aliases", []), list) else [],
@@ -354,6 +361,8 @@ class EZTVTrackerService:
     @classmethod
     def _parse_feed(cls, xml_text: str) -> list[dict[str, Any]]:
         root = ET.fromstring(xml_text)
+        if cls._local_tag(root.tag) not in {"rss", "feed", "rdf"}:
+            raise ET.ParseError("Expected an RSS or Atom feed")
         entries = [
             node for node in root.iter()
             if cls._local_tag(node.tag) in ("item", "entry")
@@ -408,23 +417,41 @@ class EZTVTrackerService:
             if not link:
                 continue
 
+            info_hash = cls._child_text(item, {"infohash"}).casefold()
+            if re.fullmatch(r"[0-9a-f]{40}", info_hash):
+                item_id = info_hash
+            seeders = cls._child_text(item, {"seeders"})
             parsed.append({
                 "id": item_id,
                 "title": title,
                 "link": link,
                 "published_at": cls._parse_datetime(pubdate_raw),
                 "published_raw": pubdate_raw,
+                "category_id": cls._child_text(item, {"categoryid"}),
+                "category": cls._child_text(item, {"category"}),
+                "seeders": int(seeders) if seeders.isascii() and seeders.isdecimal() else None,
             })
         return parsed
 
-    async def _fetch_feed(self) -> list[dict[str, Any]]:
-        feed_url = str(
-            self.get_config().get("feed_url", "https://myrss.org/eztv")
-            or "https://myrss.org/eztv"
-        ).strip()
+    async def _fetch_feed(self, category: str = "Series") -> list[dict[str, Any]]:
+        config = self.get_config()
+        if category == "Anime":
+            feed_url = str(config.get("nyaa_feed_url") or DEFAULT_FEED_URL).strip()
+        else:
+            feed_url = str(config.get("feed_url") or "https://myrss.org/eztv").strip()
+        try:
+            return await self._fetch_feed_url(feed_url)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ET.ParseError) as exc:
+            fallback = str(config.get("nyaa_fallback_feed_url") or "").strip()
+            if category != "Anime" or not fallback or fallback == feed_url:
+                raise
+            logging.info("Primary Nyaa RSS unavailable (%s); trying %s", exc, fallback)
+            return await self._fetch_feed_url(fallback)
+
+    async def _fetch_feed_url(self, feed_url: str) -> list[dict[str, Any]]:
         timeout = aiohttp.ClientTimeout(total=45, connect=20)
         headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; AdminAutomationEZTV/1.0)",
+            "User-Agent": "Mozilla/5.0 (compatible; AdminAutomationRSS/1.0)",
             "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
         }
         connector = ProxyManager.get_aiohttp_connector()
@@ -436,9 +463,35 @@ class EZTVTrackerService:
             async with session.get(feed_url) as response:
                 response.raise_for_status()
                 body = await response.text(errors="replace")
-        if not body.strip():
-            raise RuntimeError("EZTV RSS feed returned an empty response.")
         return self._parse_feed(body)
+
+    def _show_releases(self, show: dict[str, Any], releases: list[dict[str, Any]], first_episode: int):
+        matches = []
+        for release in releases:
+            title = release["title"]
+            priority = (0, False, 0)
+            if show["category"] == "Anime":
+                anime_match = episode_and_metadata(title, show)
+                if anime_match is None:
+                    continue
+                episode, metadata = anime_match
+                priority = release_priority(release, metadata, show["dual_audio"])
+                if priority is None:
+                    continue
+            else:
+                parsed = self._release_episode(title)
+                if not parsed or parsed[0] != show["season"] or not self._matches_show(title, show):
+                    continue
+                episode = parsed[1]
+                metadata = title
+            if episode < first_episode or not DownloaderService.is_torrent_target(release["link"]):
+                continue
+            qualities = [quality for quality in show["qualities"] if self._quality_matches(metadata, quality)]
+            if qualities:
+                matches.append((priority, release, episode, qualities))
+
+        matches.sort(key=lambda match: match[0], reverse=True)
+        return matches
 
     @classmethod
     def _matches_show(cls, release_title: str, show: dict[str, Any]) -> bool:
@@ -456,10 +509,10 @@ class EZTVTrackerService:
     @staticmethod
     def _quality_matches(release_title: str, quality: str) -> bool:
         title = str(release_title or "").casefold()
-        if quality == "fullhd_h264":
+        if quality in ("fullhd_h264", "fullhd_x265"):
             has_fullhd = bool(re.search(r"(?<!\d)(?:1080p|full[ ._-]?hd|fhd)(?![a-z0-9])", title))
-            has_h264 = bool(re.search(r"(?:h[ ._-]?264|x264|avc)", title))
-            return has_fullhd and has_h264
+            codec = r"(?:h[ ._-]?264|x264|avc)" if quality == "fullhd_h264" else r"\b(?:h[ ._-]?265|x265|hevc)\b"
+            return has_fullhd and bool(re.search(codec, title))
         if quality == "480p":
             return bool(re.search(r"(?<!\d)480p(?!\d)", title))
         if quality == "2160p":
@@ -545,6 +598,8 @@ class EZTVTrackerService:
 
         if quality == "fullhd_h264":
             return ["FullHD"]
+        if quality == "fullhd_x265":
+            return ["1080p-x265"]
         if quality == "480p":
             return ["480p-RMTeam", "480p-EBTV"]
         if quality == "2160p":
@@ -570,7 +625,7 @@ class EZTVTrackerService:
                 path.mkdir(parents=True, exist_ok=True)
                 return path
 
-        if quality in ("fullhd_h264", "2160p", "480p"):
+        if candidates:
             path = season_dir / candidates[0]
             path.mkdir(parents=True, exist_ok=True)
             return path
@@ -583,6 +638,8 @@ class EZTVTrackerService:
         expected = f"S{season:02d}E{episode:02d}"
         found: list[Path] = []
         for path in folder.rglob("*"):
+            if {"_incoming_downloads", "_rejected_downloads"}.intersection(path.relative_to(folder).parts):
+                continue
             if not path.is_file() or path.suffix.casefold() not in DownloaderService.VIDEO_EXTENSIONS:
                 continue
             tag = AutomationService.extract_episode_tag(path.name, fallback_season=season)
@@ -752,6 +809,7 @@ class EZTVTrackerService:
         release_link: str,
         destination: Path,
         expected_episode_tag: str,
+        anime_show: dict[str, Any] | None = None,
         progress_callback=None,
     ):
         from bot.download_handlers import _smart_download_pipeline_job
@@ -763,6 +821,7 @@ class EZTVTrackerService:
             progress_callback=progress_callback,
             automated_background=True,
             expected_episode_tag=expected_episode_tag,
+            anime_show=anime_show,
         )
 
     async def _queue_release(
@@ -778,10 +837,16 @@ class EZTVTrackerService:
         key = self._scheduled_key(show, episode, quality)
         scheduled = state.setdefault("scheduled_tasks", {})
         previous = scheduled.get(key, {})
+        anime_show = show if show["category"] == "Anime" else None
+        audio_mode = show["dual_audio"] if anime_show else None
         previous_id = str(previous.get("task_id", "")) if isinstance(previous, dict) else str(previous)
         if previous_id and self._task_is_active(previous_id):
             return None
-        if isinstance(previous, dict) and previous.get("queued_at"):
+        same_mode = isinstance(previous, dict) and previous.get("dual_audio") == audio_mode
+        rejected_ids = previous.get("audio_rejected_release_ids", []) if same_mode else []
+        if release["id"] in rejected_ids:
+            return None
+        if same_mode and previous.get("result") != "audio_mismatch" and previous.get("queued_at"):
             try:
                 previous_queued_at = self._parse_datetime(str(previous["queued_at"]))
                 if previous_queued_at and (
@@ -804,15 +869,17 @@ class EZTVTrackerService:
             return None
         chat_id = int(admin_ids[0])
 
+        source = "Nyaa" if anime_show else "EZTV"
         queue_task = await queue_engine.add_task(
             "download",
-            f"EZTV [{show['title']} {self._episode_tag(show['season'], episode)} {quality}]",
+            f"{source} [{show['title']} {self._episode_tag(show['season'], episode)} {quality}]",
             self._download_release_job,
             bot,
             chat_id,
             release["link"],
             destination,
             self._episode_tag(show["season"], episode),
+            anime_show,
             notify_completion=False,
         )
         try:
@@ -823,6 +890,7 @@ class EZTVTrackerService:
                 category=show["category"],
                 episode=self._episode_tag(show["season"], episode),
                 quality=quality,
+                source=source,
                 task_id=queue_task.task_id,
                 release_title=release.get("title", ""),
             )
@@ -836,6 +904,8 @@ class EZTVTrackerService:
             "quality": quality,
             "queued_at": datetime.now(timezone.utc).isoformat(),
             "reported": False,
+            "dual_audio": audio_mode,
+            "audio_rejected_release_ids": rejected_ids,
         }
         return queue_task.task_id
 
@@ -869,6 +939,11 @@ class EZTVTrackerService:
             item["reported"] = True
             item["finished_at"] = now
             item["result"] = "success" if is_success else "failed"
+            if not is_success and str(task.error or "").startswith(AUDIO_MISMATCH):
+                item["result"] = "audio_mismatch"
+                rejected_ids = item.setdefault("audio_rejected_release_ids", [])
+                rejected_ids.append(item["release_id"])
+                item["audio_rejected_release_ids"] = rejected_ids[-self.MAX_HISTORY_PER_EPISODE:]
             item["final_status"] = status
             if not is_success:
                 item["queued_at"] = now
@@ -933,9 +1008,24 @@ class EZTVTrackerService:
         async with self._poll_lock:
             shows = self.get_shows()
             if not shows:
-                return {"shows": 0, "queued": [], "message": "لیست سریال‌های EZTV هنوز تنظیم نشده است."}
+                return {"shows": 0, "queued": [], "message": "فهرست عناوین RSS هنوز تنظیم نشده است."}
 
-            releases = await self._fetch_feed()
+            categories = list(dict.fromkeys(show["category"] for show in shows))
+            feed_results = await asyncio.gather(
+                *(self._fetch_feed(category) for category in categories),
+                return_exceptions=True,
+            )
+            releases_by_category = {}
+            feed_errors = {}
+            for category, result in zip(categories, feed_results):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                if isinstance(result, Exception):
+                    source = "Nyaa" if category == "Anime" else "EZTV"
+                    logging.warning("%s RSS poll failed: %s", source, result)
+                    feed_errors[source] = str(result)
+                else:
+                    releases_by_category[category] = result
             state = self._load_state()
             seen_ids = set(str(x) for x in state.get("seen_item_ids", []))
             added_ids: list[str] = []
@@ -946,6 +1036,8 @@ class EZTVTrackerService:
             current_time = datetime.now(timezone.utc)
 
             for show in shows:
+                if show["category"] not in releases_by_category:
+                    continue
                 first_expected_episode = self._episode_progress(show, state)
                 season_dir = self._show_folder(show, first_expected_episode)
                 season_prepared = False
@@ -954,30 +1046,11 @@ class EZTVTrackerService:
                 # Process every matching RSS release at/after the configured episode.
                 # Release weekdays are informational only: releases can appear on several
                 # days, and several episode entries can appear in a single poll.
-                for release in releases:
+                for _, release, release_episode, matching_qualities in self._show_releases(
+                    show, releases_by_category[show["category"]], first_expected_episode,
+                ):
                     release_id = str(release["id"])
-                    parsed_episode = self._release_episode(release["title"])
-                    if (
-                        parsed_episode is None
-                        or parsed_episode[0] != show["season"]
-                        or parsed_episode[1] < first_expected_episode
-                    ):
-                        continue
-                    if not self._matches_show(release["title"], show):
-                        continue
-
-                    release_episode = parsed_episode[1]
                     release_tag = self._episode_tag(show["season"], release_episode)
-                    matching_qualities = [
-                        quality for quality in show["qualities"]
-                        if self._quality_matches(release["title"], quality)
-                    ]
-                    if not matching_qualities:
-                        continue
-
-                    release_link = str(release.get("link", "") or "").strip()
-                    if not DownloaderService.is_torrent_target(release_link):
-                        continue
 
                     if not season_prepared:
                         season_dir = await self._prepare_season(show, release_episode)
@@ -1068,13 +1141,14 @@ class EZTVTrackerService:
                 progress_item["next_episode"] = next_episode
 
             state["seen_item_ids"] = list(seen_ids)[-self.MAX_SEEN_IDS:]
-            state["last_feed_check"] = current_time.isoformat()
+            if releases_by_category:
+                state["last_feed_check"] = current_time.isoformat()
             self._save_state(state)
 
             if send_summary and (
                 queued or completed_updates or ((already_local or already_remote) and added_ids)
             ):
-                lines = ["📡 <b>گزارش خودکار EZTV</b>"]
+                lines = ["📡 <b>گزارش خودکار RSS</b>"]
                 if queued:
                     lines.append(f"✅ {len(queued)} دانلود جدید به صف اضافه شد:")
                     for item in queued[:self.MAX_STATUS_ITEMS]:
@@ -1139,7 +1213,8 @@ class EZTVTrackerService:
                 "completed_updates": completed_updates,
                 "already_local": already_local,
                 "already_remote": already_remote,
-                "release_count": len(releases),
+                "release_count": sum(map(len, releases_by_category.values())),
+                "feed_errors": feed_errors,
             }
 
     def _expected_release_time(
@@ -1524,17 +1599,21 @@ class EZTVTrackerService:
                 config = self.get_config()
                 if bool(config.get("enabled", True)):
                     try:
-                        await self.poll_once(bot, send_summary=True)
+                        result = await self.poll_once(bot, send_summary=True)
+                        errors = result.get("feed_errors", {})
                     except Exception as exc:
-                        logging.exception("EZTV RSS poll failed")
-                        now = time.time()
-                        if now - self._last_error_notice >= 1800:
-                            self._last_error_notice = now
-                            await self._send_admin_message(
-                                bot,
-                                "⚠️ <b>خطا در بررسی EZTV RSS</b>\n"
-                                + html.escape(str(exc)[:700]),
-                            )
+                        logging.exception("RSS poll failed")
+                        errors = {"RSS": str(exc)}
+                    now = time.time()
+                    if errors and now - self._last_error_notice >= 1800:
+                        self._last_error_notice = now
+                        await self._send_admin_message(
+                            bot,
+                            "⚠️ <b>خطا در بررسی RSS</b>\n" + "\n".join(
+                                f"{source}: {html.escape(detail[:700])}"
+                                for source, detail in errors.items()
+                            ),
+                        )
 
                     local_now = datetime.now(self._timezone())
                     report_time = str(config.get("daily_report_time", "09:00"))

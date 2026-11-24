@@ -669,19 +669,23 @@ class MKVService:
 
         mkvmerge_bin = cls._get_mkvmerge_bin()
         cmd = [mkvmerge_bin, "-J", str(video_path)]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode == 0:
-            try:
-                return json.loads(stdout.decode("utf-8", errors="replace"))
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(f"خروجی JSON ابزار mkvmerge معتبر نیست: {exc}") from exc
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            mkv_error = f"mkvmerge executable not found: {mkvmerge_bin}"
+        else:
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                try:
+                    return json.loads(stdout.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(f"خروجی JSON ابزار mkvmerge معتبر نیست: {exc}") from exc
+            mkv_error = stderr.decode("utf-8", errors="replace")[-4000:]
 
-        mkv_error = stderr.decode("utf-8", errors="replace")[-4000:]
         # Some files are MP4/QuickTime even when their extension is not .mp4,
         # and some non-Matroska formats are not accepted by mkvmerge at all.
         ffprobe_bin = cls._get_ffprobe_bin()

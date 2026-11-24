@@ -20,6 +20,7 @@ from services.scraper_service import ScraperService
 from services.downloader_service import DownloaderService
 from services.subtitle_service import SubtitleService
 from services.mkv_service import MKVService
+from services.nyaa_release import AUDIO_MISMATCH, audio_matches, episode_and_metadata
 from services.automation_service import AutomationService
 from services.cuteftp_service import CuteFTPService
 from bot.keyboards import (
@@ -395,6 +396,7 @@ async def _smart_download_pipeline_job(
     progress_callback=None,
     automated_background: bool = False,
     expected_episode_tag: str | None = None,
+    anime_show: dict | None = None,
 ) -> Path:
     """دانلود ایزوله، اکسترکت و اجرای پس‌پردازش فقط روی خروجی همین تسک."""
     dest_dir = Path(dest_dir).resolve()
@@ -455,13 +457,17 @@ async def _smart_download_pipeline_job(
 
         if automated_background and expected_episode_tag:
             fallback_season = AutomationService.extract_season_num_from_dir(dest_dir)
-            found_tags = [
-                AutomationService.extract_episode_tag(
-                    item.name,
-                    fallback_season=fallback_season,
-                )
-                for item in staged_videos
-            ]
+            if anime_show:
+                matches = [episode_and_metadata(item.name, anime_show) for item in staged_videos]
+                found_tags = [
+                    f"S{anime_show['season']:02d}E{match[0]:02d}" if match else None
+                    for match in matches
+                ]
+            else:
+                found_tags = [
+                    AutomationService.extract_episode_tag(item.name, fallback_season=fallback_season)
+                    for item in staged_videos
+                ]
             is_ambiguous = len(staged_videos) != 1
             has_multi_episode_name = any(
                 re.search(
@@ -474,7 +480,19 @@ async def _smart_download_pipeline_job(
                 not tag or tag.upper() != expected_episode_tag.upper()
                 for tag in found_tags
             )
-            if is_ambiguous or has_multi_episode_name or has_wrong_episode:
+            reason = ""
+            if is_ambiguous:
+                reason = "تورنت بیش از یک فایل ویدئویی تحویل داد"
+            elif has_multi_episode_name:
+                reason = "نام فایل نشان‌دهنده بسته چندقسمتی است"
+            elif has_wrong_episode:
+                reason = f"نام فایل با قسمت مورد انتظار {expected_episode_tag} مغایرت داشت"
+            elif anime_show:
+                info = await MKVService.inspect_tracks(staged_videos[0])
+                if not audio_matches(info.get("tracks", []), anime_show["dual_audio"]):
+                    reason = AUDIO_MISMATCH
+
+            if reason:
                 quarantine_dir = (
                     dest_dir / "_rejected_downloads" / uuid.uuid4().hex[:10]
                 )
@@ -482,15 +500,8 @@ async def _smart_download_pipeline_job(
                 for item in staged_videos:
                     if item.exists():
                         shutil.move(str(item), str(quarantine_dir / item.name))
-                reason = (
-                    "تورنت بیش از یک فایل ویدئویی تحویل داد"
-                    if is_ambiguous
-                    else "نام فایل نشان‌دهنده بسته چندقسمتی است"
-                    if has_multi_episode_name
-                    else f"نام فایل با قسمت مورد انتظار {expected_episode_tag} مغایرت داشت"
-                )
                 raise RuntimeError(
-                    f"دانلود خودکار امن متوقف شد: {reason}. "
+                    f"{reason}. "
                     f"فایل‌ها برای بررسی در {quarantine_dir} نگه داشته شدند."
                 )
 
@@ -521,7 +532,7 @@ async def _smart_download_pipeline_job(
                 DailyActivityService.record_media_file(
                     "quality_added" if is_quality_folder else "download_completed",
                     target_video,
-                    source="EZTV" if automated_background else "Manual",
+                    source="Nyaa" if anime_show else "EZTV" if automated_background else "Manual",
                     quality_folder=quality_folder,
                 )
             except Exception:
