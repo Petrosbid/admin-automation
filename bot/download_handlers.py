@@ -15,7 +15,12 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.config_loader import cfg
-from core.queue_manager import queue_engine, safe_throttled_edit_text
+from core.queue_manager import (
+    queue_engine,
+    safe_throttled_edit_text,
+    set_download_file_name,
+    set_download_work_dir,
+)
 from services.scraper_service import ScraperService
 from services.downloader_service import DownloaderService
 from services.subtitle_service import SubtitleService
@@ -397,7 +402,7 @@ async def _smart_download_pipeline_job(
     automated_background: bool = False,
     expected_episode_tag: str | None = None,
     anime_show: dict | None = None,
-) -> Path:
+) -> list[Path]:
     """دانلود ایزوله، اکسترکت و اجرای پس‌پردازش فقط روی خروجی همین تسک."""
     dest_dir = Path(dest_dir).resolve()
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -405,6 +410,7 @@ async def _smart_download_pipeline_job(
     # هر لینک پوشه staging مستقل دارد؛ بنابراین تسک‌ها فایل‌های یکدیگر را نمی‌بینند.
     staging_dir = dest_dir / "_incoming_downloads" / uuid.uuid4().hex[:12]
     staging_dir.mkdir(parents=True, exist_ok=True)
+    set_download_work_dir(staging_dir)
     new_videos: list[Path] = []
 
     try:
@@ -539,6 +545,7 @@ async def _smart_download_pipeline_job(
                 logging.exception("Could not record downloaded media file")
 
     finally:
+        set_download_work_dir(None)
         shutil.rmtree(staging_dir, ignore_errors=True)
         try:
             staging_parent = staging_dir.parent
@@ -549,8 +556,9 @@ async def _smart_download_pipeline_job(
 
     if not new_videos:
         logging.info("Download contained no new video files in %s", dest_dir)
-        return dest_dir
+        return []
 
+    set_download_file_name(", ".join(path.name for path in new_videos))
     is_series, season_or_movie_dir, series_or_movie_title = _resolve_series_or_movie_context(dest_dir)
 
     # همگام‌سازی ساختار فصل با سرور؛ در دانلود برنامه‌ریزی‌شده پیام جداگانه صادر نمی‌کنیم.
@@ -584,7 +592,8 @@ async def _smart_download_pipeline_job(
         if len(fullhd_candidates) > 1:
             movie_source_group = {"count": len(fullhd_candidates), "paths": []}
 
-    for vid in new_videos:
+    for index, vid in enumerate(new_videos):
+        set_download_file_name(vid.name)
         movie_quality = movie_qualities.get(vid)
         is_fullhd_source = (
             dest_dir.name.casefold() == "fullhd" if is_series
@@ -613,6 +622,8 @@ async def _smart_download_pipeline_job(
                 )
                 if copied_fullhd_name:
                     vid = _rename_downloaded_video(vid, copied_fullhd_name)
+                    new_videos[index] = vid
+                    set_download_file_name(vid.name)
 
             await _process_selected_fullhd_source(
                 bot,
@@ -636,6 +647,8 @@ async def _smart_download_pipeline_job(
 
         if copied_server_name:
             vid = _rename_downloaded_video(vid, copied_server_name)
+            new_videos[index] = vid
+            set_download_file_name(vid.name)
 
             if ask_missing_folder_question and not automated_background:
                 await _send_missing_remote_folder_upload_prompt(
@@ -670,6 +683,8 @@ async def _smart_download_pipeline_job(
             )
             if automated_background:
                 vid = _rename_downloaded_video(vid, suggested_std_name)
+                new_videos[index] = vid
+                set_download_file_name(vid.name)
                 if is_fullhd_source:
                     await _process_selected_fullhd_source(
                         bot, chat_id, vid, season_or_movie_dir, is_series, ep_tag,
@@ -710,7 +725,8 @@ async def _smart_download_pipeline_job(
                     movie_source_group=source_group,
                 )
 
-    return new_videos[0]
+    set_download_file_name(", ".join(path.name for path in new_videos))
+    return new_videos
 
 
 async def _send_fullhd_e01_prompt(bot: Bot, chat_id: int, vid_path: Path, remote_folder_path: str):
@@ -2162,6 +2178,7 @@ async def _download_and_extract_subs_job(
     temp_dir: Path,
     progress_callback=None
 ) -> list[str]:
+    set_download_work_dir(temp_dir)
     try:
         await DownloaderService.download(target_link, temp_dir, progress_callback=progress_callback)
         videos = DownloaderService.find_video_files(temp_dir)
@@ -2169,6 +2186,8 @@ async def _download_and_extract_subs_job(
             raise FileNotFoundError("هیچ فایل ویدئویی پس از دانلود یافت نشد.")
 
         video_file = videos[0]
+        set_download_work_dir(None)
+        set_download_file_name(video_file.name)
         if progress_callback:
             progress_callback(f"در حال استخراج زیرنویس‌ها از {video_file.name}...")
 
@@ -2196,6 +2215,7 @@ async def _download_and_extract_subs_job(
         return [sub_p.name for sub_p in extracted]
 
     finally:
+        set_download_work_dir(None)
         try:
             if temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)

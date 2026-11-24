@@ -11,6 +11,7 @@ import aiohttp
 import gdown
 from core.config_loader import cfg
 from core.proxy_manager import ProxyManager
+from core.queue_manager import set_download_file_name
 
 
 class _TorrentAlreadySubmittedError(RuntimeError):
@@ -245,6 +246,7 @@ class DownloaderService:
                         "برای جلوگیری از دانلود تکراری، fallback انجام نشد."
                     )
 
+                set_download_file_name(str(target_torrent.get("name") or ""))
                 if progress_callback:
                     progress_callback("تورنت در qBittorrent شناسایی شد؛ دریافت فایل‌ها آغاز شد...")
 
@@ -273,6 +275,7 @@ class DownloaderService:
                     state = str(target_torrent.get("state", "")).lower()
                     speed_mb = float(target_torrent.get("dlspeed", 0)) / (1024 * 1024)
                     name = str(target_torrent.get("name", "Torrent"))
+                    set_download_file_name(str(target_torrent.get("name") or ""))
 
                     if progress_callback:
                         progress_callback(f"{progress:.1f}% | سرعت: {speed_mb:.2f} MB/s ({name[:25]})")
@@ -419,6 +422,7 @@ class DownloaderService:
 
                 progress = float(target_torrent.get("progress", 0.0)) * 100.0
                 speed_mb = float(target_torrent.get("dlspeed", 0)) / (1024 * 1024)
+                set_download_file_name(str(target_torrent.get("name") or ""))
                 if progress_callback:
                     progress_callback(f"{progress:.1f}% | {speed_mb:.2f} MB/s")
 
@@ -510,6 +514,7 @@ class DownloaderService:
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(url, ssl=False) as resp:
                 resp.raise_for_status()
+                set_download_file_name(out_file.name)
                 total = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
                 last_report = 0.0

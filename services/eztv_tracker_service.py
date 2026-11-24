@@ -16,7 +16,7 @@ import aiohttp
 
 from core.config_loader import cfg
 from core.proxy_manager import ProxyManager
-from core.queue_manager import queue_engine
+from core.queue_manager import download_display_name, queue_engine
 from services.automation_service import AutomationService
 from services.cuteftp_service import CuteFTPService
 from services.downloader_service import DownloaderService
@@ -881,6 +881,7 @@ class EZTVTrackerService:
             self._episode_tag(show["season"], episode),
             anime_show,
             notify_completion=False,
+            download_name=str(release.get("title") or ""),
         )
         try:
             from services.daily_activity_service import DailyActivityService
@@ -955,6 +956,7 @@ class EZTVTrackerService:
                 "task_id": task_id,
                 "result": "success" if is_success else "failed",
                 "detail": str(task.error or task.progress or status)[:180],
+                "file_name": download_display_name(task)[:160],
             })
 
         return updates
@@ -1108,6 +1110,7 @@ class EZTVTrackerService:
                                 "episode": release_tag,
                                 "quality": quality,
                                 "task_id": task_id,
+                                "release_title": release["title"],
                             })
                     if release_id not in seen_ids:
                         seen_ids.add(release_id)
@@ -1155,7 +1158,8 @@ class EZTVTrackerService:
                         lines.append(
                             f"• {html.escape(item['show'])} "
                             f"<code>{item['episode']}</code> — {html.escape(item['quality'])} "
-                            f"(<code>{html.escape(item['task_id'])}</code>)"
+                            f"(<code>{html.escape(item['task_id'])}</code>)\n"
+                            f"  📄 <code>{html.escape(item['release_title'][:160])}</code>"
                         )
                 if already_local and added_ids:
                     lines.append(
@@ -1175,7 +1179,7 @@ class EZTVTrackerService:
                             lines.append(
                                 f"• {html.escape(item['show'])} "
                                 f"<code>{html.escape(item['episode'])}</code> — "
-                                f"{html.escape(item['quality'])}: دریافت فایل به پایان رسید"
+                                f"{html.escape(item['quality'])}: <code>{html.escape(item['file_name'])}</code>"
                             )
                     if failed_items:
                         lines.append(f"\n❌ دانلودهای ناموفق: {len(failed_items)}")
@@ -1183,7 +1187,8 @@ class EZTVTrackerService:
                             lines.append(
                                 f"• {html.escape(item['show'])} "
                                 f"<code>{html.escape(item['episode'])}</code> — "
-                                f"{html.escape(item['quality'])}: {html.escape(item['detail'])}"
+                                f"{html.escape(item['quality'])}: <code>{html.escape(item['file_name'])}</code>\n"
+                                f"  {html.escape(item['detail'])}"
                             )
                 if not queued and not completed_updates and not already_local and not already_remote:
                     lines.append("در این نوبت انتشار منطبق با قسمت‌های مورد انتظار پیدا نشد.")
@@ -1444,19 +1449,19 @@ class EZTVTrackerService:
                     self._scheduled_key(show, episode, quality)
                     for quality in show["qualities"]
                 ]
-                scheduled_active = any(
-                    self._task_is_active(
-                        str(state.get("scheduled_tasks", {}).get(key, {}).get("task_id", ""))
-                    )
-                    for key in scheduled_keys
-                    if isinstance(state.get("scheduled_tasks", {}).get(key, {}), dict)
-                )
+                active_downloads = []
+                for key in scheduled_keys:
+                    scheduled = state.get("scheduled_tasks", {}).get(key)
+                    if isinstance(scheduled, dict):
+                        task_id = str(scheduled.get("task_id", ""))
+                        if self._task_is_active(task_id):
+                            active_downloads.append(queue_engine.tasks[task_id])
                 release_key = self._release_history_key(show, episode)
                 release_history = state.get("release_history", {}).get(release_key, [])
                 rss_match = state.get("rss_matches", {}).get(release_key, {})
                 published_in_feed = bool(release_history or rss_match)
 
-                if not status["any_raw"] and scheduled_active:
+                if not status["any_raw"] and active_downloads:
                     headline = "📥 منتشر شده و دانلود در صف/در حال اجرا"
                 elif not status["any_raw"] and published_in_feed:
                     headline = "⚠️ در RSS دیده شده، اما هنوز فایل در دسترس نیست"
@@ -1472,6 +1477,8 @@ class EZTVTrackerService:
                     f"<code>{tag}</code>"
                 )
                 lines.append(f"وضعیت: {headline}")
+                for task in active_downloads:
+                    lines.append(f"📄 <code>{html.escape(download_display_name(task)[:160])}</code>")
 
                 configured_days = show.get("release_days") or (
                     [show.get("release_day")] if show.get("release_day") else []

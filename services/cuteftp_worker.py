@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from core.config_loader import cfg
+from core.queue_manager import set_download_file_name
 
 # قفل انحصاری برای تضمین اجرای ۱۰۰٪ ترتیبی آپلودها (یک فایل در هر لحظه تا اتمام کامل)
 _FTP_SERIAL_LOCK = threading.Lock()
@@ -1044,6 +1045,7 @@ def sync_download_episode_files(
                 part_path = target_path.with_name(
                     target_path.name + ".part-" + uuid.uuid4().hex[:8]
                 )
+                set_download_file_name(target_path.name)
                 last_error: Exception | None = None
                 for attempt in range(1, 4):
                     try:
@@ -1086,7 +1088,7 @@ def sync_download_episode_files(
                 if progress_callback:
                     progress_callback(
                         f"دریافت از سرور {index}/{total} | دانلود: {result['downloaded']} | "
-                        f"موجود: {result['skipped']} | خطا: {result['failed']} | {filename[:90]}"
+                        f"موجود: {result['skipped']} | خطا: {result['failed']}"
                     )
 
             if result["failed"] and not result["downloaded"] and not result["skipped"]:
@@ -1250,6 +1252,7 @@ def sync_download_movie_files(
                 part_path = target_path.with_name(
                     target_path.name + ".part-" + uuid.uuid4().hex[:8]
                 )
+                set_download_file_name(target_path.name)
                 last_error: Exception | None = None
                 for attempt in range(1, 4):
                     try:
@@ -1294,7 +1297,7 @@ def sync_download_movie_files(
                 if progress_callback:
                     progress_callback(
                         f"دریافت فیلم از سرور {index}/{total} | دانلود: {result['downloaded']} | "
-                        f"موجود: {result['skipped']} | خطا: {result['failed']} | {filename[:90]}"
+                        f"موجود: {result['skipped']} | خطا: {result['failed']}"
                     )
 
             if result["failed"] and not result["downloaded"] and not result["skipped"]:

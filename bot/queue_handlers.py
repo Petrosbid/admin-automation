@@ -2,12 +2,11 @@ import html
 import math
 import re
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 from aiogram import Router, F
 from aiogram.types import CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
-from core.queue_manager import queue_engine, QueueTask
-from bot.keyboards import queue_management_kb, main_menu_kb
+from core.queue_manager import queue_engine, QueueTask, download_display_name
+from bot.keyboards import queue_management_kb, main_menu_kb, smart_middle_truncate
 
 router = Router()
 
@@ -41,33 +40,14 @@ def _extract_task_paths_info(t: QueueTask) -> dict[str, str]:
 
     if t.queue_type == "download":
         # در دانلودها آرگومان‌ها یا (target_link, dest_dir) هستند یا (bot, chat_id, target_link, dest_dir)
-        link_str = ""
         dest_p = None
         for a in args:
             if isinstance(a, Path):
                 dest_p = a
-            elif isinstance(a, str) and (a.startswith(("http", "magnet:")) or a.endswith(".torrent")):
-                link_str = a
 
         if dest_p:
             info["dest_dir"] = f"{dest_p.parent.name}/{dest_p.name}" if dest_p.parent else dest_p.name
-            # اگر در حین دانلود فایلی در پوشه ساخته شده، نام واقعی آن را بردار
-            if dest_p.exists() and dest_p.is_dir():
-                vids = sorted(
-                    [f for f in dest_p.iterdir() if f.is_file() and not f.name.startswith("_")],
-                    key=lambda x: x.stat().st_mtime,
-                    reverse=True
-                )
-                if vids:
-                    info["file_name"] = vids[0].name.replace(".aria2", "")
-
-        if not info["file_name"] and link_str:
-            if link_str.startswith("magnet:"):
-                m_dn = re.search(r"dn=([^&]+)", link_str)
-                info["file_name"] = unquote(m_dn.group(1)) if m_dn else "Magnet Torrent"
-            else:
-                parsed_path = unquote(urlparse(link_str).path)
-                info["file_name"] = Path(parsed_path).name or link_str[:40]
+        info["file_name"] = download_display_name(t)
 
     elif t.queue_type == "mkvtoolnix":
         # آرگومان‌ها: (raw_video, output_file, ...)
@@ -181,7 +161,8 @@ def _format_task_card_html(t: QueueTask, pending_pos: tuple[int, int] = (0, 0)) 
     p_info = _extract_task_paths_info(t)
     metrics = _parse_metrics_by_type(t.queue_type, t.progress)
 
-    safe_file = html.escape(p_info["file_name"][:60])
+    filename = p_info["file_name"]
+    safe_file = html.escape(smart_middle_truncate(filename, 120) if t.queue_type == "download" else filename[:60])
     safe_dest = html.escape(p_info["dest_dir"][:55])
     safe_status = html.escape(str(t.status))
     elapsed = getattr(t, "elapsed_str", "00:00")
@@ -228,7 +209,7 @@ def _format_task_card_html(t: QueueTask, pending_pos: tuple[int, int] = (0, 0)) 
         safe_err = html.escape(str(t.error)[:140])
         lines.append(f"   ⚠️ <b>خطا:</b> <code>{safe_err}</code>")
 
-    if t.result and isinstance(t.result, list) and len(t.result) > 0:
+    if t.queue_type != "download" and isinstance(t.result, list) and t.result:
         first_link = html.escape(str(t.result[0]))
         lines.append(f"   🔗 <b>لینک ({len(t.result)}):</b> <code>{first_link}</code>")
 

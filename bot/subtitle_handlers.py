@@ -2918,10 +2918,13 @@ async def _watch_remote_subtitle_media_sync(
     )
     while not task.is_finished:
         progress = html.escape(str(task.progress or task.status or "در انتظار"))
+        filename = html.escape(getattr(task, "download_name", "")[:160])
+        file_line = f"📄 فایل: <code>{filename}</code>\n" if filename else ""
         status_text = (
             "📥 <b>در حال دریافت فایل‌های رسانه از سرور</b>\n"
             f"{title_line}\n"
             f"☁️ سرور: <b>{html.escape(server_name)}</b>\n"
+            f"{file_line}"
             f"⚙️ وضعیت: {progress}"
         )
         await safe_throttled_edit_text(

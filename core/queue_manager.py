@@ -12,6 +12,7 @@ from datetime import datetime
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Coroutine
+from urllib.parse import parse_qs, unquote, urlsplit
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -151,6 +152,8 @@ class QueueTask:
     notify_completion: bool = True
     batch_id: str | None = None
     awaiting_server_selection: bool = False
+    download_name: str = ""
+    download_work_dir: Path | None = None
 
     @property
     def elapsed_str(self) -> str:
@@ -163,6 +166,66 @@ class QueueTask:
         if h > 0:
             return f"{h:02d}:{m:02d}:{s:02d}"
         return f"{m:02d}:{s:02d}"
+
+
+def download_display_name(task: QueueTask) -> str:
+    """Use files from this task's private work directory while it is downloading."""
+    work_dir = getattr(task, "download_work_dir", None)
+    if work_dir is not None:
+        try:
+            names = {
+                path.name.removesuffix(".aria2").removesuffix(".!qB")
+                for path in work_dir.rglob("*")
+                if path.is_file() and not (path.name.startswith(".") and path.suffix == ".parts")
+            }
+        except OSError:
+            names = set()
+        if names:
+            if any(isinstance(arg, str) and "drive.google.com" in arg for arg in task.args):
+                names = {re.sub(r"[a-z0-9_]{8}\.part$", "", name) for name in names}
+            return ", ".join(sorted(names, key=str.casefold))
+
+    name = getattr(task, "download_name", "")
+    if name:
+        return name
+    for arg in task.args:
+        if not isinstance(arg, str):
+            continue
+        target = arg.strip()
+        lower = target.lower()
+        if lower.startswith(("http://", "https://", "magnet:")):
+            try:
+                parsed = urlsplit(target)
+            except ValueError:
+                continue
+            if parsed.scheme == "magnet":
+                return next(iter(parse_qs(parsed.query).get("dn", ())), task.title)
+            if parsed.hostname in {"drive.google.com", "mega.nz", "mega.co.nz"}:
+                return task.title
+            return Path(unquote(parsed.path)).name or task.title
+        if lower.endswith(".torrent"):
+            return Path(target).name
+    return task.title
+
+
+if "_CURRENT_DOWNLOAD_TASK" not in globals():
+    _CURRENT_DOWNLOAD_TASK: ContextVar[QueueTask | None] = ContextVar(
+        "current_download_task", default=None
+    )
+
+
+def set_download_work_dir(path: Path | None) -> None:
+    task = _CURRENT_DOWNLOAD_TASK.get()
+    if task is not None:
+        if path is None and getattr(task, "download_work_dir", None) is not None:
+            task.download_name = download_display_name(task)
+        task.download_work_dir = path
+
+
+def set_download_file_name(name: str) -> None:
+    task = _CURRENT_DOWNLOAD_TASK.get()
+    if task is not None and name:
+        task.download_name = name
 
 
 class QueueManager:
@@ -235,6 +298,7 @@ class QueueManager:
         priority_top: bool = False,
         notify_completion: bool | None = None,
         batch_id: str | None = None,
+        download_name: str = "",
         **kwargs
     ) -> QueueTask:
         self._ensure_internal_structures()
@@ -265,6 +329,7 @@ class QueueManager:
             kwargs=kwargs,
             notify_completion=effective_notify_completion,
             batch_id=effective_batch_id,
+            download_name=download_name,
         )
         self.tasks[task_id] = task
         _record_daily_activity(
@@ -550,7 +615,16 @@ class QueueManager:
             return
 
         out_path: Path | None = None
-        if isinstance(res, Path):
+        download_files: list[Path] = []
+        if task.queue_type == "download":
+            if isinstance(res, Path) and res.is_file():
+                download_files = [res]
+            elif isinstance(res, list):
+                download_files = [path for path in res if isinstance(path, Path)]
+            out_path = next((path for path in download_files if path.is_file()), None)
+            if out_path is None and local_ref_path is not None and local_ref_path.is_dir():
+                out_path = local_ref_path
+        elif isinstance(res, Path):
             out_path = res
         elif isinstance(res, str) and res.strip():
             try:
@@ -584,8 +658,17 @@ class QueueManager:
                     f"📂 <b>محل ذخیره:</b>\n<code>{html.escape(str(out_path.parent))}</code>\n"
                     f"📦 <b>حجم نهایی:</b> <code>{size_mb:.2f} MB</code>"
                 )
+                if len(download_files) > 1:
+                    other_names = [
+                        html.escape(path.name[:160]) for path in download_files if path != out_path
+                    ]
+                    details += "\n📄 <b>فایل‌های دیگر:</b> " + ", ".join(other_names[:5])
+                    if len(other_names) > 5:
+                        details += f" (+ {len(other_names) - 5})"
             elif out_path.is_dir():
                 target_dir_for_kb = out_path
+                details = f"\n📂 <b>پوشه مقصد:</b>\n<code>{html.escape(str(out_path))}</code>"
+            if out_path.is_dir() and task.queue_type != "download":
                 files_in_dir = sorted(
                     [
                         f for f in out_path.rglob("*")
@@ -604,11 +687,11 @@ class QueueManager:
                         f"📂 <b>پوشه مقصد:</b>\n<code>{html.escape(str(out_path))}</code>\n"
                         f"📦 <b>حجم فایل:</b> <code>{size_mb:.2f} MB</code>"
                     )
-                else:
-                    details = f"\n📂 <b>پوشه مقصد:</b>\n<code>{html.escape(str(out_path))}</code>"
 
         if task.queue_type == "download":
             header = "📥 <b>دانلود فایل با موفقیت به پایان رسید!</b>"
+            if target_file_for_kb is None:
+                safe_title = html.escape(download_display_name(task)[:200])
         elif task.queue_type == "mkvtoolnix":
             header = "🎬 <b>عملیات سافت‌ساب (SoftSub) تکمیل شد!</b>"
         elif task.queue_type == "handbrake":
@@ -659,6 +742,9 @@ class QueueManager:
             notify_context_token = _CURRENT_AUTOMATION_NOTIFY_COMPLETION.set(
                 task_notify_completion
             )
+            download_context_token = _CURRENT_DOWNLOAD_TASK.set(
+                task if task.queue_type == "download" else None
+            )
             try:
                 coro = task.func(*task.args, **kwargs)
                 run_task = asyncio.create_task(coro)
@@ -671,6 +757,8 @@ class QueueManager:
                 task.progress = "100%"
                 task.is_finished = True
                 result_path = str(res) if isinstance(res, (str, Path)) else ""
+                if task.queue_type == "download" and isinstance(res, list) and res and isinstance(res[0], Path):
+                    result_path = str(res[0])
                 _record_daily_activity(
                     "task_completed",
                     task_id=task.task_id,
@@ -752,16 +840,18 @@ class QueueManager:
                     error=str(e)[:700],
                 )
                 if task_notify_completion:
+                    name = download_display_name(task)[:200] if task.queue_type == "download" else task.title
                     await self._notify_admins(
                         f"❌ <b>خطا در پردازش!</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"🆔 کد: <code>{html.escape(str(task.task_id))}</code>  ▏  ⏱ زمان: <code>{task.elapsed_str}</code>\n"
                         f"⚙️ بخش: <code>{html.escape(task.queue_type.upper())}</code>\n"
-                        f"📌 عنوان: <code>{html.escape(str(task.title))}</code>\n"
+                        f"📌 عنوان: <code>{html.escape(str(name))}</code>\n"
                         f"⚠️ جزئیات خطا:\n<code>{html.escape(str(e)[:400])}</code>"
                     )
             finally:
                 task.running_asyncio_task = None
+                _CURRENT_DOWNLOAD_TASK.reset(download_context_token)
                 _CURRENT_AUTOMATION_NOTIFY_COMPLETION.reset(notify_context_token)
                 _CURRENT_AUTOMATION_BATCH_ID.reset(batch_context_token)
 
