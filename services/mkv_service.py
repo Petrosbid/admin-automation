@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -904,16 +905,74 @@ class MKVService:
             if progress_callback:
                 progress_callback("مرحله ۲/۲: تبدیل فایل واسط MKV به MP4 با حفظ ترک‌های زیرنویس...")
 
+            # Use the validated MKV as the source for video/audio, but add each
+            # external SRT as its own FFmpeg input. This avoids relying on an
+            # FFmpeg build's Matroska subtitle demuxer/stream-index handling
+            # when converting SubRip tracks to MP4 timed text (mov_text).
             ff_cmd = [
                 ffmpeg_bin,
                 "-hide_banner",
                 "-y",
                 "-i", str(temp_mkv),
+            ]
+
+            subtitle_sources: list[dict] = []
+            next_input_index = 1
+
+            if fa_srt_ready is not None:
+                if not fa_srt_ready.is_file() or fa_srt_ready.stat().st_size <= 0:
+                    raise RuntimeError(
+                        f"فایل SRT فارسی برای ورودی مستقیم MP4 وجود ندارد یا خالی است: {fa_srt_ready}"
+                    )
+                ff_cmd.extend([
+                    "-sub_charenc", "UTF-8",
+                    "-f", "srt",
+                    "-i", str(fa_srt_ready),
+                ])
+                subtitle_sources.append({
+                    "input_index": next_input_index,
+                    "language": fa_lang,
+                    "title": brand,
+                    "default": bool(fa_default),
+                    "forced": bool(fa_forced),
+                    "label": "FA",
+                })
+                next_input_index += 1
+
+            if en_srt_ready is not None:
+                if not en_srt_ready.is_file() or en_srt_ready.stat().st_size <= 0:
+                    raise RuntimeError(
+                        f"فایل SRT انگلیسی برای ورودی مستقیم MP4 وجود ندارد یا خالی است: {en_srt_ready}"
+                    )
+                ff_cmd.extend([
+                    "-sub_charenc", "UTF-8",
+                    "-f", "srt",
+                    "-i", str(en_srt_ready),
+                ])
+                subtitle_sources.append({
+                    "input_index": next_input_index,
+                    "language": en_lang,
+                    "title": brand,
+                    "default": False,
+                    "forced": False,
+                    "label": "EN",
+                })
+                next_input_index += 1
+
+            if require_fa_sub and not any(item["label"] == "FA" for item in subtitle_sources):
+                raise RuntimeError("ورودی مستقل زیرنویس فارسی برای ساخت MP4 تعریف نشده است.")
+            if require_en_sub and not any(item["label"] == "EN" for item in subtitle_sources):
+                raise RuntimeError("ورودی مستقل زیرنویس انگلیسی برای ساخت MP4 تعریف نشده است.")
+
+            # Copy video/audio from the already validated intermediate MKV.
+            # Map the subtitle files explicitly as inputs 1..N instead of
+            # relying on the subtitle stream selector from the Matroska file.
+            ff_cmd.extend([
                 "-map", "0:v?",
                 "-map", "0:a?",
-            ]
-            if muxed_tracks:
-                ff_cmd.extend(["-map", "0:s"])
+            ])
+            for item in subtitle_sources:
+                ff_cmd.extend(["-map", f'{item["input_index"]}:0'])
 
             ff_cmd.extend([
                 "-map_metadata", "0",
@@ -925,32 +984,41 @@ class MKVService:
                 "-metadata", f"title={brand}",
             ])
 
-            fa_aliases = {"fa", "fas", "per", "persian", "farsi", str(fa_lang or "").casefold()}
-            for sub_index, track in enumerate(muxed_tracks):
-                language = str(track.get("language") or "und").strip() or "und"
-                track_name = str(track.get("track_name") or brand).strip() or brand
-                is_fa_track = (
-                    language.casefold() in fa_aliases
-                    or language.casefold().split("-", 1)[0] in fa_aliases
-                )
+            for subtitle_index, item in enumerate(subtitle_sources):
                 ff_cmd.extend([
-                    f"-metadata:s:s:{sub_index}", f"language={language}",
-                    f"-metadata:s:s:{sub_index}", f"title={track_name}",
-                ])
-                dispositions = []
-                # A SoftSub track is selectable, not burned into the picture.
-                # Mark the required Persian track as the MP4 default so players
-                # that honor MP4 dispositions select it automatically.
-                if track.get("default_track") or (require_fa_sub and is_fa_track):
-                    dispositions.append("default")
-                if track.get("forced_track"):
-                    dispositions.append("forced")
-                ff_cmd.extend([
-                    f"-disposition:s:{sub_index}",
-                    "+".join(dispositions) if dispositions else "0",
+                    f"-metadata:s:s:{subtitle_index}", f'language={item["language"]}',
+                    f"-metadata:s:s:{subtitle_index}", f'title={item["title"]}',
+                    f"-disposition:s:{subtitle_index}",
+                    (
+                        "+".join(
+                            flag for flag, enabled in (
+                                ("default", item["default"]),
+                                ("forced", item["forced"]),
+                            ) if enabled
+                        )
+                        or "0"
+                    ),
                 ])
 
+            # Force the target muxer instead of relying on filename extension.
+            ff_cmd.extend(["-f", "mp4"])
             ff_cmd.append(str(output_path))
+
+            logging.info(
+                "[MP4 SOFTSUB REMUX] source_mkv=%s output=%s subtitle_inputs=%s ffmpeg=%s",
+                temp_mkv,
+                output_path,
+                [
+                    {
+                        "label": item["label"],
+                        "language": item["language"],
+                        "default": item["default"],
+                        "forced": item["forced"],
+                    }
+                    for item in subtitle_sources
+                ],
+                ffmpeg_bin,
+            )
             ff_proc = await asyncio.create_subprocess_exec(
                 *ff_cmd,
                 stdout=asyncio.subprocess.PIPE,
