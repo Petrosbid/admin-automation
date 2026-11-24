@@ -218,17 +218,37 @@ class MKVService:
                 f"ترک {language_label} در MP4 وجود دارد، اما FFmpeg هیچ زیرنویس زمان‌داری از آن استخراج نکرد."
             )
 
+        decoded_lines = decoded.splitlines()
         caption_lines = []
-        for line in decoded.splitlines():
+        for line_index, line in enumerate(decoded_lines):
             stripped = line.strip().lstrip("\ufeff")
-            if not stripped or stripped.isdigit():
+            if not stripped:
                 continue
-            if re.match(
+            is_timestamp = bool(re.match(
                 r"^\d{2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*"
                 r"\d{2}:\d{2}:\d{2}[,.]\d{1,3}$",
                 stripped,
-            ):
+            ))
+            if is_timestamp:
                 continue
+
+            # Drop SRT cue numbers only when the next non-empty line is a
+            # timestamp. A caption containing only digits remains valid text.
+            if stripped.isdigit():
+                next_line = next(
+                    (
+                        candidate.strip().lstrip("\ufeff")
+                        for candidate in decoded_lines[line_index + 1:]
+                        if candidate.strip()
+                    ),
+                    "",
+                )
+                if re.match(
+                    r"^\d{2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*"
+                    r"\d{2}:\d{2}:\d{2}[,.]\d{1,3}$",
+                    next_line,
+                ):
+                    continue
             caption_lines.append(stripped)
 
         caption_text = "\n".join(caption_lines).strip()
