@@ -51,6 +51,122 @@ class MKVService:
         return None
 
     @staticmethod
+    def _get_ffprobe_bin() -> str | None:
+        """
+        Resolve ffprobe from an explicit setting, beside ffmpeg, or PATH.
+        FFprobe is used for MP4 subtitle verification because MP4 subtitles
+        are stored as mov_text streams, not as Matroska subtitle tracks.
+        """
+        configured = str(cfg.get("paths", "ffprobe_bin", "")).strip()
+        candidates: list[Path] = []
+
+        if configured:
+            configured_path = Path(configured).expanduser()
+            if configured_path.is_file() or configured_path.name.casefold().startswith("ffprobe"):
+                candidates.append(configured_path)
+            else:
+                candidates.extend([
+                    configured_path / "ffprobe.exe",
+                    configured_path / "ffprobe",
+                    configured_path / "bin" / "ffprobe.exe",
+                    configured_path / "bin" / "ffprobe",
+                ])
+
+        ffmpeg_bin = MKVService._get_ffmpeg_bin()
+        if ffmpeg_bin:
+            ffmpeg_path = Path(ffmpeg_bin)
+            candidates.extend([
+                ffmpeg_path.with_name("ffprobe.exe"),
+                ffmpeg_path.with_name("ffprobe"),
+            ])
+
+        for executable in (shutil.which("ffprobe"), shutil.which("ffprobe.exe")):
+            if executable:
+                candidates.append(Path(executable))
+
+        candidates.extend([
+            Path("C:/ffmpeg/bin/ffprobe.exe"),
+            Path("C:/Tools/ffmpeg/bin/ffprobe.exe"),
+            Path("C:/Program Files/ffmpeg/bin/ffprobe.exe"),
+            Path.cwd() / "ffprobe.exe",
+            Path.cwd() / "ffprobe",
+        ])
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                key = str(candidate.resolve()).casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                if candidate.is_file():
+                    return str(candidate.resolve())
+            except (OSError, RuntimeError):
+                continue
+        return None
+
+    @classmethod
+    async def _list_mp4_subtitle_tracks_ffprobe(cls, video_path: Path) -> list[dict]:
+        """
+        Read MP4 timed-text (mov_text) streams with FFprobe.
+
+        Do not use mkvmerge -J for this check: MKVToolNix identifies Matroska
+        subtitle formats, while MP4 text subtitles are exposed by FFmpeg as
+        subtitle streams (normally codec_name=mov_text).
+        """
+        ffprobe_bin = cls._get_ffprobe_bin()
+        if not ffprobe_bin:
+            raise FileNotFoundError(
+                "برای تأیید ترک‌های زیرنویس MP4، ffprobe.exe پیدا نشد. "
+                "فایل ffprobe.exe را کنار ffmpeg.exe قرار دهید یا مسیر "
+                "paths.ffprobe_bin را در config تنظیم کنید."
+            )
+
+        cmd = [
+            ffprobe_bin,
+            "-v", "error",
+            "-select_streams", "s",
+            "-show_entries",
+            "stream=index,codec_name,codec_type:"
+            "stream_tags=language,language-ietf,title,handler_name:"
+            "stream_disposition=default,forced",
+            "-of", "json",
+            str(video_path),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            details = stderr.decode("utf-8", errors="replace")[-2400:]
+            raise RuntimeError(
+                f"FFprobe نتوانست ترک‌های زیرنویس MP4 را بررسی کند "
+                f"(exit={proc.returncode}): {details}"
+            )
+
+        try:
+            payload = json.loads(stdout.decode("utf-8", errors="replace") or "{}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"خروجی JSON ابزار FFprobe معتبر نیست: {exc}") from exc
+
+        result: list[dict] = []
+        for stream in payload.get("streams", []) or []:
+            tags = stream.get("tags", {}) or {}
+            disposition = stream.get("disposition", {}) or {}
+            result.append({
+                "id": stream.get("index"),
+                "codec": stream.get("codec_name", "unknown"),
+                "language": tags.get("language", "und"),
+                "language_ietf": tags.get("language-ietf", tags.get("language_ietf", "")),
+                "track_name": tags.get("title") or tags.get("handler_name", ""),
+                "default_track": bool(disposition.get("default", 0)),
+                "forced_track": bool(disposition.get("forced", 0)),
+            })
+        return result
+
+    @staticmethod
     def _get_mkvmerge_bin() -> str:
         mkv_cfg = str(cfg.get("paths", "mkvmerge_bin", "C:\\Program Files\\MKVToolNix\\mkvmerge.exe")).strip()
         if Path(mkv_cfg).is_file():
@@ -142,7 +258,12 @@ class MKVService:
     ) -> list[dict]:
         if not output_path.is_file() or output_path.stat().st_size <= 0:
             raise RuntimeError(f"فایل خروجی سافت‌ساب ساخته نشده یا خالی است: {output_path}")
-        tracks = await cls.list_subtitle_tracks(output_path)
+        # MP4 subtitle streams are timed-text (mov_text). Inspect them with
+        # FFprobe instead of mkvmerge -J, whose track model is Matroska-focused.
+        if output_path.suffix.casefold() in {".mp4", ".m4v", ".mov"}:
+            tracks = await cls._list_mp4_subtitle_tracks_ffprobe(output_path)
+        else:
+            tracks = await cls.list_subtitle_tracks(output_path)
         if not tracks and (require_fa_sub or require_en_sub):
             raise RuntimeError(f"خروجی {output_path.name} هیچ ترک زیرنویسی ندارد؛ فایل رد شد.")
 
