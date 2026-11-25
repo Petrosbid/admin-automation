@@ -10,6 +10,7 @@ from services.mkv_service import MKVService
 
 
 class HandBrakeService:
+    OUTPUT_SUFFIX = ".mp4"
     RESOLUTION_LIMITS = {
         "1080p": ("1920", "1080"),
         "720p": ("1280", "720"),
@@ -179,13 +180,13 @@ class HandBrakeService:
            - در مرحله اول فقط فایل .ass به عنوان تنها ترک زیرنویس (Track 1) وارد HandBrake می‌شود و با --subtitle-burned=1
              به صورت ۱۰۰٪ قطعی روی تصویر هاردساب (Burn-in) می‌شود.
            - در مرحله دوم، زیرنویس انگلیسی (از فایل ارسالی، پوشه srt/EN یا داخل خود فیلم) به صورت سافت‌ساب (SoftSub)
-             به کانتینر Matroska فایل خروجی اضافه می‌شود.
+             به کانتینر MP4 فایل خروجی اضافه می‌شود.
         ۲. اگر فایل ورودی زیرنویس از نوع .srt باشد:
            - بولد و زرد (#fbff00) شده، روی تصویر هاردساب (Burn-in) می‌شود و هیچ زیرنویس انگلیسی‌ای به آن اضافه نمی‌گردد.
-        پسوند نام فایل نهایی از output_media_path گرفته می‌شود.
+        فایل نهایی با پسوند .mp4 در مسیر خروجی ذخیره می‌شود.
         """
         video_path = Path(video_path).expanduser().resolve()
-        output_media_path = Path(output_media_path).expanduser().resolve()
+        output_media_path = Path(output_media_path).expanduser().resolve().with_suffix(cls.OUTPUT_SUFFIX)
         if not video_path.is_file() or video_path.stat().st_size <= 0:
             raise FileNotFoundError(f"ویدئوی ورودی HardSub پیدا نشد یا خالی است: {video_path}")
         primary_srt_path = MKVService.validate_subtitle_file(
@@ -206,9 +207,9 @@ class HandBrakeService:
         temp_styled_srt = output_media_path.with_name(f"_temp_styled_{unique_tag}.srt")
         temp_en_srt = output_media_path.with_name(f"_temp_en_soft_{unique_tag}.srt")
         temp_mkv = output_media_path.with_name(f"_temp_hb_mux_{unique_tag}.mkv")
-        temp_hb_encoded = output_media_path.with_name(f"_temp_hb_enc_{unique_tag}.mkv")
+        temp_hb_encoded = output_media_path.with_name(f"_temp_hb_enc_{unique_tag}{cls.OUTPUT_SUFFIX}")
         # merge_softsub کانتینر را از پسوند مسیر خروجی انتخاب می‌کند.
-        temp_final_output = output_media_path.with_name(f"_temp_hb_final_{unique_tag}.mkv")
+        temp_final_output = output_media_path.with_name(f"_temp_hb_final_{unique_tag}{cls.OUTPUT_SUFFIX}")
         brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
         handbrake_bin = cfg.get("paths", "handbrake_bin")
 
@@ -288,7 +289,7 @@ class HandBrakeService:
                 handbrake_bin,
                 "--preset-import-file", preset_json_path,
                 "--preset", preset_name,
-                "--format", "av_mkv",
+                "--format", "av_mp4",
                 "--input", str(temp_mkv),
                 *audio_cli_flags,
                 "--output", str(hb_target_out),

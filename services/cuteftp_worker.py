@@ -457,10 +457,12 @@ def _upload_single_file_with_retry(
     local_file: Path,
     remote_dest_dir: str,
     progress_prefix: str = "",
-    progress_callback: Callable[[str], None] | None = None
+    progress_callback: Callable[[str], None] | None = None,
+    *,
+    preserve_filename: bool = False,
 ) -> Path:
     """
-    Upload one file with retry and server-side filename alignment.
+    Upload one file with retry and optional server-side filename alignment.
 
     Every retry starts a fresh STOR from byte zero. Blind REST-resume is unsafe
     when an older file with the same name already exists: its prefix may not
@@ -493,7 +495,8 @@ def _upload_single_file_with_retry(
                     ftp_holder[0] = ftp
 
             _ensure_ftp_remote_dir(ftp, remote_dest_dir)
-            local_file = _auto_align_filename_with_server_siblings(ftp, local_file)
+            if not preserve_filename:
+                local_file = _auto_align_filename_with_server_siblings(ftp, local_file)
 
             if not local_file.is_file():
                 raise FileNotFoundError(f"فایل محلی پس از تطبیق نام پیدا نشد: {local_file}")
@@ -1315,6 +1318,8 @@ def sync_upload_cuteftp(
     remote_subpath: str = "__CURRENT__",
     progress_callback: Callable[[str], None] | None = None,
     server_config: dict | None = None,
+    *,
+    preserve_filename: bool = False,
 ) -> list[str]:
     import logging
     local_target = Path(local_target).resolve()
@@ -1389,7 +1394,8 @@ def sync_upload_cuteftp(
                     local_file=local_target,
                     remote_dest_dir=target_remote_dir,
                     progress_prefix="",
-                    progress_callback=progress_callback
+                    progress_callback=progress_callback,
+                    preserve_filename=preserve_filename,
                 )
                 public_url = _build_public_url(target_remote_dir, local_target.name)
                 if public_url:
@@ -1438,7 +1444,8 @@ def sync_upload_cuteftp(
                         local_file=file_p,
                         remote_dest_dir=dest_folder,
                         progress_prefix=prefix_str,
-                        progress_callback=progress_callback
+                        progress_callback=progress_callback,
+                        preserve_filename=preserve_filename,
                     )
                     public_url = _build_public_url(dest_folder, file_p.name)
                     if public_url:

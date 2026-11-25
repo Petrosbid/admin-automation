@@ -4182,7 +4182,7 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
             scheduled_ids.append(f"⏭ SoftSub برای `{vid.name}` اجرا نشد: {reason}")
 
         if mode in ("hardsub", "both") and chosen_preset and video_fa_sub and video_fa_sub.is_file():
-            hard_out = hard_dir / f"{base_stem}.HardSub.EBTV.mkv"
+            hard_out = hard_dir / f"{base_stem}.HardSub.EBTV{HandBrakeService.OUTPUT_SUFFIX}"
             primary_sub = video_fa_sub
             is_fa_ass = bool(video_fa_sub and video_fa_sub.suffix.lower() in (".ass", ".ssa"))
             secondary_sub = video_en_sub if is_fa_ass else None

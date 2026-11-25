@@ -175,7 +175,9 @@ async def _send_missing_remote_folder_upload_prompt(
     bot: Bot,
     chat_id: int,
     vid_path: Path,
-    remote_folder_path: str
+    remote_folder_path: str,
+    *,
+    preserve_filename: bool = False,
 ):
     """وقتی بعد از دانلود می‌خواهد فایلی را آپلود کند اما پوشه‌اش روی سرور نیست، از کاربر سوال می‌پرسد"""
     token = uuid.uuid4().hex[:6]
@@ -183,6 +185,7 @@ async def _send_missing_remote_folder_upload_prompt(
         "type": "missing_remote_folder",
         "vid_path": str(vid_path.resolve()),
         "remote_dir": remote_folder_path,
+        "preserve_filename": preserve_filename,
     }
     kb = InlineKeyboardBuilder()
     kb.row(
@@ -310,6 +313,8 @@ async def _process_selected_fullhd_source(
     episode_tag: str,
     automated_background: bool = False,
     source_already_handled: bool = False,
+    *,
+    preserve_filename: bool = False,
 ):
     source_path = Path(source_path).resolve()
     if not source_path.is_file():
@@ -351,6 +356,7 @@ async def _process_selected_fullhd_source(
             source_path,
             remote_dir,
             notify_completion=not automated_background,
+            preserve_filename=preserve_filename,
         )
     elif not automated_background and not remote_info.get("exists"):
         await _send_missing_remote_folder_upload_prompt(
@@ -358,6 +364,7 @@ async def _process_selected_fullhd_source(
             chat_id,
             source_path,
             remote_dir,
+            preserve_filename=preserve_filename,
         )
 
     await _check_and_prompt_auto_softsub_for_new_quality(
@@ -668,7 +675,6 @@ async def _smart_download_pipeline_job(
                 chat_id=chat_id,
                 vid_path=vid,
                 is_series=is_series,
-                movie_quality=movie_quality,
                 season_or_movie_dir=season_or_movie_dir,
                 ep_tag=ep_tag,
                 automated_background=automated_background,
@@ -680,6 +686,7 @@ async def _smart_download_pipeline_job(
                 series_or_movie_title=series_or_movie_title,
                 season_ep_tag=ep_tag,
                 is_series=is_series,
+                movie_quality=movie_quality,
             )
             if automated_background:
                 vid = _rename_downloaded_video(vid, suggested_std_name)
@@ -1499,7 +1506,8 @@ async def cb_pdl_fullhd_upload_yes(call: CallbackQuery):
         f"AutoUpload [{remote_dir}]: {vid_path.name}",
         CuteFTPService.upload_path,
         vid_path,
-        remote_dir
+        remote_dir,
+        preserve_filename=info.get("preserve_filename", False),
     )
     await call.message.edit_text(
         f"☁️ پوشه مقصد ساخته و آپلود فایل `{vid_path.name}` به مسیر `{remote_dir}` در صف قرار گرفت! (کد: `{task.task_id}`)",
@@ -1552,6 +1560,7 @@ async def _finalize_post_dl_rename_and_upload(
             await msg_or_call.answer(confirmation, parse_mode="HTML")
         return await _process_selected_fullhd_source(
             bot, chat_id, vid_path, season_or_movie_dir, is_ser, ep_tag,
+            preserve_filename=True,
         )
 
     if info.get("movie_source_group"):
@@ -1563,7 +1572,9 @@ async def _finalize_post_dl_rename_and_upload(
             await msg_or_call.message.edit_text(confirmation, parse_mode="HTML")
         else:
             await msg_or_call.answer(confirmation, parse_mode="HTML")
-        await _send_missing_remote_folder_upload_prompt(bot, chat_id, vid_path, remote_dir)
+        await _send_missing_remote_folder_upload_prompt(
+            bot, chat_id, vid_path, remote_dir, preserve_filename=True,
+        )
         return await _check_and_prompt_auto_softsub_for_new_quality(
             bot, chat_id, vid_path, is_ser, season_or_movie_dir, ep_tag,
         )
@@ -1574,7 +1585,8 @@ async def _finalize_post_dl_rename_and_upload(
             f"AutoUpload [{remote_dir}]: {vid_path.name}",
             CuteFTPService.upload_path,
             vid_path,
-            remote_dir
+            remote_dir,
+            preserve_filename=True,
         )
         done_txt = (
             f"✅ نام فایل به:\n`{vid_path.name}`\nتغییر یافت و آپلود خودکار آن به مسیر `{remote_dir}` در صف قرار گرفت! (کد: `{task.task_id}`)"
