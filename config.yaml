@@ -41,6 +41,7 @@ monitor:
 
 paths:
   workspace_dir: "C:\\MediaBot\\workspace"
+  data_dir: "C:\\MediaBot\\mediabot-data"
   presets_dir: "C:\\MediaBot\\presets"
   aria2c_bin: "C:\\Tools\\aria2\\aria2c.exe"
   mkvmerge_bin: "E:\\MKVToolNix\\mkvmerge.exe"

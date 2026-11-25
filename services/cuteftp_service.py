@@ -704,6 +704,7 @@ class CuteFTPService:
         server_id: str | None = None,
         *,
         preserve_filename: bool = False,
+        skip_identical: bool = False,
     ) -> list[str]:
         selected_server = await cls._resolve_upload_server(remote_subpath, server_id)
         return await asyncio.to_thread(
@@ -713,6 +714,7 @@ class CuteFTPService:
             progress_callback,
             selected_server,
             preserve_filename=preserve_filename,
+            skip_identical=skip_identical,
         )
 
     @classmethod

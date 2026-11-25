@@ -6,6 +6,7 @@ import re
 import shutil
 import tempfile
 import uuid
+from weakref import WeakValueDictionary
 from pathlib import Path
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardButton
@@ -213,7 +214,26 @@ async def _send_missing_remote_folder_upload_prompt(
         parse_mode="Markdown"
     )
 
+_english_download_locks: WeakValueDictionary = WeakValueDictionary()
+
+
 async def _extract_and_queue_fullhd_english_subtitle(
+    bot: Bot,
+    chat_id: int,
+    video_path: Path,
+    season_or_movie_dir: Path,
+    is_series: bool,
+    episode_tag: str,
+) -> Path | None:
+    key = (Path(season_or_movie_dir).resolve(), episode_tag.upper() if is_series else "")
+    lock = _english_download_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        return await _prepare_fullhd_english_subtitle(
+            bot, chat_id, video_path, season_or_movie_dir, is_series, episode_tag
+        )
+
+
+async def _prepare_fullhd_english_subtitle(
     bot: Bot,
     chat_id: int,
     video_path: Path,
@@ -239,6 +259,9 @@ async def _extract_and_queue_fullhd_english_subtitle(
         if plan.category == "Anime":
             logging.info("Skipping separate EN subtitle extraction for Anime: %s", video_path.name)
             return None
+        existing_en = AutomationService.find_existing_english_sidecar(plan)
+        if existing_en:
+            return existing_en
         existing_en = await AutomationService.extract_english_subtitle_for_plan(
             plan,
             preferred_video=video_path,
@@ -278,6 +301,7 @@ async def _extract_and_queue_fullhd_english_subtitle(
             CuteFTPService.upload_path,
             existing_en,
             remote_dir,
+            skip_identical=True,
             notify_completion=True,
         )
     except Exception as exc:
@@ -415,7 +439,7 @@ async def _smart_download_pipeline_job(
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     # هر لینک پوشه staging مستقل دارد؛ بنابراین تسک‌ها فایل‌های یکدیگر را نمی‌بینند.
-    staging_dir = dest_dir / "_incoming_downloads" / uuid.uuid4().hex[:12]
+    staging_dir = cfg.data_dir / "_incoming_downloads" / uuid.uuid4().hex[:12]
     staging_dir.mkdir(parents=True, exist_ok=True)
     set_download_work_dir(staging_dir)
     new_videos: list[Path] = []
@@ -506,9 +530,7 @@ async def _smart_download_pipeline_job(
                     reason = AUDIO_MISMATCH
 
             if reason:
-                quarantine_dir = (
-                    dest_dir / "_rejected_downloads" / uuid.uuid4().hex[:10]
-                )
+                quarantine_dir = cfg.data_dir / "_rejected_downloads" / uuid.uuid4().hex[:10]
                 quarantine_dir.mkdir(parents=True, exist_ok=True)
                 for item in staged_videos:
                     if item.exists():
@@ -554,12 +576,6 @@ async def _smart_download_pipeline_job(
     finally:
         set_download_work_dir(None)
         shutil.rmtree(staging_dir, ignore_errors=True)
-        try:
-            staging_parent = staging_dir.parent
-            if staging_parent.exists() and not any(staging_parent.iterdir()):
-                staging_parent.rmdir()
-        except OSError:
-            pass
 
     if not new_videos:
         logging.info("Download contained no new video files in %s", dest_dir)
@@ -1071,7 +1087,7 @@ async def _schedule_fullhd_destination_automation(
         ep_tag if is_series and ep_tag else None,
     )
     fa_sub = None
-    en_sub = plan.existing_en_sub if plan.existing_en_sub and plan.existing_en_sub.exists() else None
+    en_sub = AutomationService.find_existing_english_sidecar(plan) if plan.category != "Anime" else None
     try:
         candidates = AutomationService.find_local_fa_subtitles(plan)
         key = plan.season_ep_tag if (plan.is_series and plan.season_ep_tag) else "MOVIE"
@@ -1232,7 +1248,7 @@ async def _check_and_prompt_auto_softsub_for_new_quality(
         if not remote_sub:
             return
 
-    en_sub = plan.existing_en_sub if (plan.existing_en_sub and plan.existing_en_sub.exists()) else None
+    en_sub = AutomationService.find_existing_english_sidecar(plan) if plan.category != "Anime" else None
 
     if is_series and vid_path.parent.resolve() != season_or_movie_dir.resolve():
         soft_out_dir = season_or_movie_dir / f"{vid_path.parent.name}-SoftSub"
@@ -1824,8 +1840,9 @@ async def cb_direct_dl(call: CallbackQuery, state: FSMContext):
     await state.set_state(DownloadStates.waiting_direct_link)
     await call.message.edit_text(
         "📥 **دانلود هوشمند فیلم یا سریال (تکی و گروهی Batch)**\n\n"
-        "🔗 لطفاً **یک یا چند لینک (مستقیم، Magnet، Mega.nz، Google Drive)** را ارسال کنید:\n"
+        "🔗 لطفاً **یک یا چند لینک (مستقیم، Magnet، Mega.nz، Google Drive، FileQ)** را ارسال کنید:\n"
         "• برای **دانلود گروهی (Batch)**، بین هر لینک یک خط فاصله بگذارید.\n"
+        "• برای FileQ، اگر سایت تأیید خواست، آن را در مرورگر دستگاهی که ربات روی آن اجرا می‌شود انجام دهید.\n"
         "• پس از دانلود، اگر فایل زیپ باشد خودکار خارج می‌شود، نام آن از روی قسمت‌های قبلی سرور کپی (یا استانداردسازی) شده و در همان پوشه در سرور آپلود می‌گردد:",
         parse_mode="Markdown"
     )
@@ -1834,7 +1851,7 @@ async def cb_direct_dl(call: CallbackQuery, state: FSMContext):
 @router.message(DownloadStates.waiting_direct_link)
 async def handle_direct_link_input(message: Message, state: FSMContext):
     if message.document and message.document.file_name and message.document.file_name.lower().endswith(".torrent"):
-        temp_dir = Path(cfg.get("paths", "workspace_dir")) / "_incoming_torrents"
+        temp_dir = cfg.data_dir / "_incoming_torrents"
         temp_dir.mkdir(parents=True, exist_ok=True)
         t_path = temp_dir / message.document.file_name
         await message.bot.download(message.document, destination=t_path)
@@ -2254,7 +2271,7 @@ async def handle_link_for_sub_extract(message: Message, state: FSMContext):
     targets: list[str] = []
     if message.document and message.document.file_name and message.document.file_name.lower().endswith(".torrent"):
         job_uid = str(uuid.uuid4())[:6]
-        temp_dir = Path(cfg.get("paths", "workspace_dir")) / f"SubExtract_{job_uid}"
+        temp_dir = cfg.data_dir / f"SubExtract_{job_uid}"
         temp_dir.mkdir(parents=True, exist_ok=True)
         t_path = temp_dir / message.document.file_name
         await message.bot.download(message.document, destination=t_path)
@@ -2268,7 +2285,7 @@ async def handle_link_for_sub_extract(message: Message, state: FSMContext):
     task_ids = []
     for t_link in targets:
         job_uid = str(uuid.uuid4())[:6]
-        temp_dir = Path(cfg.get("paths", "workspace_dir")) / f"SubExtract_{job_uid}"
+        temp_dir = cfg.data_dir / f"SubExtract_{job_uid}"
         temp_dir.mkdir(parents=True, exist_ok=True)
         task = await queue_engine.add_task(
             "download",
@@ -2345,7 +2362,7 @@ async def cb_link_purpose(call: CallbackQuery, state: FSMContext):
         task_ids = []
         for target in targets:
             job_uid = uuid.uuid4().hex[:6]
-            temp_dir = Path(cfg.get("paths", "workspace_dir")) / f"SubExtract_{job_uid}"
+            temp_dir = cfg.data_dir / f"SubExtract_{job_uid}"
             temp_dir.mkdir(parents=True, exist_ok=True)
             task = await queue_engine.add_task(
                 "download",
@@ -2572,7 +2589,7 @@ async def receive_download_torrent(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     if message.document.file_name and message.document.file_name.lower().endswith(".torrent"):
-        temp_dir = Path(cfg.get("paths", "workspace_dir")) / "_incoming_torrents"
+        temp_dir = cfg.data_dir / "_incoming_torrents"
         temp_dir.mkdir(parents=True, exist_ok=True)
         t_path = temp_dir / message.document.file_name
         await message.bot.download(message.document, destination=t_path)

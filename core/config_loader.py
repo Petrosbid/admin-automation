@@ -127,6 +127,16 @@ class ConfigManager:
             return sec.get(key, default)
         return default
 
+    @property
+    def data_dir(self) -> Path:
+        workspace = Path(self.get("paths", "workspace_dir") or "./workspace").resolve()
+        configured = self.get("paths", "data_dir")
+        path = Path(configured).resolve() if configured else workspace.with_name("mediabot-data")
+        if path.is_relative_to(workspace):
+            raise ValueError("paths.data_dir must be outside paths.workspace_dir")
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     def set_value(self, section: str, key: str, value: Any):
         """Change a non-secret setting; credentials must be changed in .env."""
         if key.casefold() in {"bot_token", "password", "username", "admin_ids"}:

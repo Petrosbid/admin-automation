@@ -1,3 +1,4 @@
+import hashlib
 import os
 import posixpath
 import uuid
@@ -460,6 +461,7 @@ def _upload_single_file_with_retry(
     progress_callback: Callable[[str], None] | None = None,
     *,
     preserve_filename: bool = False,
+    skip_identical: bool = False,
 ) -> Path:
     """
     Upload one file with retry and optional server-side filename alignment.
@@ -513,6 +515,18 @@ def _upload_single_file_with_retry(
                 existing_remote_size = ftp.size(local_file.name)
             except Exception:
                 existing_remote_size = None
+
+            if skip_identical and existing_remote_size == total_size:
+                remote_digest = hashlib.sha256()
+                try:
+                    ftp.retrbinary(f"RETR {local_file.name}", remote_digest.update)
+                except error_perm:
+                    logging.info("FTP read unavailable for %s; proceeding with upload", local_file.name)
+                else:
+                    with local_file.open("rb") as source:
+                        local_digest = hashlib.sha256(source.read()).digest()
+                    if remote_digest.digest() == local_digest:
+                        return local_file
 
             if existing_remote_size is not None and progress_callback:
                 progress_callback(
@@ -1320,6 +1334,7 @@ def sync_upload_cuteftp(
     server_config: dict | None = None,
     *,
     preserve_filename: bool = False,
+    skip_identical: bool = False,
 ) -> list[str]:
     import logging
     local_target = Path(local_target).resolve()
@@ -1396,6 +1411,7 @@ def sync_upload_cuteftp(
                     progress_prefix="",
                     progress_callback=progress_callback,
                     preserve_filename=preserve_filename,
+                    skip_identical=skip_identical,
                 )
                 public_url = _build_public_url(target_remote_dir, local_target.name)
                 if public_url:

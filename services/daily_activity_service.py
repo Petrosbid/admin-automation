@@ -27,7 +27,7 @@ class DailyActivityService:
 
     @classmethod
     def _state_dir(cls) -> Path:
-        root = Path(cfg.get("paths", "workspace_dir", "./workspace")).resolve() / "_state"
+        root = cfg.data_dir / "_state"
         root.mkdir(parents=True, exist_ok=True)
         return root
 

@@ -57,14 +57,14 @@ class EZTVTrackerService:
 
     @property
     def state_file(self) -> Path:
-        path = self._workspace() / "_state" / "eztv_tracker_state.json"
+        path = cfg.data_dir / "_state" / "eztv_tracker_state.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
     @property
     def managed_shows_file(self) -> Path:
         """Managed show list is stored separately so Telegram edits never rewrite config.yaml."""
-        path = self._workspace() / "_state" / "eztv_tracker_shows.json"
+        path = cfg.data_dir / "_state" / "eztv_tracker_shows.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 

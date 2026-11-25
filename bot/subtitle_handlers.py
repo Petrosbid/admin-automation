@@ -65,7 +65,7 @@ async def _collect_subtitle_documents(
         destination_root: Path,
 ) -> tuple[list[Path], Path]:
     """Download one Telegram document/album into isolated staging folders and extract subtitle archives."""
-    batch_root = destination_root / "_incoming_subs" / uuid.uuid4().hex[:10]
+    batch_root = cfg.data_dir / "_incoming_subs" / uuid.uuid4().hex[:10]
     batch_root.mkdir(parents=True, exist_ok=True)
     candidates: list[Path] = []
 
@@ -1374,6 +1374,7 @@ async def _execute_smart_automation_batch(
                     r_dir_en,
                     server_id=server_id,
                     batch_id=batch_id,
+                    skip_identical=True,
                     notify_completion=False,
                 )
                 batch_tasks.append(en_task)
@@ -2446,7 +2447,7 @@ async def catch_direct_subtitle_drop_for_smart_auto(message: Message, state: FSM
         parse_mode="HTML"
     )
 
-    temp_dir = Path(cfg.get("paths", "workspace_dir")) / "_incoming_subs" / uuid.uuid4().hex[:8]
+    temp_dir = cfg.data_dir / "_incoming_subs" / uuid.uuid4().hex[:8]
     temp_dir.mkdir(parents=True, exist_ok=True)
     saved_p = temp_dir / fname
     try:
@@ -3282,6 +3283,28 @@ def _find_local_subtitles_for_video(video_path: Path) -> list[Path]:
     return found
 
 
+def _local_english_for_video(video: Path) -> Path | None:
+    season = AutomationService.extract_season_num_from_dir(video.parent)
+    episode = AutomationService.extract_episode_tag(video.name, fallback_season=season)
+    candidates = _find_local_subtitles_for_video(video)
+    if AutomationService.SEASON_DIR_REGEX.match(video.parent.parent.name) or re.search(
+        r"fullhd|(?:480|720|1080|2160)p|raw_temp", video.parent.name, re.I
+    ):
+        candidates.extend(_find_local_subtitles_for_video(video.parent.parent / video.name))
+    matches = []
+    for sub in dict.fromkeys(candidates):
+        if not (AutomationService._is_english_subtitle_filename(sub.name)
+                or sub.parent.name.casefold() in {"en", "eng", "english"}):
+            continue
+        if AutomationService.extract_episode_tag(sub.name, fallback_season=season) != episode:
+            continue
+        if sub.stat().st_size:
+            if sub.stem.casefold().startswith(video.stem.casefold() + "."):
+                return sub
+            matches.append(sub)
+    return matches[0] if len(matches) == 1 else None
+
+
 def _format_current_filenames_prompt(data: dict) -> str:
     target_videos = [Path(p) for p in data.get("target_videos", [])]
     if len(target_videos) == 1:
@@ -3592,6 +3615,20 @@ async def _after_fa_subtitle_chosen(
         if isinstance(msg_or_call, CallbackQuery):
             return await msg_or_call.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
         return await msg_or_call.answer(text, reply_markup=kb, parse_mode="Markdown")
+
+
+    videos = [Path(path) for path in data["target_videos"]]
+    for video in videos:
+        if _local_english_for_video(video):
+            continue
+        if not await MKVService.preferred_english_track(video, text_only=video.suffix.lower() == ".mp4"):
+            return await _prompt_en_subtitle_step(msg_or_call, state)
+    await state.update_data(en_sub_path=None)
+    await state.set_state(SubtitleStates.waiting_sync_choice)
+    message = msg_or_call.message if isinstance(msg_or_call, CallbackQuery) else msg_or_call
+    send = message.edit_text if isinstance(msg_or_call, CallbackQuery) else message.answer
+    await send("زیرنویس انگلیسی برای هر فایل آماده است. روش سینک زیرنویس فارسی را انتخاب کنید.",
+               reply_markup=sync_options_kb())
 
 
 async def _prompt_fa_subtitle_step(msg_or_call: Message | CallbackQuery, state: FSMContext):
@@ -4148,6 +4185,9 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
                 video_en_sub = None
             elif expected_batch_episode and en_ep and en_ep != expected_batch_episode:
                 video_en_sub = None
+
+        if video_en_sub is None:
+            video_en_sub = _local_english_for_video(vid)
 
         if custom_output_dir:
             out_dir = Path(custom_output_dir)

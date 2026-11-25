@@ -1484,15 +1484,7 @@ class AutomationService:
         return plans
 
     @classmethod
-    async def extract_english_subtitle_for_plan(
-            cls,
-            plan: AutomationPlan,
-            preferred_video: Path | None = None,
-    ) -> Path | None:
-        """
-        Find and extract one explicit English text subtitle for this movie/episode.
-        Tracks with unknown (und) or non-English languages are NOT auto-assumed as English.
-        """
+    def find_existing_english_sidecar(cls, plan: AutomationPlan) -> Path | None:
         if plan.existing_en_sub and plan.existing_en_sub.is_file():
             try:
                 if plan.existing_en_sub.stat().st_size > 0:
@@ -1594,6 +1586,22 @@ class AutomationService:
                 SubtitleService.normalize_srt_utf8(sidecar_destination)
             plan.existing_en_sub = sidecar_destination.resolve()
             return plan.existing_en_sub
+
+        return None
+
+    @classmethod
+    async def extract_english_subtitle_for_plan(
+            cls,
+            plan: AutomationPlan,
+            preferred_video: Path | None = None,
+    ) -> Path | None:
+        """
+        Find and extract one explicit English text subtitle for this movie/episode.
+        Tracks with unknown (und) or non-English languages are NOT auto-assumed as English.
+        """
+        existing = cls.find_existing_english_sidecar(plan)
+        if existing:
+            return existing
 
         ordered: list[Path] = []
         for item in (
@@ -1799,9 +1807,6 @@ class AutomationService:
                 "مسیر خروجی SoftSub با فایل خام یکسان است؛ برای جلوگیری از جایگزینی فایل اصلی، عملیات متوقف شد."
             )
         fa_sub = MKVService.validate_subtitle_file(fa_sub, "زیرنویس فارسی SoftSub")
-        if en_sub is not None:
-            en_sub = MKVService.validate_subtitle_file(en_sub, "زیرنویس انگلیسی SoftSub")
-
         logging.info(
             "[SOFTSUB AUTOMATION DISPATCH] module=%s python=%s cwd=%s "
             "source=%s output=%s fa_sub=%s en_sub=%s",

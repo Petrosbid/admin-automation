@@ -46,13 +46,19 @@ class HandBrakeService:
         secondary_en_srt_path: Path | None,
         temp_en_out: Path
     ) -> Path | None:
-        """
-        Resolve an already-extracted English subtitle for the final SoftSub mux.
+        embedded = await MKVService.preferred_english_track(video_path, text_only=True)
+        if embedded:
+            ext = MKVService.subtitle_extension_for_codec(embedded.get("codec", ""))
+            extracted = temp_en_out.with_suffix(ext)
+            try:
+                await MKVService.extract_subtitle_track(video_path, embedded["id"], extracted)
+                if extracted != temp_en_out:
+                    MKVService._ass_to_clean_srt(extracted, temp_en_out)
+                return MKVService.validate_subtitle_file(temp_en_out, "English subtitle")
+            finally:
+                if extracted != temp_en_out:
+                    extracted.unlink(missing_ok=True)
 
-        Embedded subtitle extraction is intentionally not performed here.
-        English tracks are extracted only by the post-FullHD-download pipeline,
-        then passed to HandBrake as an external subtitle file.
-        """
         candidate: Path | None = None
         if secondary_en_srt_path and Path(secondary_en_srt_path).is_file():
             candidate = Path(secondary_en_srt_path)

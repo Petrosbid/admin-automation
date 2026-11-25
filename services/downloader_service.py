@@ -12,6 +12,7 @@ import gdown
 from core.config_loader import cfg
 from core.proxy_manager import ProxyManager
 from core.queue_manager import set_download_file_name
+from services.fileq_service import download_fileq, is_fileq_url
 
 
 class _TorrentAlreadySubmittedError(RuntimeError):
@@ -108,6 +109,9 @@ class DownloaderService:
         dest_dir.mkdir(parents=True, exist_ok=True)
         target = url_or_magnet.strip()
         url_lower = target.lower()
+
+        if is_fileq_url(target):
+            return await download_fileq(target, dest_dir, progress_callback)
 
         if cls.is_torrent_target(target):
             try:

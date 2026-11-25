@@ -493,6 +493,14 @@ class MKVService:
         return ".srt"
 
     @classmethod
+    async def preferred_english_track(cls, video_path: Path, text_only: bool) -> dict | None:
+        tracks = await cls.list_subtitle_tracks(video_path)
+        return next((
+            track for track in tracks if cls._is_english_track(track)
+            and (not text_only or cls.subtitle_extension_for_codec(track.get("codec", "")) in (".srt", ".ass", ".ssa"))
+        ), None)
+
+    @classmethod
     async def _inspect_tracks_with_ffprobe(cls, video_path: Path) -> dict:
         """
         Return the same normalized track structure as mkvmerge -J, but use
@@ -1355,7 +1363,15 @@ class MKVService:
             )
         if require_fa_sub and fa_sub_path is None:
             raise ValueError("برای ساخت SoftSub معتبر، زیرنویس فارسی الزامی است.")
-        if require_en_sub and en_sub_path is None:
+        embedded = None
+        if keep_old_subs:
+            embedded = await cls.preferred_english_track(
+                video_path, text_only=output_path.suffix.casefold() in cls.MP4_EXTENSIONS
+            )
+        kept_embedded_en_id = embedded["id"] if embedded else None
+        if embedded:
+            en_sub_path = None
+        if require_en_sub and en_sub_path is None and embedded is None:
             raise ValueError("زیرنویس انگلیسی برای این خروجی الزامی است.")
         if fa_sub_path is not None:
             fa_sub_path = cls.validate_subtitle_file(fa_sub_path, "زیرنویس فارسی")
@@ -1409,15 +1425,11 @@ class MKVService:
                 )
                 SubtitleService.normalize_subtitle_file(clean_en_sub)
 
-            # Detect embedded English subtitle using the container-aware method
-            # (FFprobe for MP4, mkvmerge for MKV).
-            kept_embedded_en_id: int | None = None
-            if keep_old_subs and not clean_en_sub:
-                existing_sub_tracks = await cls.list_subtitle_tracks(video_path)
-                for sub_track in existing_sub_tracks:
-                    if cls._is_english_track(sub_track):
-                        kept_embedded_en_id = sub_track.get("id")
-                        break
+            if embedded and is_mp4_output:
+                ext = cls.subtitle_extension_for_codec(embedded.get("codec", ""))
+                clean_en_sub = output_path.with_name(f"_soft_clean_en_{uid}{ext}")
+                await cls.extract_subtitle_track(video_path, kept_embedded_en_id, clean_en_sub)
+                kept_embedded_en_id = None
 
             if is_mp4_output:
                 mp4_require_fa_sub = bool(require_fa_sub or clean_fa_sub is not None)
@@ -1500,7 +1512,12 @@ class MKVService:
                 kept_embedded_en_id = None
 
             if kept_embedded_en_id is not None:
+                if clean_fa_sub:
+                    order = [f"0:{t['id']}" for t in tracks if t.get("type") in ("video", "audio")]
+                    order.extend(["1:0", f"0:{kept_embedded_en_id}"])
+                    cmd.extend(["--track-order", ",".join(order)])
                 cmd.extend([
+                    "--language", f"{kept_embedded_en_id}:{en_lang}",
                     "--subtitle-tracks", str(kept_embedded_en_id),
                     "--track-name", f"{kept_embedded_en_id}:{brand}",
                     "--default-track-flag", f"{kept_embedded_en_id}:no",

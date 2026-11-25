@@ -181,17 +181,14 @@ class SiteMonitorService:
 
     @property
     def state_file(self) -> Path:
-        ws = Path(cfg.get("paths", "workspace_dir", "./workspace")).resolve()
-        ws.mkdir(parents=True, exist_ok=True)
-        return ws / "monitor_state.json"
+        return cfg.data_dir / "monitor_state.json"
 
     @property
     def profile_dir(self) -> Path:
-        ws = Path(cfg.get("paths", "workspace_dir", "./workspace")).resolve()
         # Each bot process gets its own persistent profile. Chromium locks a user-data
         # directory; sharing one fixed path with another running bot instance causes
         # "Opening in existing browser session" and leaves the monitor without pages.
-        p_dir = ws / f"browser_profile_playwright_{os.getpid()}"
+        p_dir = cfg.data_dir / f"browser_profile_playwright_{os.getpid()}"
         p_dir.mkdir(parents=True, exist_ok=True)
         return p_dir
 
