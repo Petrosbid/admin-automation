@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime
+from functools import partial
 import html
 import importlib.util
 import json
@@ -18,6 +19,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.config_loader import cfg
 from core.proxy_manager import ProxyManager
+from services.monitor_subtitles import (
+    SUBTITLE_SITES, SubtitleAccessRequired, download_subtitle_video,
+    notification_episode, select_subtitle_video,
+)
 
 
 def _make_soup(html: str) -> BeautifulSoup:
@@ -53,7 +58,7 @@ class SiteMonitorService:
         self._pages: dict[str, object] = {}
         self._browser_lock = asyncio.Lock()
         self._check_lock = asyncio.Lock()
-        self._pw_installed = importlib.util.find_spec("playwright") is not None
+        self._pw_installed = any(importlib.util.find_spec(name) for name in ("playwright", "patchright"))
         self._browser_start_error: str = ""
         self._browser_warmup_task: asyncio.Task | None = None
         self._last_error_notified: dict[str, float] = {}
@@ -243,7 +248,10 @@ class SiteMonitorService:
     async def ensure_real_browser_open(self) -> bool:
         """Start the Playwright-managed headed Chromium browser, never silently degrade."""
         try:
-            from playwright.async_api import async_playwright
+            try:
+                from playwright.async_api import async_playwright
+            except ImportError:
+                from patchright.async_api import async_playwright
         except Exception as exc:
             self._pw_installed = False
             self._browser_start_error = (
@@ -254,16 +262,12 @@ class SiteMonitorService:
 
         self._pw_installed = True
         async with self._browser_lock:
-            if self._browser_context is not None:
-                try:
-                    _ = self._browser_context.pages
-                    return True
-                except Exception:
-                    logging.warning("Previous Playwright browser context is no longer usable.")
-                    self._browser_context = None
-                    self._pages.clear()
+            if self._browser_context is not None and self._browser_context.pages:
+                return True
 
             try:
+                if self._pw is not None:
+                    await self._pw.stop()
                 self._pw = await async_playwright().start()
                 launch_kwargs = {
                     "user_data_dir": str(self.profile_dir),
@@ -403,6 +407,57 @@ class SiteMonitorService:
             "کوکی‌ها در پروفایل اختصاصی Playwright ذخیره می‌شوند."
         )
         return result
+
+    @classmethod
+    def is_subtitle_site_url(cls, site_key: str, url: str) -> bool:
+        if site_key not in SUBTITLE_SITES:
+            return False
+        parsed = urlparse(url)
+        configured = urlparse(cls.get_site_url(site_key))
+        return (
+            parsed.scheme == "https" and bool(parsed.hostname)
+            and parsed.netloc == configured.netloc and not parsed.username and not parsed.password
+        )
+
+    async def resolve_subtitle_download(self, site_key: str, post_url: str, season: int, episode: int):
+        if not self.is_subtitle_site_url(site_key, post_url):
+            raise RuntimeError("دامنه اعلان با تنظیم فعلی سایت هماهنگ نیست. یک اعلان تازه بگیرید.")
+        if not await self.ensure_real_browser_open() or self._browser_context is None:
+            raise RuntimeError("مرورگر ربات باز نشد. وضعیت آن را با /monitor_browser بررسی کنید.")
+
+        context = self._browser_context
+        page = await context.new_page()
+        try:
+            response, error = await self._navigate_page_with_retry(page, post_url, site_key)
+            if error or not self.is_subtitle_site_url(site_key, page.url):
+                raise RuntimeError("صفحه دانلود این عنوان در مرورگر ربات باز نشد.")
+            page_html = await page.content()
+            if self._captcha_detection_reason(page_html):
+                raise SubtitleAccessRequired("سایت تأیید دستی مرورگر می‌خواهد.", post_url)
+            if response and response.status >= 400:
+                raise RuntimeError(f"صفحه دانلود پاسخ HTTP {response.status} برگرداند.")
+            video, purchase_url = select_subtitle_video(site_key, page_html, page.url, season, episode)
+            download = partial(
+                download_subtitle_video, context, referer=page.url,
+                user_agent=await page.evaluate("navigator.userAgent"), purchase_url=purchase_url,
+            )
+            return video, download
+        finally:
+            await page.close()
+
+    async def open_subtitle_access(self, site_key: str, url: str) -> bool:
+        if not self.is_subtitle_site_url(site_key, url) or self._browser_context is None:
+            return False
+        key = f"subtitle_access:{site_key}"
+        async with self._browser_lock:
+            page = self._pages.get(key)
+            if page is None or page.is_closed():
+                page = await self._browser_context.new_page()
+                self._pages[key] = page
+            await page.bring_to_front()
+            if not self.is_subtitle_site_url(site_key, page.url) or urlparse(page.url).path != urlparse(url).path:
+                await page.goto(url, wait_until="domcontentloaded", timeout=12000)
+        return True
 
     @staticmethod
     def _captcha_detection_reason(html: str) -> str | None:
@@ -917,6 +972,8 @@ class SiteMonitorService:
 
         if not posts:
             raise RuntimeError("سایت باز شد اما هیچ پستی استخراج نشد (احتمال تغییر دامنه یا صفحه کپچا).")
+        for post in posts:
+            post["site_key"] = site_key
         return posts
 
     @staticmethod
@@ -938,6 +995,14 @@ class SiteMonitorService:
     def _build_post_kb(post: dict) -> InlineKeyboardMarkup:
         builder = InlineKeyboardBuilder()
         builder.row(InlineKeyboardButton(text="🌐 باز کردن لینک پست", url=post["url"]))
+        site_key = post.get("site_key")
+        if site_key in SUBTITLE_SITES:
+            season, episode = notification_episode(post.get("details", ""))
+            builder.row(InlineKeyboardButton(
+                text="📤 استخراج خودکار زیرنویس",
+                callback_data=f"mon:sub:{site_key}:{season}:{episode}",
+            ))
+            return builder.as_markup()
         safe_title = post["title"][:35].replace(":", "").replace("/", " ")
         builder.row(
             InlineKeyboardButton(text="📁 ساخت پوشه برای این عنوان", callback_data=f"qmkdir:{safe_title}")

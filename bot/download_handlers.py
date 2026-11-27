@@ -26,6 +26,8 @@ from services.scraper_service import ScraperService
 from services.downloader_service import DownloaderService
 from services.subtitle_service import SubtitleService
 from services.mkv_service import MKVService
+from services.monitor_service import monitor_service
+from services.monitor_subtitles import SubtitleAccessRequired
 from services.nyaa_release import AUDIO_MISMATCH, audio_matches, episode_and_metadata
 from services.automation_service import AutomationService
 from services.cuteftp_service import CuteFTPService
@@ -2205,11 +2207,14 @@ async def _download_and_extract_subs_job(
     chat_id: int,
     target_link: str,
     temp_dir: Path,
-    progress_callback=None
+    progress_callback=None,
+    *,
+    download_video=None,
 ) -> list[str]:
     set_download_work_dir(temp_dir)
     try:
-        await DownloaderService.download(target_link, temp_dir, progress_callback=progress_callback)
+        download = download_video or DownloaderService.download
+        await download(target_link, temp_dir, progress_callback=progress_callback)
         videos = DownloaderService.find_video_files(temp_dir)
         if not videos:
             raise FileNotFoundError("هیچ فایل ویدئویی پس از دانلود یافت نشد.")
@@ -2226,8 +2231,7 @@ async def _download_and_extract_subs_job(
         if not extracted:
             await bot.send_message(
                 chat_id,
-                f"⚠️ فیلم `{video_file.name}` دانلود شد اما هیچ ترک زیرنویسی داخل آن وجود نداشت.",
-                parse_mode="Markdown"
+                f"⚠️ فایل {video_file.name} دانلود شد، اما هیچ ترک زیرنویسی داخل آن پیدا نشد.",
             )
             return []
 
@@ -2235,8 +2239,7 @@ async def _download_and_extract_subs_job(
             await bot.send_document(
                 chat_id,
                 FSInputFile(sub_p),
-                caption=f"📤 زیرنویس استخراج شده از:\n`{video_file.name}`\n📄 فایل: `{sub_p.name}`",
-                parse_mode="Markdown"
+                caption=f"📤 زیرنویس استخراج شده از\n{video_file.name}\n📄 {sub_p.name}",
             )
 
         if progress_callback:
@@ -2250,6 +2253,74 @@ async def _download_and_extract_subs_job(
                 shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+async def _monitor_subtitle_job(bot, chat_id, site_key, post_url, season, episode, progress_callback=None):
+    try:
+        if progress_callback:
+            progress_callback("در حال بررسی حجم نسخه‌های سافت‌ساب در سایت...")
+        video, download = await monitor_service.resolve_subtitle_download(site_key, post_url, season, episode)
+        if progress_callback:
+            label = f"S{video.season:02}E{video.episode:02} • " if video.episode else ""
+            progress_callback(f"{label}{video.size / 1024 ** 2:.0f} MB • شروع دانلود")
+        temp_dir = Path(tempfile.mkdtemp(prefix="SubExtract_", dir=cfg.data_dir))
+        return await _download_and_extract_subs_job(
+            bot, chat_id, video.url, temp_dir, progress_callback, download_video=download,
+        )
+    except SubtitleAccessRequired as exc:
+        keyboard = InlineKeyboardBuilder()
+        if exc.purchase_url != exc.url and monitor_service.is_subtitle_site_url(site_key, exc.url):
+            keyboard.row(InlineKeyboardButton(text="🌐 باز کردن صفحه دسترسی", url=exc.url))
+        if monitor_service.is_subtitle_site_url(site_key, exc.purchase_url):
+            keyboard.row(InlineKeyboardButton(text="💳 صفحه اشتراک سایت", url=exc.purchase_url))
+        try:
+            opened = await monitor_service.open_subtitle_access(site_key, exc.url)
+        except Exception:
+            logging.warning("Could not open monitor subtitle access page for %s", site_key)
+            opened = False
+        access_hint = (
+            "صفحه در مرورگر ربات باز شد. پس از فعال شدن دسترسی، دوباره دکمه استخراج را بزنید."
+            if opened else "برای باز کردن مرورگر ربات از /monitor_browser استفاده کنید و دوباره دکمه استخراج را بزنید."
+        )
+        markup = keyboard.as_markup()
+        await bot.send_message(
+            chat_id, f"🔒 {exc}\n{access_hint}", reply_markup=markup if markup.inline_keyboard else None,
+        )
+        raise
+    except Exception as exc:
+        detail = str(exc) if isinstance(exc, (RuntimeError, FileNotFoundError)) else "جزئیات در لاگ ربات ثبت شد."
+        await bot.send_message(chat_id, f"❌ استخراج خودکار زیرنویس انجام نشد.\n{detail[:300]}")
+        raise
+
+
+@router.callback_query(F.data.startswith("mon:sub:"))
+async def cb_monitor_extract_subtitles(call: CallbackQuery):
+    if not is_admin(call.from_user.id) or not isinstance(call.message, Message):
+        return await call.answer("این عملیات در دسترس نیست.", show_alert=True)
+    parts = call.data.split(":")
+    if len(parts) != 5 or any(not re.fullmatch(r"[0-9]{1,4}", value) for value in parts[3:]):
+        return await call.answer("درخواست استخراج نامعتبر است.", show_alert=True)
+    site_key = parts[2]
+    season, episode = map(int, parts[3:])
+    markup = call.message.reply_markup
+    post_url = ""
+    if markup:
+        post_url = next((button.url for row in markup.inline_keyboard for button in row if button.url), "")
+    if not monitor_service.is_subtitle_site_url(site_key, post_url):
+        return await call.answer("لینک این اعلان معتبر نیست. از یک اعلان تازه استفاده کنید.", show_alert=True)
+
+    args = (call.bot, call.message.chat.id, site_key, post_url, season, episode)
+    if any(
+        task.func is _monitor_subtitle_job and task.args == args and not task.is_finished
+        for task in queue_engine.tasks.values()
+    ):
+        return await call.answer("استخراج این عنوان در صف است یا در حال اجراست.")
+    site_name = monitor_service.DEFAULT_SITES[site_key]["title"]
+    task = await queue_engine.add_task(
+        "download", f"استخراج خودکار زیرنویس {site_name}", _monitor_subtitle_job, *args,
+        notify_completion=False,
+    )
+    await call.answer(f"استخراج زیرنویس در صف قرار گرفت ({task.task_id}).")
 
 
 @router.callback_query(F.data == "extmode:link")

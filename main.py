@@ -60,6 +60,7 @@ RELOADABLE_MODULES_ORDER = [
     "services.scraper_service",
     "services.downloader_service",
     "services.automation_service",
+    "services.monitor_subtitles",
     "services.monitor_service",
     "services.nyaa_release",
     "services.eztv_tracker_service",
@@ -121,8 +122,9 @@ async def hot_reload_code(dp: Dispatcher, bot: Bot) -> tuple[bool, str]:
         importlib.invalidate_caches()
         cfg.reload()
 
-        if hasattr(monitor_mod, "monitor_service"):
-            monitor_mod.monitor_service.stop()
+        active_monitor = getattr(monitor_mod, "monitor_service", None)
+        if active_monitor is not None:
+            active_monitor.stop()
         if hasattr(eztv_mod, "eztv_tracker_service"):
             eztv_mod.eztv_tracker_service.stop()
 
@@ -132,6 +134,9 @@ async def hot_reload_code(dp: Dispatcher, bot: Bot) -> tuple[bool, str]:
         for mod_name in RELOADABLE_MODULES_ORDER:
             if mod_name in sys.modules:
                 importlib.reload(sys.modules[mod_name])
+                if mod_name == "services.monitor_service" and active_monitor is not None:
+                    active_monitor.__class__ = monitor_mod.SiteMonitorService
+                    monitor_mod.monitor_service = active_monitor
                 reloaded_count += 1
 
         # ارتقای کلاس و ری‌استارت ورکرهای بیکار تا کد جدید نوتیفیکیشن بلافاصله در _worker_loop فعال شود
