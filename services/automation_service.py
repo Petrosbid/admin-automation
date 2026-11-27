@@ -1948,7 +1948,7 @@ class AutomationService:
                 validated_subs.append(MKVService.validate_subtitle_file(subtitle_path, "زیرنویس فارسی"))
             except (OSError, ValueError) as exc:
                 logging.warning("Skipping invalid Persian subtitle candidate %s: %s", subtitle_path, exc)
-        all_subs = validated_subs
+        all_subs = cls.prefer_styled_fa_subtitles(validated_subs)
         if not plan.is_series or not plan.season_ep_tag:
             return all_subs
 
@@ -1970,6 +1970,14 @@ class AutomationService:
                 matched.append(f)
 
         return matched
+
+    @staticmethod
+    def prefer_styled_fa_subtitles(paths: list[Path]) -> list[Path]:
+        styled = [p for p in paths if p.suffix.casefold() in (".ass", ".ssa")]
+        styled_stems = {p.stem.casefold() for p in styled}
+        return styled + [
+            p for p in paths if p.suffix.casefold() == ".srt" and p.stem.casefold() not in styled_stems
+        ]
 
     @classmethod
     def match_subtitles_to_episodes(
@@ -2056,7 +2064,8 @@ class AutomationService:
                         "server_id": server["server_id"],
                         "server_name": server["server_name"],
                     })
-        match = cls.match_subtitles_to_episodes([plan], list(candidates)).get(plan.season_ep_tag or "MOVIE")
+        paths = cls.prefer_styled_fa_subtitles(list(candidates))
+        match = cls.match_subtitles_to_episodes([plan], paths).get(plan.season_ep_tag or "MOVIE")
         return candidates.get(match)
 
     @staticmethod

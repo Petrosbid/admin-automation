@@ -901,6 +901,36 @@ def sync_download_subtitle(
         _close_ftp_quietly(ftp)
 
 
+def _retrieve_media_file(
+    ftp: FTP,
+    filename: str,
+    part_path: Path,
+    expected_size: int | None,
+    file_label: str,
+    progress_callback: Callable[[str], None] | None,
+) -> int:
+    received = 0
+    last_report = time.monotonic()
+
+    def write_chunk(chunk: bytes):
+        nonlocal received, last_report
+        output.write(chunk)
+        received += len(chunk)
+        if progress_callback:
+            now = time.monotonic()
+            if now - last_report >= 1:
+                amount = f"{received / (1024 * 1024):.1f} MiB"
+                if expected_size and expected_size > 0:
+                    percent = min(100, int(received * 100 / expected_size))
+                    amount = f"{percent}% | {amount}"
+                progress_callback(f"{file_label} | دریافت‌شده: {amount}")
+                last_report = now
+
+    with part_path.open("wb") as output:
+        ftp.retrbinary(f"RETR {filename}", write_chunk, blocksize=UPLOAD_BLOCK_SIZE)
+    return part_path.stat().st_size
+
+
 def sync_download_episode_files(
     remote_season_dir: str,
     local_season_dir: Path,
@@ -962,9 +992,15 @@ def sync_download_episode_files(
         "errors": [],
     }
 
+    if progress_callback:
+        progress_callback("منتظر نوبت همگام‌سازی FTP")
     with _DOWNLOAD_LOCK:
         try:
+            if progress_callback:
+                progress_callback("در حال اتصال به سرور FTP")
             ftp_holder[0] = connect()
+            if progress_callback:
+                progress_callback("در حال بررسی پوشه‌های سرور")
             candidates: list[tuple[str, tuple[str, ...], str, int | None]] = []
             visited: set[str] = set()
 
@@ -1063,21 +1099,20 @@ def sync_download_episode_files(
                     target_path.name + ".part-" + uuid.uuid4().hex[:8]
                 )
                 set_download_file_name(target_path.name)
+                file_label = f"فایل {index}/{total}"
                 last_error: Exception | None = None
                 for attempt in range(1, 4):
                     try:
+                        if progress_callback:
+                            progress_callback(f"{file_label} | شروع دریافت، تلاش {attempt}/3")
                         ftp = ftp_holder[0]
                         if ftp is None:
                             ftp_holder[0] = connect()
                             ftp = ftp_holder[0]
                         ftp.cwd(remote_dir)
-                        with part_path.open("wb") as output:
-                            ftp.retrbinary(
-                                f"RETR {filename}",
-                                output.write,
-                                blocksize=UPLOAD_BLOCK_SIZE,
-                            )
-                        received_size = part_path.stat().st_size
+                        received_size = _retrieve_media_file(
+                            ftp, filename, part_path, expected_size, file_label, progress_callback
+                        )
                         if expected_size is not None and received_size != expected_size:
                             raise IOError(
                                 f"اندازه فایل دریافتی ({received_size}) با اندازه سرور ({expected_size}) برابر نیست."
@@ -1166,9 +1201,15 @@ def sync_download_movie_files(
         "errors": [],
     }
 
+    if progress_callback:
+        progress_callback("منتظر نوبت همگام‌سازی FTP")
     with _DOWNLOAD_LOCK:
         try:
+            if progress_callback:
+                progress_callback("در حال اتصال به سرور FTP")
             ftp_holder[0] = connect()
+            if progress_callback:
+                progress_callback("در حال بررسی پوشه‌های سرور")
             candidates: list[tuple[str, tuple[str, ...], str, int | None]] = []
             visited: set[str] = set()
 
@@ -1270,21 +1311,20 @@ def sync_download_movie_files(
                     target_path.name + ".part-" + uuid.uuid4().hex[:8]
                 )
                 set_download_file_name(target_path.name)
+                file_label = f"فایل {index}/{total}"
                 last_error: Exception | None = None
                 for attempt in range(1, 4):
                     try:
+                        if progress_callback:
+                            progress_callback(f"{file_label} | شروع دریافت، تلاش {attempt}/3")
                         ftp = ftp_holder[0]
                         if ftp is None:
                             ftp_holder[0] = connect()
                             ftp = ftp_holder[0]
                         ftp.cwd(remote_dir)
-                        with part_path.open("wb") as output:
-                            ftp.retrbinary(
-                                f"RETR {filename}",
-                                output.write,
-                                blocksize=UPLOAD_BLOCK_SIZE,
-                            )
-                        received_size = part_path.stat().st_size
+                        received_size = _retrieve_media_file(
+                            ftp, filename, part_path, expected_size, file_label, progress_callback
+                        )
                         if expected_size is not None and received_size != expected_size:
                             raise IOError(
                                 f"اندازه فایل دریافتی ({received_size}) با اندازه سرور "

@@ -19,6 +19,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from core.config_loader import cfg
 from core.queue_manager import queue_engine, safe_throttled_edit_text
 from services.downloader_service import DownloaderService
+from services.subtitle_review import release_key, sample_report
 from services.subtitle_service import SubtitleService
 from services.mkv_service import MKVService
 from services.handbrake_service import HandBrakeService
@@ -232,6 +233,7 @@ async def _queue_sauto_subtitle_album(
 
 
 class SubtitleStates(StatesGroup):
+    reviewing_timing = State()
     sauto_browsing_dir = State()
     sauto_waiting_fa_sub = State()
     sauto_waiting_fa_sub_name = State()
@@ -542,9 +544,9 @@ async def _init_smart_auto_batch(
         else:
             valid_local_subs.append(sub_p)
 
-    all_candidate_subs = (pre_uploaded_subs or []) + [
-        p for p in valid_local_subs if p not in (pre_uploaded_subs or [])
-    ]
+    uploaded = AutomationService.prefer_styled_fa_subtitles(pre_uploaded_subs or [])
+    local = AutomationService.prefer_styled_fa_subtitles(valid_local_subs)
+    all_candidate_subs = uploaded + [p for p in local if p not in (pre_uploaded_subs or [])]
 
     matched_map = AutomationService.match_subtitles_to_episodes(plans, all_candidate_subs)
     if len(plans) == 1 and len(all_candidate_subs) == 1 and not matched_map:
@@ -654,6 +656,7 @@ async def _process_sauto_fa_sub_messages(messages: list[Message], state: FSMCont
 
     fallback_season = AutomationService.extract_season_num_from_dir(plans[0].base_dir)
     new_subs.sort(key=lambda item: _subtitle_episode_sort_key(item, fallback_season))
+    new_subs = AutomationService.prefer_styled_fa_subtitles(new_subs)
     matched_map = AutomationService.match_subtitles_to_episodes(plans, new_subs)
 
     if len(plans) == 1 and len(new_subs) == 1 and not matched_map:
@@ -1275,6 +1278,61 @@ async def cb_sauto_hb_quality_action(call: CallbackQuery, state: FSMContext):
     )
 
 
+async def _review_next(call, state, candidates, continuation, approved, offset=0):
+    groups = {}
+    for episode, video, fa in candidates:
+        if fa and fa.is_file():
+            groups.setdefault((episode, release_key(video), str(fa)), set()).add(video)
+    for (episode, group, subtitle), videos in groups.items():
+        video = min(videos, key=lambda v: (
+            AutomationService.quality_tag_from_name(v.name + "." + v.parent.name) != "720p", str(v)
+        ))
+        fa = Path(subtitle)
+        signature = [episode, group, subtitle, fa.stat().st_mtime_ns, str(video),
+                     video.stat().st_mtime_ns if video.is_file() else None]
+        if signature in approved:
+            continue
+        token = uuid.uuid4().hex[:12]
+        await state.set_state(SubtitleStates.reviewing_timing)
+        await state.update_data(timing_token=token, timing_approved=approved,
+                                timing_current=signature, timing_action=continuation)
+        try:
+            report = await sample_report(video, fa, offset)
+        except (OSError, ValueError, UnicodeError):
+            logging.exception("Could not sample %s", fa)
+            report = "خواندن نمونه‌ها ممکن نشد. فایل را روی ویدیو بررسی کنید."
+        kb = InlineKeyboardBuilder()
+        kb.button(text="هماهنگ است؛ ادامه", callback_data=f"timing:yes:{token}")
+        kb.button(text="توقف برای اصلاح زیرنویس", callback_data=f"timing:no:{token}")
+        kb.adjust(1)
+        await call.message.edit_text(
+            f"بررسی هماهنگی · {episode} · {len(videos)} فایل\n{video.name}\n{fa.name}\n\n"
+            f"{report}\n\nمعنی و زمان دیالوگ‌ها را مقایسه کنید. تأیید برای همهٔ کیفیت‌های این گروه اعمال می‌شود.",
+            parse_mode=None, reply_markup=kb.as_markup())
+        return True
+    return False
+
+
+@router.callback_query(SubtitleStates.reviewing_timing, F.data.startswith("timing:"))
+async def cb_review_timing(call: CallbackQuery, state: FSMContext):
+    _, decision, token = call.data.split(":")
+    data = await state.get_data()
+    if token != data.get("timing_token"):
+        return await call.answer("این بررسی دیگر فعال نیست.")
+    await state.update_data(timing_token=None)
+    if decision != "yes":
+        await state.clear()
+        await call.answer()
+        return await call.message.edit_text("عملیات متوقف شد. پس از اصلاح زیرنویس دوباره شروع کنید.",
+                                            reply_markup=main_menu_kb())
+    approved = [*data["timing_approved"], data["timing_current"]]
+    action = data["timing_action"]
+    await call.answer()
+    if action[0] == "smart":
+        return await _execute_smart_automation_batch(call, state, *action[1:], approved=approved)
+    return await _schedule_subtitle_jobs(call, state, action[1], approved=approved)
+
+
 async def _execute_smart_automation_batch(
         call: CallbackQuery,
         state: FSMContext,
@@ -1282,6 +1340,7 @@ async def _execute_smart_automation_batch(
         selected_hb_srt: list[str],
         auto_upload: bool,
         include_en: bool = True,
+        approved=None,
 ):
     data = await state.get_data()
     target_dir = Path(data["sauto_target_dir"])
@@ -1300,6 +1359,17 @@ async def _execute_smart_automation_batch(
             plan.fullhd_source_video = Path(source_path).resolve()
             plan.source_type = AutomationService.detect_source_type(plan.fullhd_source_video.name)
     selected_soft_set = set(selected_soft_qualities)
+    candidates = []
+    for plan in plans:
+        key = plan.season_ep_tag if plan.is_series and plan.season_ep_tag else "MOVIE"
+        if key in fa_map:
+            videos = [st.raw_video for st in plan.softsub_targets if st.quality_folder_name in selected_soft_set]
+            if selected_hb_srt and plan.fullhd_source_video:
+                videos.append(plan.fullhd_source_video)
+            candidates.extend((key, vid, Path(fa_map[key])) for vid in videos)
+    action = ["smart", selected_soft_qualities, selected_hb_srt, auto_upload, include_en]
+    if await _review_next(call, state, candidates, action, approved or []):
+        return
     batch_id = uuid.uuid4().hex[:10]
     batch_tasks = []
     skipped_items: list[str] = []
@@ -1466,7 +1536,7 @@ async def _execute_smart_automation_batch(
         _ACTIVE_AUTOMATION_MONITORS.add(monitor_task)
         monitor_task.add_done_callback(_release_automation_monitor)
 
-    await call.answer("اتوماسیون در صف قرار گرفت؛ گزارش نهایی پس از پایان ارسال می‌شود.")
+
 
 @router.callback_query(SubtitleStates.sauto_waiting_en_decision, F.data == "sauto_en:auto_extract")
 @router.callback_query(SubtitleStates.sauto_waiting_en_decision, F.data == "sauto_en:extract")
@@ -2918,7 +2988,10 @@ async def _watch_remote_subtitle_media_sync(
         else f"🎞 قسمت‌ها: <code>{html.escape(', '.join(episode_tags))}</code>"
     )
     while not task.is_finished:
-        progress = html.escape(str(task.progress or task.status or "در انتظار"))
+        if task.started_ts:
+            progress = html.escape(str(task.progress or task.status))
+        else:
+            progress = "در صف دانلود، منتظر نوبت"
         filename = html.escape(getattr(task, "download_name", "")[:160])
         file_line = f"📄 فایل: <code>{filename}</code>\n" if filename else ""
         status_text = (
@@ -4113,7 +4186,7 @@ async def handle_new_dest_subfolder_name(message: Message, state: FSMContext):
     await _render_output_dest_browser(message, state, new_dir, page=0)
 
 
-async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> list[str]:
+async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None, review_candidates=None) -> list[str]:
     target_videos = [Path(p) for p in data["target_videos"]]
     fa_sub = Path(data["fa_sub_path"]) if data.get("fa_sub_path") else None
     en_sub = Path(data["en_sub_path"]) if data.get("en_sub_path") else None
@@ -4144,6 +4217,14 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
             fallback_season=AutomationService.extract_season_num_from_dir(video.parent),
         ))
     }
+    # Resolution variants with the same explicit title share a movie subtitle.
+    movie_titles = set()
+    for video in target_videos:
+        quality = AutomationService.QUALITY_TAG.search(video.stem)
+        title = video.stem[:quality.start()] if quality else video.stem
+        movie_titles.add(re.sub(r"[\W_]+", " ", title.casefold()).strip())
+    ambiguous_movies = len(target_videos) > 1 and (len(movie_titles) != 1 or "" in movie_titles)
+
     scheduled_ids = []
     total_vids = len(target_videos)
 
@@ -4165,7 +4246,7 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
                     video_fa_sub = None
             elif len(target_episode_tags) > 1:
                 video_fa_sub = None
-            elif not target_episode_tags and len(target_videos) > 1:
+            elif not target_episode_tags and ambiguous_movies:
                 # Multiple videos with no reliable episode identity must not
                 # share one subtitle by guesswork.
                 video_fa_sub = None
@@ -4181,10 +4262,15 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
                     video_en_sub = None
             elif len(target_episode_tags) > 1:
                 video_en_sub = None
-            elif not target_episode_tags and len(target_videos) > 1:
+            elif not target_episode_tags and ambiguous_movies:
                 video_en_sub = None
             elif expected_batch_episode and en_ep and en_ep != expected_batch_episode:
                 video_en_sub = None
+
+        if review_candidates is not None:
+            if video_fa_sub:
+                review_candidates.append((video_ep or "MOVIE", vid, video_fa_sub))
+            continue
 
         if video_en_sub is None:
             video_en_sub = _local_english_for_video(vid)
@@ -4250,26 +4336,18 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None) -> lis
     return scheduled_ids
 
 
-async def _schedule_subtitle_jobs(call: CallbackQuery, state: FSMContext, chosen_preset: dict | None):
+async def _schedule_subtitle_jobs(call: CallbackQuery, state: FSMContext, chosen_preset: dict | None, approved=None):
     data = await state.get_data()
+    candidates = []
+    await _build_and_enqueue_jobs(data, chosen_preset, review_candidates=candidates)
+    offset = int(data.get("sync_offset_ms", 0)) if data.get("sync_mode") == "manual" and Path(data.get("fa_sub_path") or "").suffix.lower() == ".srt" else 0
+    if await _review_next(call, state, candidates, ["manual", chosen_preset], approved or [], offset):
+        return
     brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
     scheduled_ids = await _build_and_enqueue_jobs(data, chosen_preset)
     await state.clear()
     summary_text = "\n".join(scheduled_ids)
     await call.message.edit_text(
-        f"✅ عملیات با تگ `{brand}` در صف قرار گرفت!\n\n{summary_text}",
-        reply_markup=main_menu_kb(),
-        parse_mode="Markdown"
-    )
-
-
-async def _schedule_subtitle_jobs_from_msg(message: Message, state: FSMContext, chosen_preset: dict | None):
-    data = await state.get_data()
-    brand = cfg.get("branding", "global_title_and_track_name", ".::EmpireBestTv.Com::.")
-    scheduled_ids = await _build_and_enqueue_jobs(data, chosen_preset)
-    await state.clear()
-    summary_text = "\n".join(scheduled_ids)
-    await message.answer(
         f"✅ عملیات با تگ `{brand}` در صف قرار گرفت!\n\n{summary_text}",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"

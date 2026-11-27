@@ -284,6 +284,8 @@ class HandBrakeService:
                     "فایل واسط HandBrake باید دقیقاً یک ترک زیرنویس اصلی داشته باشد؛ "
                     f"تعداد فعلی: {len(mux_subtitle_tracks)}"
                 )
+            if is_ass_format and MKVService.subtitle_extension_for_codec(mux_subtitle_tracks[0]["codec"]) not in (".ass", ".ssa"):
+                raise RuntimeError("ترک زیرنویس فایل واسط با فرمت ASS/SSA ذخیره نشده است.")
             audio_cli_flags = await cls._build_all_audio_cli_flags(
                 video_path=video_path,
                 target_resolution=target_resolution
