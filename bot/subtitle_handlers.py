@@ -19,7 +19,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from core.config_loader import cfg
 from core.queue_manager import queue_engine, safe_throttled_edit_text
 from services.downloader_service import DownloaderService
-from services.subtitle_review import release_key, sample_report
+from services.subtitle_review import review_base_dir, sample_report
 from services.subtitle_service import SubtitleService
 from services.mkv_service import MKVService
 from services.handbrake_service import HandBrakeService
@@ -1278,37 +1278,64 @@ async def cb_sauto_hb_quality_action(call: CallbackQuery, state: FSMContext):
     )
 
 
-async def _review_next(call, state, candidates, continuation, approved, offset=0):
-    groups = {}
+async def _review_next(
+        call: CallbackQuery,
+        state: FSMContext,
+        candidates: list[tuple[str, Path, Path]],
+        continuation: list,
+        approved: list,
+        offset: int = 0,
+        plans: dict[str, AutomationPlan] | None = None,
+) -> bool:
+    plans = plans or {}
+    groups: dict[tuple[str, Path, Path], set[Path]] = {}
     for episode, video, fa in candidates:
-        if fa and fa.is_file():
-            groups.setdefault((episode, release_key(video), str(fa)), set()).add(video)
-    for (episode, group, subtitle), videos in groups.items():
-        video = min(videos, key=lambda v: (
-            AutomationService.quality_tag_from_name(v.name + "." + v.parent.name) != "720p", str(v)
-        ))
-        fa = Path(subtitle)
-        signature = [episode, group, subtitle, fa.stat().st_mtime_ns, str(video),
-                     video.stat().st_mtime_ns if video.is_file() else None]
+        if fa.is_file():
+            plan = plans.get(episode)
+            base_dir = plan.base_dir if plan else review_base_dir(video)
+            groups.setdefault((episode, base_dir, fa.resolve()), set()).add(video.resolve())
+    for (episode, base_dir, fa), selected_videos in groups.items():
+        videos = sorted(selected_videos)
+        signature = [
+            episode, str(base_dir), str(fa), fa.stat().st_mtime_ns, offset,
+            [[str(video), video.stat().st_mtime_ns if video.is_file() else None] for video in videos],
+        ]
         if signature in approved:
             continue
         token = uuid.uuid4().hex[:12]
+        if not approved:
+            await call.answer()
         await state.set_state(SubtitleStates.reviewing_timing)
         await state.update_data(timing_token=token, timing_approved=approved,
                                 timing_current=signature, timing_action=continuation)
+        plan = plans.get(episode)
+        title = plan.series_title if plan else AutomationService.format_clean_title(videos[0].stem)
+        label = f"{title} · {episode}" if episode != "MOVIE" else title
+        header = (
+            "⏱ <b>بررسی هماهنگی زیرنویس فارسی</b>\n"
+            f"{html.escape(label[:120])}  ·  {len(videos)} فایل برای پردازش\n"
+            f"<b>زیرنویس فارسی</b>  ·  <code>{html.escape(fa.name[:120])}</code>"
+        )
+        await call.message.edit_text(f"{header}\n\nدر حال آماده‌سازی نمونه‌های FullHD…", parse_mode="HTML")
         try:
-            report = await sample_report(video, fa, offset)
-        except (OSError, ValueError, UnicodeError):
+            report = await sample_report(
+                base_dir,
+                episode if episode != "MOVIE" else None,
+                [target.raw_video for target in plan.softsub_targets] if plan else videos,
+                fa,
+                offset,
+                preferred_video=plan.fullhd_source_video if plan else None,
+            )
+        except (OSError, ValueError):
             logging.exception("Could not sample %s", fa)
-            report = "خواندن نمونه‌ها ممکن نشد. فایل را روی ویدیو بررسی کنید."
+            report = "⚠️ خواندن نمونه‌ها ممکن نشد. زیرنویس را روی ویدیو بررسی کنید."
         kb = InlineKeyboardBuilder()
-        kb.button(text="هماهنگ است؛ ادامه", callback_data=f"timing:yes:{token}")
-        kb.button(text="توقف برای اصلاح زیرنویس", callback_data=f"timing:no:{token}")
+        kb.button(text="✅ تأیید زمان‌بندی و ادامه", callback_data=f"timing:yes:{token}")
+        kb.button(text="✏️ توقف برای اصلاح زیرنویس", callback_data=f"timing:no:{token}")
         kb.adjust(1)
         await call.message.edit_text(
-            f"بررسی هماهنگی · {episode} · {len(videos)} فایل\n{video.name}\n{fa.name}\n\n"
-            f"{report}\n\nمعنی و زمان دیالوگ‌ها را مقایسه کنید. تأیید برای همهٔ کیفیت‌های این گروه اعمال می‌شود.",
-            parse_mode=None, reply_markup=kb.as_markup())
+            f"{header}\n\n{report}\n\nاگر معنی و زمان دیالوگ‌ها هماهنگ است، ادامه را بزنید.",
+            parse_mode="HTML", reply_markup=kb.as_markup())
         return True
     return False
 
@@ -1360,15 +1387,17 @@ async def _execute_smart_automation_batch(
             plan.source_type = AutomationService.detect_source_type(plan.fullhd_source_video.name)
     selected_soft_set = set(selected_soft_qualities)
     candidates = []
+    review_plans = {}
     for plan in plans:
         key = plan.season_ep_tag if plan.is_series and plan.season_ep_tag else "MOVIE"
         if key in fa_map:
+            review_plans[key] = plan
             videos = [st.raw_video for st in plan.softsub_targets if st.quality_folder_name in selected_soft_set]
             if selected_hb_srt and plan.fullhd_source_video:
                 videos.append(plan.fullhd_source_video)
             candidates.extend((key, vid, Path(fa_map[key])) for vid in videos)
     action = ["smart", selected_soft_qualities, selected_hb_srt, auto_upload, include_en]
-    if await _review_next(call, state, candidates, action, approved or []):
+    if await _review_next(call, state, candidates, action, approved or [], plans=review_plans):
         return
     batch_id = uuid.uuid4().hex[:10]
     batch_tasks = []
@@ -4269,7 +4298,10 @@ async def _build_and_enqueue_jobs(data: dict, chosen_preset: dict | None, review
 
         if review_candidates is not None:
             if video_fa_sub:
-                review_candidates.append((video_ep or "MOVIE", vid, video_fa_sub))
+                review_episode = video_ep or AutomationService.extract_episode_tag(
+                    video_fa_sub.name, fallback_season=fallback_season,
+                )
+                review_candidates.append((review_episode or "MOVIE", vid, video_fa_sub))
             continue
 
         if video_en_sub is None:
